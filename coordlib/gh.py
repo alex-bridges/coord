@@ -1,9 +1,12 @@
-"""Thin wrapper over the `gh` CLI.
+"""GitHub access: the `gh` CLI when it is installed, plain HTTPS with a token when not.
 
-Every agent environment that can push to the repository already has `gh`
-authenticated, so this is the one transport. All agents share ONE GitHub login
-(alex-bridges) and therefore one quota of 5,000 REST and 5,000 GraphQL points an
-hour; `calls` counts what a command spent so the board can print it.
+Every agent environment that can push already has `gh` authenticated or a token
+(GH_TOKEN/GITHUB_TOKEN: Actions jobs, containers). Tycho's runners do not all
+have `gh`, so the HTTPS path is what the merge-train workflow uses there.
+
+All agents share ONE GitHub login (alex-bridges) and therefore one quota of
+5,000 REST and 5,000 GraphQL points an hour; `calls` counts what a command spent
+so the board can print it.
 """
 
 from __future__ import annotations
@@ -11,8 +14,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
-from typing import Any, Callable, Dict, List, Optional, Sequence
+import urllib.error
+import urllib.request
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_REPO = "example-owner/example-repo"
 CALL_TIMEOUT_SECONDS = 30
@@ -74,28 +80,94 @@ def detect_repo(cwd: Optional[str] = None) -> str:
     return repo_from_remote_url(url) or DEFAULT_REPO
 
 
+def _next_link(header: Optional[str]) -> Optional[str]:
+    for part in (header or "").split(","):
+        match = re.search(r'<([^>]+)>;\s*rel="next"', part)
+        if match:
+            return match.group(1)
+    return None
+
+
 class GitHub:
-    def __init__(self, repo: Optional[str] = None, runner: Optional[Runner] = None):
+    """`runner` injects a fake `gh` (tests); `transport` forces "gh" or "http"."""
+
+    def __init__(
+        self,
+        repo: Optional[str] = None,
+        runner: Optional[Runner] = None,
+        transport: Optional[str] = None,
+        token: Optional[str] = None,
+    ):
         self.repo = repo or detect_repo()
         self.owner, self.name = self.repo.split("/", 1)
-        self._runner = runner or _default_runner
+        self._runner = runner
+        self._transport = transport or os.environ.get("COORD_TRANSPORT") or ("gh" if runner else None)
+        self._token = token
+        self.api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
         self.calls = 0
 
-    # MARK: - Transport
+    # MARK: - Transport selection
+
+    def transport(self) -> str:
+        if self._transport is None:
+            if shutil.which("gh"):
+                self._transport = "gh"
+            elif self.token():
+                self._transport = "http"
+            else:
+                raise GitHubError("neither the gh CLI nor a GH_TOKEN/GITHUB_TOKEN is available")
+        return self._transport
+
+    def token(self) -> str:
+        return self._token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
+
+    # MARK: - gh CLI
 
     def _run(self, args: List[str], stdin: Optional[str] = None) -> str:
         self.calls += 1
-        result = self._runner(["gh"] + args, stdin)
+        result = (self._runner or _default_runner)(["gh"] + args, stdin)
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
-            if "HTTP 404" in message or "Not Found" in message:
+            if "HTTP 404" in message:
                 raise NotFound(message)
             raise GitHubError(message or f"gh {' '.join(args[:2])} exited {result.returncode}")
         return result.stdout
 
+    # MARK: - HTTPS
+
+    def _http(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, str]]:
+        self.calls += 1
+        if not url.startswith("http"):
+            url = f"{self.api}/{url.lstrip('/')}"
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Authorization", f"Bearer {self.token()}")
+        request.add_header("Accept", "application/vnd.github+json")
+        request.add_header("X-GitHub-Api-Version", "2022-11-28")
+        request.add_header("User-Agent", "inisa-coord")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(request, timeout=CALL_TIMEOUT_SECONDS) as response:
+                raw = response.read().decode()
+                headers = {k.lower(): v for k, v in response.headers.items()}
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(errors="replace")[:500]
+            if error.code == 404:
+                raise NotFound(f"HTTP 404 {method} {url}: {detail}") from error
+            raise GitHubError(f"HTTP {error.code} {method} {url}: {detail}") from error
+        except (urllib.error.URLError, OSError) as error:
+            raise GitHubError(f"{method} {url}: {error}") from error
+        return (json.loads(raw) if raw.strip() else None), headers
+
+    # MARK: - API
+
     def rest(self, path: str, method: str = "GET", body: Optional[Dict[str, Any]] = None) -> Any:
         """One REST call. `path` may contain {repo}."""
-        args = ["api", path.replace("{repo}", self.repo), "--method", method]
+        path = path.replace("{repo}", self.repo)
+        if self.transport() == "http":
+            return self._http(method, path, body)[0]
+        args = ["api", path, "--method", method]
         stdin = None
         if body is not None:
             args += ["--input", "-"]
@@ -106,26 +178,41 @@ class GitHub:
     def rest_paginated(self, path: str) -> List[Any]:
         """Every page of a list endpoint, flattened.
 
-        `--paginate` alone prints one JSON document PER PAGE, which a single
+        `gh api --paginate` alone prints one JSON document PER PAGE, which a single
         json.loads rejects (Codex P1 on #989); `--slurp` wraps the pages in one
         array. Endpoints that wrap their list in an object (actions/runs) come
         back as a list of those objects; the caller unwraps them.
         """
-        out = self._run(["api", path.replace("{repo}", self.repo), "--paginate", "--slurp"])
-        pages = json.loads(out) if out.strip() else []
+        path = path.replace("{repo}", self.repo)
+        pages: List[Any] = []
+        if self.transport() == "http":
+            url: Optional[str] = path
+            while url:
+                page, headers = self._http("GET", url)
+                pages.append(page)
+                url = _next_link(headers.get("link"))
+        else:
+            out = self._run(["api", path, "--paginate", "--slurp"])
+            pages = json.loads(out) if out.strip() else []
         flat: List[Any] = []
         for page in pages:
             if isinstance(page, list):
                 flat.extend(page)
-            else:
+            elif page is not None:
                 flat.append(page)
         return flat
 
     def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload = {"query": query, "variables": variables or {}}
-        out = self._run(["api", "graphql", "--input", "-"], json.dumps(payload))
-        data = json.loads(out)
+        if self.transport() == "http":
+            data = self._http("POST", "graphql", payload)[0]
+        else:
+            data = json.loads(self._run(["api", "graphql", "--input", "-"], json.dumps(payload)))
         if data.get("errors"):
             messages = "; ".join(str(e.get("message", e)) for e in data["errors"])
             raise GitHubError(f"GraphQL: {messages}")
         return data["data"]
+
+    def dispatch_workflow(self, workflow: str, ref: str, inputs: Optional[Dict[str, str]] = None) -> None:
+        self.rest(f"repos/{{repo}}/actions/workflows/{workflow}/dispatches", method="POST",
+                  body={"ref": ref, "inputs": inputs or {}})

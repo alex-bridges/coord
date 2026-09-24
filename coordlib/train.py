@@ -1,0 +1,156 @@
+"""The merge train: land ready PRs on main in batches, one CI run per batch.
+
+GitHub's merge queue is not available for a private repository owned by a personal
+account, so this is built from parts that are: a label (the queue), a batch branch
+`train/<stamp>` (the batch and its state), a `ci.yml` dispatch with `lanes=changed`
+(the gate), and a fast-forward of main to exactly the tested commit (the merge).
+`.github/workflows/merge-train.yml` runs `coord train step` one at a time on the
+light runner; each step reads the state from GitHub, does one thing, and exits.
+
+The pure rules (eligibility, planning, what to do with a finished run, reading a
+batch back from git) are separate from the step that performs them, so tests can
+cover every branch of the state machine without GitHub.
+
+Merge rule (memory: feedback-pr-train-protocol), re-checked when a batch is built
+AND again just before main moves — the `train` label is intent, not approval:
+- Codex 👍 on the current head (review.codex_state), or the `codex-unavailable`
+  label when a substitute review was recorded on the PR (Alex's rule for quota
+  outages);
+- no unanswered Codex findings;
+- CI at the head not red (pending is fine: the batch runs the gates anyway);
+- not a carve-out: sound-character changes, persistence changes without a
+  migration and public API breaks carry `needs-alex` until Alex adds
+  `alex-approved`. Adding a PR to the train asserts it is not a carve-out.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import re
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+TRAIN_LABEL = "train"
+SOLO_LABEL = "train:solo"
+NEEDS_ALEX_LABEL = "needs-alex"
+ALEX_APPROVED_LABEL = "alex-approved"
+CODEX_UNAVAILABLE_LABEL = "codex-unavailable"
+BATCH_PREFIX = "train/"
+BATCH_CAP = 3
+CI_WORKFLOW = "ci.yml"
+CI_LANES = "changed"
+WORKFLOW_DIR = ".github/workflows/"
+MAX_ATTEMPTS = 2
+
+READY, HOLD, DROP = "ready", "hold", "drop"
+
+LABELS = {
+    TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
+    SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
+}
+
+
+def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
+                all_files: Optional[Sequence[str]] = None) -> Tuple[str, str]:
+    """(READY | HOLD | DROP, reason). HOLD waits and retries; DROP removes the label.
+
+    `all_files` is the complete file list when the summary's list was truncated.
+    """
+    files = list(all_files) if all_files is not None else pr.get("files", [])
+    labels = set(pr.get("labels", []))
+    if pr.get("base") != "main":
+        return DROP, f"its base is {pr.get('base')}, not main"
+    if pr.get("fromFork"):
+        return DROP, "it comes from a fork; the train only builds same-repository branches on Tycho"
+    if head_at_add and head_at_add != pr.get("head"):
+        return DROP, (f"its head moved from {head_at_add[:9]} to {str(pr.get('head'))[:9]} after it was added; "
+                      "add it again once the new head is reviewed")
+    touched = [f for f in files if f.startswith(WORKFLOW_DIR)]
+    if touched:
+        return DROP, (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
+                      "so this PR is merged by hand")
+    if pr.get("mergeable") == "CONFLICTING":
+        return DROP, "it conflicts with main; merge main into it (or rebase) and add it again"
+    if pr.get("isDraft"):
+        return HOLD, "it is a draft"
+    if NEEDS_ALEX_LABEL in labels and ALEX_APPROVED_LABEL not in labels:
+        return HOLD, "it is labelled needs-alex and waits for alex-approved"
+    codex = pr.get("codex") or {}
+    if codex.get("reviewing"):
+        return HOLD, "Codex is re-reviewing it"
+    if not codex.get("approved") and CODEX_UNAVAILABLE_LABEL not in labels:
+        return HOLD, "no Codex 👍 on its current head"
+    if pr.get("unansweredFindings"):
+        count = pr["unansweredFindings"]
+        return HOLD, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")
+    failing = (pr.get("ci") or {}).get("failing") or []
+    if failing:
+        return HOLD, "CI is red at its head: " + ", ".join(failing[:3])
+    return READY, "ready"
+
+
+def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],
+         labels: Dict[int, Sequence[str]], cap: int = BATCH_CAP) -> Dict[str, Any]:
+    """Pick the next batch from the queue (already in train order).
+
+    A PR labelled train:solo was in a red batch and is tested alone when it reaches
+    the front; others are batched up to `cap`, skipping solo ones behind the front.
+    """
+    ready = [q["pr"] for q in queue if verdicts[q["pr"]][0] == READY]
+    batch: List[int] = []
+    if ready:
+        if SOLO_LABEL in labels.get(ready[0], ()):
+            batch = [ready[0]]
+        else:
+            batch = [n for n in ready if SOLO_LABEL not in labels.get(n, ())][:cap]
+    return {
+        "batch": batch,
+        "drops": [(q["pr"], verdicts[q["pr"]][1]) for q in queue if verdicts[q["pr"]][0] == DROP],
+        "holds": [(q["pr"], verdicts[q["pr"]][1]) for q in queue if verdicts[q["pr"]][0] == HOLD],
+    }
+
+
+_MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+) ")
+
+
+def parse_members(log: str) -> List[Dict[str, Any]]:
+    """Batch members from `git log --first-parent --merges --format=%H%x09%P%x09%s base..tip`.
+
+    Each train merge commit's second parent is the PR head it merged; its subject
+    names the PR. Returned oldest first. Anything else on the branch is ignored.
+    """
+    members = []
+    for line in reversed([l for l in log.splitlines() if l.strip()]):
+        parts = line.split("\t", 2)
+        if len(parts) != 3:
+            continue
+        _, parents, subject = parts
+        match = _MERGE_SUBJECT.match(subject)
+        parent_list = parents.split()
+        if match and len(parent_list) == 2:
+            members.append({"pr": int(match.group(1)), "sha": parent_list[1]})
+    return members
+
+
+def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
+    """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon."""
+    if run is None:
+        return "dispatch"
+    if run.get("status") != "completed":
+        return "wait"
+    conclusion = run.get("conclusion")
+    if conclusion == "success":
+        return "merge"
+    if conclusion in ("failure", "timed_out", "startup_failure"):
+        if (run.get("run_attempt") or 1) < MAX_ATTEMPTS:
+            return "rerun"
+        return "eject" if batch_size == 1 else "split"
+    return "abandon"  # cancelled, skipped, neutral, stale: build again next step
+
+
+def batch_name(now: dt.datetime) -> str:
+    return BATCH_PREFIX + now.astimezone(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+
+def merge_message(pr: Dict[str, Any], owner: str) -> Tuple[str, str]:
+    """The same subject GitHub's merge button writes, so history reads the same."""
+    return f"Merge pull request #{pr['number']} from {owner}/{pr['branch']}", pr.get("title", "")

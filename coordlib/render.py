@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
-from . import review
+from . import review, train
 
 
 def ago(value: Optional[str], now: dt.datetime) -> str:
@@ -100,8 +100,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None) -> st
         owner = claim_owner(snapshot, pr)
         who = f" · {owner['agent']}" if owner else ""
         draft = " · draft" if pr["isDraft"] else ""
-        train = " · in train" if "train" in pr["labels"] else ""
-        lines.append(f"  PR #{pr['number']}  {pr['branch']}{draft}{train}{who}")
+        in_train = " · in train" if train.TRAIN_LABEL in pr["labels"] else ""
+        lines.append(f"  PR #{pr['number']}  {pr['branch']}{draft}{in_train}{who}")
         lines.append(f"      {_clip(pr['title'], 70)}")
         lines.append(f"      {ci_words(pr['ci'])} · {codex_words(pr)} · updated {ago(pr['updatedAt'], now)} ago")
     for claim in snapshot["claims"]:
@@ -134,16 +134,20 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None) -> st
     for run in runs["running"]:
         lines.append(_run_line(run, now))
     for run in runs["queued"]:
-        lines.append(f"  queued   {run['workflow']} · {run['branch']} ({run['event']}) · waiting {ago(run['createdAt'], now)}")
+        status = "" if run.get("status") in (None, "queued") else f" [{run['status']}]"
+        lines.append(f"  queued   {run['workflow']} · {run['branch']} ({run['event']}){status} · waiting {ago(run['createdAt'], now)}")
     lines.append("")
 
     lines.append("TRAIN")
     if not snapshot["train"]:
         lines.append("  empty")
+    prs = {pr["number"]: pr for pr in snapshot["prs"]}
     for position, entry in enumerate(snapshot["train"], start=1):
-        moved = " · head moved since added" if entry["headMoved"] else ""
         by = f" by {entry['agent']}" if entry.get("agent") else ""
-        lines.append(f"  {position}. PR #{entry['pr']} · added {ago(entry['addedAt'], now)} ago{by}{moved}")
+        pr = prs.get(entry["pr"])
+        verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
+        state = "ready" if verdict == train.READY else ("held: " if verdict == train.HOLD else "will be removed: ") + reason
+        lines.append(f"  {position}. PR #{entry['pr']} · added {ago(entry['addedAt'], now)} ago{by} · {state}")
     lines.append("")
 
     if unread is not None:

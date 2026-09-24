@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
 import sys
 from typing import Any, Dict, List, Optional
 
 from . import EXIT_BACKEND, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import cache, identity, marker, render, review, snapshot
+from . import cache, identity, marker, render, review, snapshot, train, train_step
 from .gh import GitHub, GitHubError, NotFound
 
 INBOX_DEFAULT_DAYS = 7
@@ -36,12 +37,14 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
 def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str]) -> int:
     """Messages addressed to `me` newer than the inbox cursor, from the snapshot alone."""
     since = review.parse_time(cursor) if cursor else None
+    mine = {f"#{n}" for c in snap["claims"] if c["agent"] == me for n in (c["issue"], c["pr"]) if n}
     count = 0
     for message in snap["messages"]:
         payload = message["payload"]
         if payload.get("agent") == me:
             continue
-        if not any(identity.matches(str(to), me) for to in payload.get("to") or []):
+        # `send --on N` addresses "#N": whoever works on N.
+        if not any(identity.matches(str(to), me) or str(to) in mine for to in payload.get("to") or []):
             continue
         created = review.parse_time(message["createdAt"])
         if since is None or (created is not None and created > since):
@@ -315,11 +318,103 @@ def cmd_ci(args: argparse.Namespace, gh: GitHub) -> int:
     ref = args.ref or identity.git_branch()
     if not ref:
         raise UsageError("no branch: pass --ref")
-    gh._run(["workflow", "run", "ci.yml", "--repo", gh.repo, "--ref", ref, "-f", f"lanes={args.lanes}"])
+    gh.dispatch_workflow("ci.yml", ref, {"lanes": args.lanes})
     cache.invalidate_snapshot(gh.repo)
     runs = snapshot.fetch_runs(gh)
     print(f"requested ci.yml lanes={args.lanes} on {ref}. Tycho now: "
           f"{len(runs['running'])} running, {len(runs['queued'])} queued (yours is among the queued once GitHub registers it).")
+    return EXIT_OK
+
+
+def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
+    me = identity.agent_id()
+    snap = get_snapshot(gh, 0)
+    pr = next((p for p in snap["prs"] if p["number"] == args.pr), None)
+    if pr is None:
+        print(f"coord: #{args.pr} is not an open pull request", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    verdict, reason = train.eligibility(pr)
+    if verdict == train.DROP:
+        print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
+        return EXIT_CONFLICT
+    train_step.ensure_labels(gh)
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
+    text = (
+        f"**Added to the merge train** by `{me}` at head `{pr['head'][:9]}`"
+        + (f" ({args.note})" if args.note else "") + ".\n\n"
+        "Adding asserts this PR is not a carve-out (a sound-character change, a persistence change "
+        "without a migration, a public API break); those carry `needs-alex` until Alex adds "
+        "`alex-approved`. A new push after this point takes the PR out of the train."
+    )
+    post_comment(gh, args.pr, text, {"kind": "train-add", "v": 1, "agent": me, "pr": args.pr, "head": pr["head"]})
+    cache.invalidate_snapshot(gh.repo)
+    try:
+        gh.dispatch_workflow("merge-train.yml", "main")
+    except GitHubError:
+        pass  # the workflow runs on its own schedule too; before it reaches main it cannot be dispatched
+    state = "ready now" if verdict == train.READY else f"held until: {reason}"
+    print(f"added #{args.pr} at {pr['head'][:9]} to the merge train; {state}")
+    return EXIT_OK
+
+
+def cmd_train_remove(args: argparse.Namespace, gh: GitHub) -> int:
+    me = identity.agent_id()
+    try:
+        gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels/{train.TRAIN_LABEL}", method="DELETE")
+    except NotFound:
+        pass
+    post_comment(gh, args.pr, f"**Taken out of the merge train** by `{me}`." + (f"\n\n{args.note}" if args.note else ""),
+                 {"kind": "train-remove", "v": 1, "agent": me, "pr": args.pr})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"removed #{args.pr} from the merge train")
+    return EXIT_OK
+
+
+def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
+    snap = get_snapshot(gh, args.max_age)
+    prs = {p["number"]: p for p in snap["prs"]}
+    refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX) or []
+    batches = []
+    for ref in refs:
+        name = ref["ref"][len("refs/heads/"):]
+        tip = (ref.get("object") or {}).get("sha", "")
+        pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={name}&per_page=10")
+        runs = [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
+        run = max(runs, key=lambda r: r["id"]) if runs else None
+        batches.append({"branch": name, "tip": tip, "run": None if run is None else {
+            "status": run.get("status"), "conclusion": run.get("conclusion"),
+            "attempt": run.get("run_attempt"), "url": run.get("html_url")}})
+    queue = []
+    for entry in snap["train"]:
+        pr = prs.get(entry["pr"])
+        verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
+        queue.append(dict(entry, verdict=verdict, reason=reason))
+    if args.json:
+        print(json.dumps({"batches": batches, "queue": queue}, indent=2))
+        return EXIT_OK
+    print("batch: " + ("none" if not batches else ""))
+    for batch in batches:
+        run = batch["run"]
+        state = "CI not started" if run is None else f"CI {run['status']}" + (
+            f" / {run['conclusion']}" if run.get("conclusion") else "") + f" (attempt {run['attempt']}) {run['url']}"
+        print(f"  {batch['branch']} at {batch['tip'][:9]}: {state}")
+    print("queue: " + ("empty" if not queue else ""))
+    for position, entry in enumerate(queue, start=1):
+        print(f"  {position}. #{entry['pr']} {entry['verdict']}" + ("" if entry["verdict"] == train.READY else f": {entry['reason']}"))
+    return EXIT_OK
+
+
+def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
+    step = train_step.Step(gh, train_step.Git(args.repo_dir), args.mode, agent=identity.agent_id())
+    try:
+        lines = step.run()
+    except train_step.GitError as error:
+        print(f"coord: git: {error}", file=sys.stderr)
+        return EXIT_BACKEND
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a", encoding="utf-8") as handle:
+            handle.write(f"### Merge train step ({args.mode})\n\n" + "\n".join(f"- {line}" for line in lines) + "\n")
     return EXIT_OK
 
 
@@ -382,6 +477,25 @@ def parser() -> argparse.ArgumentParser:
     ci.add_argument("lanes", help="comma-separated ci.yml lanes: all, mk4, mk4-debug, mk4-release, apps, ...")
     ci.add_argument("--ref", help="default: the current branch")
     ci.set_defaults(func=cmd_ci)
+
+    train_parser = sub.add_parser("train", help="the merge train: add, remove, status (step runs in Actions)")
+    train_sub = train_parser.add_subparsers(dest="train_command", required=True)
+    add = train_sub.add_parser("add", help="queue a PR; asserts it is not a carve-out")
+    add.add_argument("pr", type=int)
+    add.add_argument("--note")
+    add.set_defaults(func=cmd_train_add)
+    remove = train_sub.add_parser("remove", help="take a PR out of the train")
+    remove.add_argument("pr", type=int)
+    remove.add_argument("--note")
+    remove.set_defaults(func=cmd_train_remove)
+    status = train_sub.add_parser("status", help="the current batch and every queued PR's readiness")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
+    status.set_defaults(func=cmd_train_status)
+    step = train_sub.add_parser("step", help="advance the train by one step (merge-train.yml runs this)")
+    step.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
+    step.add_argument("--repo-dir", default=".", help="a clone with push access (default: current directory)")
+    step.set_defaults(func=cmd_train_step)
     return top
 
 

@@ -235,6 +235,79 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(claims[0]["pr"], 101)
 
 
+class CodexRoundTwoTests(unittest.TestCase):
+    """Findings from Codex's review of aea96eea9 on #989."""
+
+    def test_forced_claim_retires_the_previous_holder(self):
+        comments = [
+            coord_comment(1, 7, 60, {"kind": "claim", "agent": "a", "issue": 7, "branch": "x"}),
+            coord_comment(2, 7, 10, {"kind": "claim", "agent": "b", "issue": 7, "branch": "y", "takesOverFrom": ["a"]}),
+        ]
+        claims = snapshot.resolve_claims(comments, {"issues": {7: {"state": "OPEN"}}, "branches": {}}, [], NOW)
+        self.assertEqual([(c["agent"], c["contested"]) for c in claims], [("b", False)])
+
+    def test_a_claim_with_a_pr_keeps_its_declared_files_in_overlaps(self):
+        pr = snapshot.summarize_pr(pr_node())  # touches A.swift and Docs/X.md
+        claims = [
+            {"issue": 55, "agent": "a", "pr": 101, "files": ["Packages/CoreKit/Sources/B.swift"]},
+            {"issue": 60, "agent": "b", "pr": None, "files": ["Packages/CoreKit/Sources/B.swift"]},
+        ]
+        found = snapshot.overlaps([pr], claims)
+        self.assertEqual(found, [{"a": "PR #101", "b": "claim #60 (b)", "files": ["Packages/CoreKit/Sources/B.swift"]}])
+
+    def test_unread_count_includes_messages_sent_to_an_issue_i_work_on(self):
+        me = "claude@Eidolon:wt"
+        snap = {"claims": [{"agent": me, "issue": 40, "pr": 41}], "messages": [
+            {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#40"]}},
+            {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#41"]}},
+            {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#99"]}},
+        ]}
+        self.assertEqual(cli.unread_direct(snap, me, None), 2)
+
+    def test_truncated_files_and_review_threads_are_completed(self):
+        class Fake:
+            owner, name = "o", "r"
+
+            def __init__(self):
+                self.graphql_calls = 0
+
+            def rest_paginated(self, path):
+                assert "pulls/101/files" in path, path
+                return [{"filename": f"f{i}"} for i in range(150)]
+
+            def graphql(self, query, variables):
+                self.graphql_calls += 1
+                return {"repository": {"pullRequest": {"reviewThreads": {
+                    "pageInfo": {"hasNextPage": False, "endCursor": "z"},
+                    "nodes": [{"isResolved": False, "comments": {"nodes": [{"author": {"login": "chatgpt-codex-connector"}}]}}],
+                }}}}
+
+        node = pr_node(files={"totalCount": 150, "nodes": [{"path": "f0"}]},
+                       reviewThreads={"totalCount": 51, "pageInfo": {"hasNextPage": True, "endCursor": "a"}, "nodes": []})
+        fake = Fake()
+        snapshot.complete_pr_node(fake, node)
+        summary = snapshot.summarize_pr(node)
+        self.assertEqual(len(summary["files"]), 150)
+        self.assertFalse(summary["filesTruncated"])
+        self.assertEqual(summary["unansweredFindings"], 1)
+        self.assertEqual(fake.graphql_calls, 1)
+
+    def test_every_waiting_run_status_is_listed(self):
+        class Fake:
+            def __init__(self):
+                self.paths = []
+
+            def rest_paginated(self, path):
+                self.paths.append(path)
+                status = path.split("status=")[1].split("&")[0]
+                if status == "in_progress":
+                    return [{"workflow_runs": []}]
+                return [{"workflow_runs": [{"id": len(self.paths), "status": status, "created_at": t(len(self.paths))}]}]
+
+        runs = snapshot.fetch_runs(Fake())
+        self.assertEqual(sorted(r["status"] for r in runs["queued"]), ["pending", "queued", "requested", "waiting"])
+
+
 class OverlapAndTrainTests(unittest.TestCase):
     def test_directory_claim_overlaps_file(self):
         pr = snapshot.summarize_pr(pr_node())

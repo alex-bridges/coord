@@ -24,9 +24,10 @@ CLAIM_WINDOW_DAYS = 14
 STALE_HOURS = 48
 TRAIN_LABEL = "train"
 MAILBOX_LABEL = "coord:mailbox"
+WAITING_RUN_STATUSES = ("queued", "waiting", "requested", "pending")
 
 PR_FIELDS = """
-number title url isDraft headRefName headRefOid baseRefName createdAt updatedAt mergeable
+number title url isDraft isCrossRepository headRefName headRefOid baseRefName createdAt updatedAt mergeable
 labels(first: 20) { nodes { name } }
 files(first: 100) { totalCount nodes { path } }
 reactions(first: 50) { nodes { content createdAt user { login } } }
@@ -40,7 +41,7 @@ commits(last: 1) { nodes { commit {
     ... on StatusContext { context state }
   } } }
 } } }
-reviewThreads(first: 50) { totalCount nodes { isResolved comments(first: 10) { nodes { author { login } } } } }
+reviewThreads(first: 50) { totalCount pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 10) { nodes { author { login } } } } }
 """
 
 PRS_QUERY = """
@@ -64,7 +65,44 @@ def iso(moment: dt.datetime) -> str:
     return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+THREADS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { isResolved comments(first: 10) { nodes { author { login } } } }
+      }
+    }
+  }
+}
+"""
+
+
 # MARK: - Fetch
+
+
+def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
+    """Fill in what the batched query truncates, for the few PRs that need it.
+
+    The PR query takes the first 100 files and 50 review threads; a PR past either
+    limit would otherwise show fewer overlaps or fewer unanswered findings than it
+    has (Codex on #989). The extra calls are spent only on those PRs.
+    """
+    files = node.get("files") or {}
+    if files.get("totalCount", 0) > len(files.get("nodes") or []):
+        listed = gh.rest_paginated(f"repos/{{repo}}/pulls/{node['number']}/files?per_page=100")
+        node["files"] = {"totalCount": len(listed), "nodes": [{"path": f["filename"]} for f in listed]}
+    threads = node.get("reviewThreads") or {}
+    page_info = threads.get("pageInfo") or {}
+    cursor = page_info.get("endCursor")
+    while page_info.get("hasNextPage"):
+        data = gh.graphql(THREADS_QUERY, {"owner": gh.owner, "name": gh.name, "number": node["number"], "cursor": cursor})
+        more = data["repository"]["pullRequest"]["reviewThreads"]
+        threads.setdefault("nodes", []).extend(more["nodes"])
+        page_info = more["pageInfo"]
+        cursor = page_info.get("endCursor")
+    threads["pageInfo"] = {"hasNextPage": False, "endCursor": cursor}
 
 
 def fetch_prs(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -81,6 +119,8 @@ def fetch_prs(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         if not page["pageInfo"]["hasNextPage"]:
             break
         cursor = page["pageInfo"]["endCursor"]
+    for node in nodes:
+        complete_pr_node(gh, node)
     return main, nodes
 
 
@@ -88,9 +128,13 @@ def fetch_runs(gh: GitHub) -> Dict[str, List[Dict[str, Any]]]:
     running: List[Dict[str, Any]] = []
     for page in gh.rest_paginated("repos/{repo}/actions/runs?status=in_progress&per_page=50"):
         running.extend(page.get("workflow_runs", []))
+    # Every status a run can wait in, not only `queued`: a run held in `waiting`,
+    # `requested` or `pending` is work in line too (Codex on #989).
     queued: List[Dict[str, Any]] = []
-    for page in gh.rest_paginated("repos/{repo}/actions/runs?status=queued&per_page=50"):
-        queued.extend(page.get("workflow_runs", []))
+    for status in WAITING_RUN_STATUSES:
+        for page in gh.rest_paginated(f"repos/{{repo}}/actions/runs?status={status}&per_page=50"):
+            queued.extend(page.get("workflow_runs", []))
+    queued.sort(key=lambda run: run.get("created_at") or "")
 
     def summary(run: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -103,6 +147,7 @@ def fetch_runs(gh: GitHub) -> Dict[str, List[Dict[str, Any]]]:
             "startedAt": run.get("run_started_at"),
             "attempt": run.get("run_attempt"),
             "url": run.get("html_url"),
+            "status": run.get("status"),
         }
 
     out_running = []
@@ -197,6 +242,7 @@ def summarize_pr(pr: Dict[str, Any]) -> Dict[str, Any]:
         "head": pr.get("headRefOid"),
         "base": pr.get("baseRefName"),
         "isDraft": bool(pr.get("isDraft")),
+        "fromFork": bool(pr.get("isCrossRepository")),
         "mergeable": pr.get("mergeable"),
         "updatedAt": pr.get("updatedAt"),
         "labels": [l["name"] for l in ((pr.get("labels") or {}).get("nodes")) or []],
@@ -237,6 +283,10 @@ def resolve_claims(
             for key in [k for k in latest if k[0] == issue]:
                 latest.pop(key)
             continue
+        if kind == "claim":
+            # A forced claim (`claim --force`) retires the holders it names.
+            for previous in payload.get("takesOverFrom") or []:
+                latest.pop((issue, previous), None)
         latest[(issue, agent)] = comment
 
     pr_by_branch = {pr["branch"]: pr for pr in prs}
@@ -293,7 +343,9 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
     """Pairs of in-flight work touching the same files. A warning, never a lock."""
     items: List[Tuple[str, List[str]]] = []
     for pr in prs:
-        items.append((f"PR #{pr['number']}", pr["files"]))
+        # Files the claim expects but the PR has not touched yet still count.
+        declared = [f for c in claims if c["pr"] == pr["number"] for f in c["files"]]
+        items.append((f"PR #{pr['number']}", sorted(set(pr["files"]) | set(declared))))
     for claim in claims:
         if claim["pr"] is None and claim["files"]:
             items.append((f"claim #{claim['issue']} ({claim['agent']})", claim["files"]))
