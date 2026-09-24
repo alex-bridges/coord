@@ -177,7 +177,7 @@ class FindingTests(unittest.TestCase):
 class CITests(unittest.TestCase):
     def test_verdict_success(self):
         state = review.ci_state(with_checks(check("CI verdict"), check("Select lanes")))
-        self.assertEqual(state, {"verdict": "success", "failing": [], "pending": []})
+        self.assertEqual(state, {"verdict": "success", "failing": [], "pending": [], "started": []})
 
     def test_failing_ignores_xcode_cloud_and_cancelled(self):
         state = review.ci_state(with_checks(
@@ -194,6 +194,14 @@ class CITests(unittest.TestCase):
         state = review.ci_state(with_checks(check("CI verdict", status="QUEUED", conclusion=None)))
         self.assertEqual(state["verdict"], "pending")
         self.assertEqual(state["pending"], ["CI verdict"])
+
+    def test_queued_checks_are_not_called_running(self):
+        queued = review.ci_state(with_checks(check("CI verdict", status="QUEUED", conclusion=None),
+                                             check("CoreKit release gate", status="QUEUED", conclusion=None)))
+        self.assertEqual(render.ci_words(queued), "CI queued (2 checks waiting for a runner)")
+        started = review.ci_state(with_checks(check("CI verdict", status="QUEUED", conclusion=None),
+                                              check("CoreKit release gate", status="IN_PROGRESS", conclusion=None)))
+        self.assertEqual(render.ci_words(started), "CI running (1 check running, 1 waiting)")
 
     def test_cancelled_verdict(self):
         self.assertEqual(review.ci_state(with_checks(check("CI verdict", conclusion="CANCELLED")))["verdict"], "cancelled")
@@ -519,7 +527,7 @@ class RestFallbackTests(unittest.TestCase):
         self.assertEqual(main["sha"], "m" * 40)
         self.assertTrue(pr["codex"]["approved"])
         self.assertEqual(pr["unansweredFindings"], 1, "thread 1 answered, thread 3 not")
-        self.assertEqual(pr["ci"], {"verdict": "success", "failing": [], "pending": []}, "Xcode Cloud ignored")
+        self.assertEqual(pr["ci"], {"verdict": "success", "failing": [], "pending": [], "started": []}, "Xcode Cloud ignored")
         self.assertEqual((pr["mergeable"], pr["fromFork"], pr["labels"], pr["closes"]),
                          ("CONFLICTING", False, ["train"], [55, 56]))
 
@@ -684,7 +692,9 @@ class RenderTests(unittest.TestCase):
         text = render.board(self.full_snapshot(), "me", unread=2)
         for expected in ("PR #101", "CONTESTED", "(+1 more)", "Tycho", "waiting 12m", "1. PR #101", "INBOX  2 new"):
             self.assertIn(expected, text)
-        self.assertIn("1 claim without a PR", render.brief(self.full_snapshot(), "me", unread=0))
+        brief = render.brief(self.full_snapshot(), "me", unread=0)
+        self.assertIn("1 claim without a PR", brief)
+        self.assertIn("workflow runs 1 running / 1 queued", brief)
 
     def test_empty_board_renders(self):
         empty = {"schema": 1, "generatedAt": snapshot.iso(NOW), "repo": "o/r", "main": {}, "prs": [], "claims": [],

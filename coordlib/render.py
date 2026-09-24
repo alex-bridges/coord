@@ -29,6 +29,10 @@ def _clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
 def ci_words(ci: Dict[str, Any]) -> str:
     verdict = ci.get("verdict")
     if ci.get("failing"):
@@ -37,7 +41,10 @@ def ci_words(ci: Dict[str, Any]) -> str:
     if verdict == "success":
         return "CI green"
     if verdict == "pending" or ci.get("pending"):
-        return f"CI running ({len(ci.get('pending', []))} pending)"
+        waiting = len(ci.get("pending", [])) - len(ci.get("started", []))
+        if ci.get("started"):
+            return f"CI running ({_count(len(ci['started']), 'check')} running, {waiting} waiting)"
+        return f"CI queued ({_count(waiting, 'check')} waiting for a runner)"
     if verdict == "cancelled":
         return "CI cancelled"
     if verdict == "skipped":
@@ -162,7 +169,7 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     parts = [
         f"{len(snapshot['prs'])} open PR" + ("s" if len(snapshot["prs"]) != 1 else ""),
         f"{len(open_claims)} claim" + ("s" if len(open_claims) != 1 else "") + " without a PR",
-        f"CI {len(runs['running'])} running / {len(runs['queued'])} queued",
+        f"workflow runs {len(runs['running'])} running / {len(runs['queued'])} queued",
         f"train {len(snapshot['train'])}",
     ]
     if snapshot["overlaps"]:

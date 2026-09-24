@@ -112,6 +112,7 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
     failing: List[str] = []
     pending: List[str] = []
+    started: List[str] = []
     verdict = "none"
     for context in contexts:
         if context.get("__typename") == "CheckRun":
@@ -120,6 +121,8 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
             conclusion = context.get("conclusion")
             done = status == "COMPLETED"
             failed = done and conclusion in _FAILED
+            if status == "IN_PROGRESS" and not (context.get("name") or "").startswith(_IGNORED_CHECK_PREFIXES):
+                started.append(name)
             if name == VERDICT_CHECK:
                 if not done:
                     verdict = "pending"
@@ -140,5 +143,9 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
             failing.append(name)
         elif not done:
             pending.append(name)
-    return {"verdict": verdict, "failing": sorted(set(failing)), "pending": sorted(set(pending))}
+    # `started` is the part of `pending` a runner has picked up; the rest waits in the
+    # queue. The board says "running" only when something started (probe 5: a PR row
+    # said "running" while the header, which counts workflow runs, said 0 running).
+    return {"verdict": verdict, "failing": sorted(set(failing)), "pending": sorted(set(pending)),
+            "started": sorted(set(started))}
 
