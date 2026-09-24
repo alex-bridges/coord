@@ -8,6 +8,7 @@ issues/comments returns them).
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import os
 import subprocess
@@ -400,6 +401,35 @@ class CodexRoundThreeTests(unittest.TestCase):
         comment = calls.index(("POST", "repos/{repo}/issues/101/comments"))
         label = calls.index(("POST", "repos/{repo}/issues/101/labels"))
         self.assertLess(comment, label)
+
+    def test_train_status_asks_without_a_trailing_slash_and_keeps_only_batches(self):
+        requested = []
+
+        class Fake:
+            repo, owner, name = "o/r", "o", "r"
+
+            def rest(self, path, method="GET", body=None):
+                requested.append(path)
+                return [{"ref": "refs/heads/train/20260924-180000", "object": {"sha": "t" * 40}},
+                        {"ref": "refs/heads/training-notes", "object": {"sha": "x" * 40}}]
+
+            def rest_paginated(self, path):
+                return [{"workflow_runs": []}]
+
+        original = cli.get_snapshot
+        cli.get_snapshot = lambda gh, max_age: {"prs": [], "claims": [], "train": []}
+        try:
+            args = cli.parser().parse_args(["train", "status", "--json"])
+            captured = io.StringIO()
+            saved, sys.stdout = sys.stdout, captured
+            try:
+                self.assertEqual(cli.cmd_train_status(args, Fake()), 0)
+            finally:
+                sys.stdout = saved
+        finally:
+            cli.get_snapshot = original
+        self.assertEqual(requested, ["repos/{repo}/git/matching-refs/heads/train"])
+        self.assertEqual([b["branch"] for b in json.loads(captured.getvalue())["batches"]], ["train/20260924-180000"])
 
     def test_coord_ci_refuses_a_train_batch(self):
         args = cli.parser().parse_args(["ci", "docs", "--ref", "train/20260924-170000"])

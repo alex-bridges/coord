@@ -382,7 +382,11 @@ def cmd_train_remove(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, args.max_age)
     prs = {p["number"]: p for p in snap["prs"]}
-    refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX) or []
+    # No trailing slash: the cloud proxy rejects `…/heads/train/` ("Request path could not
+    # be canonicalized", probe 4). Without it GitHub also matches `training…`, so keep
+    # only refs under refs/heads/train/.
+    refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
+    refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
     for ref in refs:
         name = ref["ref"][len("refs/heads/"):]
