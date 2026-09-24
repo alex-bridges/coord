@@ -256,9 +256,9 @@ class StepTests(unittest.TestCase):
         log = sh(self.origin, "log", "--first-parent", "--max-count=10", f"--format={train.LOG_FORMAT}", name)
         return train.parse_batch(log, name)[1]
 
-    def step(self, fake, mode="live", now=None):
+    def step(self, fake, mode="live", now=None, sleep=None):
         return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(),
-                               log=lambda line: None)
+                               log=lambda line: None, sleep=sleep or (lambda seconds: None))
 
     def queue(self, fake, number, head, minutes_ago):
         fake.issue_comments[number] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
@@ -567,6 +567,35 @@ class StepTests(unittest.TestCase):
         sh(self.work, "push", "-q", "origin", "main")
         self.step(fake, mode="dry-run").run()
         self.assertEqual(fake.posted("green-dry-run"), [1])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+
+    def test_a_run_only_finishing_its_bookkeeping_is_waited_for(self):
+        # ci.yml's verdict job wakes the train as its last step, so the step can start
+        # before GitHub marks the run completed.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        run = self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = [{"name": "Select lanes", "status": "completed"}, {"name": "CI verdict", "status": "in_progress"}]
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            run.update(status="completed", conclusion="success")
+            fake.jobs[77] = [dict(job, status="completed") for job in fake.jobs[77]]
+
+        self.step(fake, sleep=sleep).run()
+        self.assertEqual(slept, [train_step.SETTLE_POLL_SECONDS])
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+
+    def test_a_run_with_real_work_left_is_not_waited_for(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = [{"name": "CoreKit release gate", "status": "in_progress"},
+                         {"name": "CI verdict", "status": "queued"}]
+        slept = []
+        self.step(fake, sleep=slept.append).run()
+        self.assertEqual(slept, [], "a gate still running is an ordinary wait, not a poll")
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
 
     def test_branch_names_are_encoded_in_run_queries(self):

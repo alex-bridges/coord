@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import subprocess
+import time
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
@@ -34,6 +35,12 @@ from .gh import GitHub, GitHubError, NotFound
 BOT_NAME = "github-actions[bot]"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 DISPATCH_GRACE_MINUTES = 10
+# ci.yml's verdict job wakes the train as its last step, so the step can start before
+# GitHub marks the batch run completed. It waits this long, but only while nothing but
+# that bookkeeping is left (every job done, or only the verdict job still running).
+SETTLE_SECONDS = 120
+SETTLE_POLL_SECONDS = 10
+VERDICT_JOB = "CI verdict"
 
 
 class GitError(RuntimeError):
@@ -60,7 +67,8 @@ class Git:
 
 class Step:
     def __init__(self, gh: GitHub, git: Git, mode: str, now: Optional[dt.datetime] = None,
-                 agent: str = "train@actions", log: Callable[[str], None] = print):
+                 agent: str = "train@actions", log: Callable[[str], None] = print,
+                 sleep: Callable[[float], None] = time.sleep):
         if mode not in ("dry-run", "live"):
             raise ValueError(f"mode must be dry-run or live, not {mode!r}")
         self.gh = gh
@@ -69,6 +77,7 @@ class Step:
         self.now = now or snapshot.now_utc()
         self.agent = agent
         self.log = log
+        self.sleep = sleep
         self.lines: List[str] = []
         self._labels_ready = False
 
@@ -135,6 +144,23 @@ class Step:
         newest = max(runs, key=lambda r: r["id"])
         failed = self.failed_jobs(newest["id"]) if newest["conclusion"] == "failure" else []
         return {"conclusion": newest["conclusion"], "failed": failed, "url": newest.get("html_url")}
+
+    def settle(self, name: str, tip: str, run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Give a batch run that is only finishing its bookkeeping time to be marked done.
+
+        Bounded (SETTLE_SECONDS) and only when no real work is left, so a step never
+        holds the runner through a gate.
+        """
+        waited = 0
+        while run is not None and run.get("status") != "completed" and waited < SETTLE_SECONDS:
+            pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
+            unfinished = [j for page in pages for j in page.get("jobs", []) if j.get("status") != "completed"]
+            if any(j.get("name") != VERDICT_JOB for j in unfinished):
+                break  # real work is still running: an ordinary wait
+            self.sleep(SETTLE_POLL_SECONDS)
+            waited += SETTLE_POLL_SECONDS
+            run = self.batch_run(name, tip)
+        return run
 
     def batch_run(self, name: str, tip: str) -> Optional[Dict[str, Any]]:
         """The batch's gate: the newest ci.yml run at the tip that THE TRAIN dispatched.
@@ -294,7 +320,7 @@ class Step:
             self.note(f"{name}: its tip names the batch but no batch merges were found; leaving it for a person")
             return
         numbers = ", ".join(f"#{m['pr']}" for m in members)
-        run = self.batch_run(name, tip)
+        run = self.settle(name, tip, self.batch_run(name, tip))
         if self.git.run("merge-base", "--is-ancestor", tip, "refs/remotes/origin/main", check=False).returncode == 0:
             # Main already holds the batch: an earlier step moved it and was interrupted.
             self.note(f"{name} ({numbers}): main already contains {tip[:9]}; finishing the clean-up")
