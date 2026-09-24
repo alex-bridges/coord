@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import subprocess
+import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 from . import marker, snapshot, train
@@ -111,7 +112,7 @@ class Step:
         `triggering_actor` would change.
         """
         pages = self.gh.rest_paginated(
-            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={name}&per_page=20")
+            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
         runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
         return max(runs, key=lambda r: r["id"]) if runs else None
 
@@ -128,7 +129,9 @@ class Step:
         moving between states (Codex on #989).
         """
         try:
-            pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs?branch={branch}&per_page=100")
+            # Encoded: a branch named `feature#1` or `a&b` must not change the query.
+            pages = self.gh.rest_paginated(
+                f"repos/{{repo}}/actions/runs?branch={urllib.parse.quote(branch, safe='')}&per_page=100")
             for run in [r for page in pages for r in page.get("workflow_runs", [])]:
                 if run.get("status") != "completed":
                     self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/cancel", method="POST")
@@ -171,16 +174,68 @@ class Step:
             self.build(main, prs)
         return self.lines
 
+    def already_posted(self, number: int, event: str, batch: str) -> bool:
+        for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
+            payload = marker.decode(comment.get("body"))
+            if payload and payload.get("kind") == "train" and payload.get("event") == event \
+                    and payload.get("batch") == batch:
+                return True
+        return False
+
+    def finish(self, name: str, tip: str, members: List[Dict[str, Any]], prs: Dict[int, Dict[str, Any]],
+               run: Optional[Dict[str, Any]]) -> None:
+        """Everything after a green batch: labels off, a receipt on each PR, (live) the
+        merged branches' runs cancelled, then the batch branch deleted.
+
+        Each member is handled on its own and every step is safe to repeat, so a failure
+        halfway (after main already moved) leaves the batch branch in place and the next
+        step finishes the job without a second receipt (Codex on #989).
+        """
+        numbers = ", ".join(f"#{m['pr']}" for m in members)
+        url = (run or {}).get("html_url", "")
+        event = "merged" if self.mode == "live" else "green-dry-run"
+        failures = []
+        for member in members:
+            number = member["pr"]
+            try:
+                self.remove_label(number, train.TRAIN_LABEL)
+                self.remove_label(number, train.SOLO_LABEL)
+                if not self.already_posted(number, event, name):
+                    if self.mode == "live":
+                        text = (f"**Merged by the merge train** in batch `{name}` ({numbers}): main is now "
+                                f"`{tip[:9]}`, the exact commit CI tested: {url}")
+                    else:
+                        text = (f"**Merge train (dry run):** batch `{name}` ({numbers}) passed CI at `{tip[:9]}`: "
+                                f"{url}\n\nThe train is in dry-run mode, so main was not changed and this PR left "
+                                f"the queue. Merge it the usual way.")
+                    self.comment(number, text, event, batch=name, run=(run or {}).get("id"), tip=tip)
+                if self.mode == "live":
+                    branch = (prs.get(number) or {}).get("branch") \
+                        or ((self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}).get("head") or {}).get("ref")
+                    if branch:
+                        self.cancel_branch_runs(branch)
+            except GitHubError as error:
+                failures.append(f"#{number}: {error}")
+        if failures:
+            self.note(f"{name}: clean-up incomplete ({'; '.join(failures)}); the next step finishes it")
+            return
+        self.delete_branch(name)
+
     def advance(self, name: str, tip: str, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
-        base = self.git.out("merge-base", tip, "refs/remotes/origin/main")
-        members = train.parse_members(self.git.out(
-            "log", "--first-parent", "--merges", "--format=%H%x09%P%x09%s", f"{base}..{tip}"))
+        base, members = train.parse_batch(
+            self.git.out("log", "--first-parent", f"--max-count={train.BATCH_CAP + 1}",
+                         f"--format={train.LOG_FORMAT}", tip), name)
         if not members:
-            self.note(f"{name}: no train merges on it; deleting")
+            self.note(f"{name}: no merges of this batch on it; deleting")
             self.delete_branch(name)
             return
         numbers = ", ".join(f"#{m['pr']}" for m in members)
         run = self.batch_run(name, tip)
+        if self.git.run("merge-base", "--is-ancestor", tip, "refs/remotes/origin/main", check=False).returncode == 0:
+            # Main already holds the batch: an earlier step moved it and was interrupted.
+            self.note(f"{name} ({numbers}): main already contains {tip[:9]}; finishing the clean-up")
+            self.finish(name, tip, members, prs, run)
+            return
         action = train.run_action(run, len(members))
         if action == "dispatch":
             built = dt.datetime.fromtimestamp(int(self.git.out("log", "-1", "--format=%ct", tip)), dt.timezone.utc)
@@ -253,26 +308,9 @@ class Step:
                 self.note(f"{name} ({numbers}): green, but main could not be fast-forwarded ({error}); rebuilding")
                 self.delete_branch(name)
                 return
-        for member in members:
-            number = member["pr"]
-            pr = prs[number]
-            self.remove_label(number, train.TRAIN_LABEL)
-            self.remove_label(number, train.SOLO_LABEL)
-            if self.mode == "live":
-                self.comment(number, (
-                    f"**Merged by the merge train** in batch `{name}` ({numbers}): main is now `{tip[:9]}`, "
-                    f"the exact commit CI tested: {url}"
-                ), "merged", batch=name, run=run["id"], tip=tip)
-                self.cancel_branch_runs(pr["branch"])
-            else:
-                self.comment(number, (
-                    f"**Merge train (dry run):** batch `{name}` ({numbers}) passed CI at `{tip[:9]}`: {url}\n\n"
-                    f"The train is in dry-run mode, so main was not changed and this PR left the queue. "
-                    f"Merge it the usual way."
-                ), "green-dry-run", batch=name, run=run["id"], tip=tip)
         verb = "main fast-forwarded to" if self.mode == "live" else "dry run: would have fast-forwarded main to"
         self.note(f"{name} ({numbers}): CI green; {verb} {tip[:9]}")
-        self.delete_branch(name)
+        self.finish(name, tip, members, prs, run)
 
     def build(self, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
         queued = [pr for pr in prs.values() if train.TRAIN_LABEL in pr["labels"]]
@@ -317,9 +355,8 @@ class Step:
             if result.returncode != 0:
                 raise GitError(f"git merge-tree: {result.stderr.strip()}")
             tree = result.stdout.split()[0]
-            subject, body = train.merge_message(pr, self.gh.owner)
-            tip = self.git.out("commit-tree", tree, "-p", tip, "-p", head, "-m", subject, "-m", body or subject,
-                               env=identity)
+            paragraphs = [arg for text in train.merge_message(pr, self.gh.owner, name) for arg in ("-m", text)]
+            tip = self.git.out("commit-tree", tree, "-p", tip, "-p", head, *paragraphs, env=identity)
             merged.append(number)
         if not merged:
             self.note("nothing merged cleanly; no batch")

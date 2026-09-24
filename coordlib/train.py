@@ -110,25 +110,38 @@ def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],
 
 
 _MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+) ")
+BATCH_TRAILER = "Train-Batch"
+# One line per first-parent commit: sha, parents, the Train-Batch trailer, subject.
+LOG_FORMAT = "%H%x09%P%x09%(trailers:key=Train-Batch,valueonly,separator=%x2C)%x09%s"
 
 
-def parse_members(log: str) -> List[Dict[str, Any]]:
-    """Batch members from `git log --first-parent --merges --format=%H%x09%P%x09%s base..tip`.
+def parse_batch(log: str, name: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """(base, members oldest first) of batch `name`, from
+    `git log --first-parent --format=LOG_FORMAT <tip>`.
 
-    Each train merge commit's second parent is the PR head it merged; its subject
-    names the PR. Returned oldest first. Anything else on the branch is ignored.
+    The batch is the run of commits from the tip down whose Train-Batch trailer names
+    it; each one's second parent is the PR head it merged, and the first parent of the
+    earliest is the main the batch was built on. The trailer, not a diff against the
+    current main, identifies the batch: after main is fast-forwarded to the tip that
+    diff is empty, and a step interrupted between the fast-forward and the clean-up
+    must still find the PRs it merged (Codex on #989). It also keeps earlier batches'
+    merges, already on main, out of this one.
     """
-    members = []
-    for line in reversed([l for l in log.splitlines() if l.strip()]):
-        parts = line.split("\t", 2)
-        if len(parts) != 3:
-            continue
-        _, parents, subject = parts
-        match = _MERGE_SUBJECT.match(subject)
+    members: List[Dict[str, Any]] = []
+    base: Optional[str] = None
+    for line in log.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) != 4:
+            break
+        _, parents, batch, subject = parts
         parent_list = parents.split()
-        if match and len(parent_list) == 2:
-            members.append({"pr": int(match.group(1)), "sha": parent_list[1]})
-    return members
+        match = _MERGE_SUBJECT.match(subject)
+        if batch.strip() != name or not match or len(parent_list) != 2:
+            break
+        members.append({"pr": int(match.group(1)), "sha": parent_list[1]})
+        base = parent_list[0]
+    members.reverse()
+    return base, members
 
 
 GATE_ACTOR = "github-actions[bot]"
@@ -161,6 +174,9 @@ def batch_name(now: dt.datetime) -> str:
     return BATCH_PREFIX + now.astimezone(dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
 
 
-def merge_message(pr: Dict[str, Any], owner: str) -> Tuple[str, str]:
-    """The same subject GitHub's merge button writes, so history reads the same."""
-    return f"Merge pull request #{pr['number']} from {owner}/{pr['branch']}", pr.get("title", "")
+def merge_message(pr: Dict[str, Any], owner: str, batch: str) -> List[str]:
+    """Paragraphs for `git commit-tree -m …`: the subject GitHub's merge button writes (so
+    history reads the same), the PR title, and the Train-Batch trailer."""
+    return [f"Merge pull request #{pr['number']} from {owner}/{pr['branch']}",
+            pr.get("title") or f"#{pr['number']}",
+            f"{BATCH_TRAILER}: {batch}"]

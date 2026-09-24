@@ -7,7 +7,8 @@ import datetime as dt
 import json
 import os
 import sys
-from typing import Any, Dict, List, Optional
+import urllib.parse
+from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
 from . import cache, identity, marker, render, review, snapshot, train, train_step
@@ -19,6 +20,15 @@ DEFAULT_MAX_AGE = 60
 
 class UsageError(Exception):
     pass
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """argparse exits 2 on a bad invocation; here 2 means a claim conflict, so a usage
+    error must exit EXIT_USAGE (Codex on #989). Subparsers inherit this class."""
+
+    def error(self, message: str) -> "NoReturn":  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, f"{self.prog}: error: {message}\n")
 
 
 # MARK: - Shared helpers
@@ -391,7 +401,8 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     for ref in refs:
         name = ref["ref"][len("refs/heads/"):]
         tip = (ref.get("object") or {}).get("sha", "")
-        pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={name}&per_page=10")
+        pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
+                                  f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
         runs = [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
         run = max(runs, key=lambda r: r["id"]) if runs else None
         batches.append({"branch": name, "tip": tip, "run": None if run is None else {
@@ -435,7 +446,7 @@ def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
 
 
 def parser() -> argparse.ArgumentParser:
-    top = argparse.ArgumentParser(
+    top = ArgumentParser(
         prog="coord",
         description="Shared awareness for agents in example-owner/example-repo: what is in flight, who works on what, "
                     "CI and train state, and messages. Reads GitHub; writes only marked comments.",

@@ -431,6 +431,17 @@ class CodexRoundThreeTests(unittest.TestCase):
         self.assertEqual(requested, ["repos/{repo}/git/matching-refs/heads/train"])
         self.assertEqual([b["branch"] for b in json.loads(captured.getvalue())["batches"]], ["train/20260924-180000"])
 
+    def test_a_bad_invocation_exits_with_the_usage_code_not_the_conflict_code(self):
+        for argv in (["claim", "not-a-number"], ["nonsense"], ["train", "step", "--mode", "yolo"]):
+            with open(os.devnull, "w") as quiet:
+                saved, sys.stderr = sys.stderr, quiet
+                try:
+                    with self.assertRaises(SystemExit) as raised:
+                        cli.parser().parse_args(argv)
+                finally:
+                    sys.stderr = saved
+            self.assertEqual(raised.exception.code, 1, argv)
+
     def test_coord_ci_refuses_a_train_batch(self):
         args = cli.parser().parse_args(["ci", "docs", "--ref", "train/20260924-170000"])
         with self.assertRaises(cli.UsageError):

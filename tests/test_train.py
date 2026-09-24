@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -106,11 +107,12 @@ class PlanAndRunTests(unittest.TestCase):
         self.assertEqual(train.run_action({"status": "completed", "conclusion": "failure", "run_attempt": 2}, 1), "eject")
         self.assertEqual(train.run_action({"status": "completed", "conclusion": "cancelled"}, 1), "abandon")
 
-    def test_parse_members(self):
-        log = ("c3\tc2 p3\tMerge pull request #30 from o/c\n"
-               "c2\tc1 p2\tMerge pull request #20 from o/b\n"
-               "c1\tm0 x\tSome other merge\n")
-        self.assertEqual(train.parse_members(log), [{"pr": 20, "sha": "p2"}, {"pr": 30, "sha": "p3"}])
+    def test_parse_batch_reads_only_this_batchs_merges(self):
+        log = ("c3\tc2 p3\ttrain/B\tMerge pull request #30 from o/c\n"
+               "c2\tc1 p2\ttrain/B\tMerge pull request #20 from o/b\n"
+               "c1\tm0 p1\ttrain/A\tMerge pull request #10 from o/a\n")  # an EARLIER batch, already on main
+        self.assertEqual(train.parse_batch(log, "train/B"), ("c1", [{"pr": 20, "sha": "p2"}, {"pr": 30, "sha": "p3"}]))
+        self.assertEqual(train.parse_batch(log, "train/C"), (None, []))
 
 
 # MARK: - Step against real git and a fake GitHub
@@ -128,6 +130,7 @@ class FakeGitHub:
         self.writes: List[tuple] = []
         self.dispatched: List[tuple] = []
         self.branch_runs: Dict[str, List[Dict[str, Any]]] = {}
+        self.fail_writes = 0
         self.calls = 0
 
     def graphql(self, query, variables=None):
@@ -136,18 +139,26 @@ class FakeGitHub:
                                                 "nodes": self.nodes}}}
 
     def rest(self, path, method="GET", body=None):
+        if self.fail_writes and method in ("POST", "DELETE"):
+            self.fail_writes -= 1
+            from coordlib.gh import GitHubError
+            raise GitHubError("HTTP 502 (injected)")
         self.writes.append((method, path, body))
+        match = re.search(r"issues/(\d+)/comments$", path)
+        if method == "POST" and match:
+            self.issue_comments.setdefault(int(match.group(1)), []).append(
+                {"created_at": snapshot.iso(NOW), "body": body["body"]})
         return {"html_url": "h"} if method == "POST" else None
 
     def rest_paginated(self, path):
         match = re.search(r"actions/workflows/ci\.yml/runs\?branch=([^&]+)", path)
         if match:
-            return [{"workflow_runs": self.runs.get(match.group(1), [])}]
+            return [{"workflow_runs": self.runs.get(urllib.parse.unquote(match.group(1)), [])}]
         match = re.search(r"actions/runs/(\d+)/jobs", path)
         if match:
             return [{"jobs": self.jobs.get(int(match.group(1)), [])}]
         if "actions/runs?branch=" in path:
-            branch = path.split("branch=")[1].split("&")[0]
+            branch = urllib.parse.unquote(path.split("branch=")[1].split("&")[0])
             return [{"workflow_runs": self.branch_runs.get(branch, [])}]
         match = re.search(r"issues/(\d+)/comments", path)
         if match:
@@ -213,6 +224,10 @@ class StepTests(unittest.TestCase):
         sh(self.work, "checkout", "-q", "main")
         return head
 
+    def members(self, name):
+        log = sh(self.origin, "log", "--first-parent", "--max-count=10", f"--format={train.LOG_FORMAT}", name)
+        return train.parse_batch(log, name)[1]
+
     def step(self, fake, mode="live", now=None):
         return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(),
                                log=lambda line: None)
@@ -238,8 +253,8 @@ class StepTests(unittest.TestCase):
         branches = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
         self.assertEqual(len(branches.splitlines()), 1, lines)
         tip = sh(self.origin, "rev-parse", branches)
-        log = sh(self.origin, "log", "--first-parent", "--merges", "--format=%H%x09%P%x09%s", f"{self.main}..{tip}")
-        self.assertEqual(train.parse_members(log), [{"pr": 2, "sha": h2}, {"pr": 1, "sha": h1}], "queue order")
+        self.assertEqual(self.members(branches), [{"pr": 2, "sha": h2}, {"pr": 1, "sha": h1}], "queue order")
+        self.assertIn("Train-Batch: " + branches, sh(self.origin, "log", "-1", "--format=%B", tip))
         self.assertEqual(sh(self.origin, "show", f"{tip}:b.txt"), "b from 1")
         self.assertEqual(fake.dispatched, [("ci.yml", branches, {"lanes": "changed"})])
         self.assertEqual(sorted(fake.posted("testing")), [1, 2])
@@ -256,9 +271,7 @@ class StepTests(unittest.TestCase):
         lines = self.step(fake).run()
         name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
         tip = sh(self.origin, "rev-parse", name)
-        members = train.parse_members(sh(self.origin, "log", "--first-parent", "--merges",
-                                         "--format=%H%x09%P%x09%s", f"{self.main}..{tip}"))
-        self.assertEqual([m["pr"] for m in members], [1])
+        self.assertEqual([m["pr"] for m in self.members(name)], [1])
         self.assertTrue(any("#2 held: it does not merge cleanly on top of #1" in line for line in lines), lines)
         self.assertEqual(fake.posted("removed"), [], "a conflict with a batch-mate is not the PR's fault")
 
@@ -380,6 +393,36 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertEqual(fake.posted("ejected"), [1])
         self.assertIn(("DELETE", "repos/{repo}/issues/1/labels/train", None), fake.writes)
+
+    def test_clean_up_interrupted_after_main_moved_is_finished_by_the_next_step(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        h2 = self.pr_branch(2, "d.txt", "d\n")
+        fake, name, tip = self.build_batch([(1, h1), (2, h2)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.fail_writes = 1  # the first write after the fast-forward fails
+        lines = self.step(fake).run()
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes,
+                         "the batch branch stays so the clean-up can resume")
+        self.assertTrue(any("clean-up incomplete" in line for line in lines), lines)
+        first_round = sorted(fake.posted("merged"))
+        # What the real PATCH did: main is now the batch tip. The merged PRs are closed.
+        sh(self.origin, "update-ref", "refs/heads/main", tip)
+        fake.nodes = []
+        fake.writes.clear()
+        lines = self.step(fake).run()
+        self.assertTrue(any("main already contains" in line for line in lines), lines)
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), "main is not moved twice")
+        self.assertEqual(sorted(first_round + fake.posted("merged")), [1, 2], "one receipt per PR, none twice")
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_branch_names_are_encoded_in_run_queries(self):
+        fake = FakeGitHub([], self.main)
+        seen = []
+        original = fake.rest_paginated
+        fake.rest_paginated = lambda path: (seen.append(path), original(path))[1]
+        self.step(fake).cancel_branch_runs("feature#1&x")
+        self.assertIn("branch=feature%231%26x&", seen[0])
 
     def test_a_missing_run_waits_briefly_then_dispatches_again(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
