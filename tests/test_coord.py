@@ -590,6 +590,22 @@ class TransportTests(unittest.TestCase):
         self.assertIn("repos/o/r/issues/comments", seen[0])
         self.assertEqual(gh.calls, 1)
 
+    def test_http_pagination_stays_on_the_owner_name_path(self):
+        from coordlib import gh as ghmodule
+        link = ("<https://api.github.com/repositories/100000001/issues/comments?since=x&per_page=100&page=2>; "
+                'rel="next", <https://api.github.com/repositories/100000001/issues/comments?page=5>; rel="last"')
+        self.assertEqual(ghmodule.repo_path_link(ghmodule._next_link(link), "example-owner/example-repo"),
+                         "https://api.github.com/repos/example-owner/example-repo/issues/comments?since=x&per_page=100&page=2")
+        requested = []
+        pages = {
+            "repos/o/r/issues/comments?per_page=100": ([{"id": 1}], {"link": '<https://api.github.com/repositories/42/issues/comments?per_page=100&page=2>; rel="next"'}),
+            "https://api.github.com/repos/o/r/issues/comments?per_page=100&page=2": ([{"id": 2}], {}),
+        }
+        gh = GitHub("o/r", transport="http", token="t")
+        gh._http = lambda method, url, body=None: (requested.append(url), pages[url])[1]
+        self.assertEqual(gh.rest_paginated("repos/{repo}/issues/comments?per_page=100"), [{"id": 1}, {"id": 2}])
+        self.assertFalse(any("repositories/" in url for url in requested), requested)
+
     def test_errors_raise(self):
         def runner(args, stdin):
             return subprocess.CompletedProcess(args, 1, "", "gh: Not Found (HTTP 404)")

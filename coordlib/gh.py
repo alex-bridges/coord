@@ -88,6 +88,17 @@ def _next_link(header: Optional[str]) -> Optional[str]:
     return None
 
 
+def repo_path_link(url: str, repo: str) -> str:
+    """A next-page link rewritten from `repositories/<numeric id>/…` to `repos/<owner>/<name>/…`.
+
+    GitHub writes pagination links with the repository's numeric id, and the Claude
+    cloud proxy refuses that form ("Numeric-ID repository paths … are not supported
+    through this proxy", probe 3, 2026-09-24), so every read that needed a second page
+    failed there. The query (page number or cursor) is kept as GitHub wrote it.
+    """
+    return re.sub(r"/repositories/\d+/", f"/repos/{repo}/", url, count=1)
+
+
 class GitHub:
     """`runner` injects a fake `gh` (tests); `transport` forces "gh" or "http"."""
 
@@ -191,7 +202,8 @@ class GitHub:
             while url:
                 page, headers = self._http("GET", url)
                 pages.append(page)
-                url = _next_link(headers.get("link"))
+                link = _next_link(headers.get("link"))
+                url = repo_path_link(link, self.repo) if link else None
         else:
             out = self._run(["api", path, "--paginate", "--slurp"])
             pages = json.loads(out) if out.strip() else []
