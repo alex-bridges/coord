@@ -88,6 +88,15 @@ class PlanAndRunTests(unittest.TestCase):
         solo_behind = train.plan(queue, verdicts, {1: [], 3: ["train:solo"], 5: []}, cap=3)
         self.assertEqual(solo_behind["batch"], [1, 5])
 
+    def test_is_gate_run(self):
+        bot = {"head_sha": "t", "event": "workflow_dispatch", "actor": {"login": "github-actions[bot]"}}
+        self.assertTrue(train.is_gate_run(bot, "t"))
+        self.assertFalse(train.is_gate_run(bot, "other tip"))
+        self.assertFalse(train.is_gate_run(dict(bot, actor={"login": "alex-bridges"}), "t"))
+        self.assertFalse(train.is_gate_run(dict(bot, event="push"), "t"))
+        # A re-run changes triggering_actor, never actor.
+        self.assertTrue(train.is_gate_run(dict(bot, triggering_actor={"login": "alex-bridges"}), "t"))
+
     def test_run_action(self):
         self.assertEqual(train.run_action(None, 2), "dispatch")
         self.assertEqual(train.run_action({"status": "in_progress"}, 2), "wait")
@@ -279,10 +288,20 @@ class StepTests(unittest.TestCase):
         return fake, name, tip
 
     def run_on(self, fake, name, tip, **fields):
-        run = {"id": 77, "head_sha": tip, "status": "completed", "run_attempt": 1, "html_url": "run-url"}
+        run = {"id": 77, "head_sha": tip, "status": "completed", "run_attempt": 1, "html_url": "run-url",
+               "event": "workflow_dispatch", "actor": {"login": "github-actions[bot]"}}
         run.update(fields)
         fake.runs[name] = [run]
         return run
+
+    def test_only_the_trains_own_dispatch_gates_a_batch(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        # Someone's green narrow dispatch at the same tip, newer than any train run.
+        self.run_on(fake, name, tip, id=99, conclusion="success", actor={"login": "alex-bridges"})
+        lines = self.step(fake, now=snapshot.now_utc()).run()
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+        self.assertEqual(fake.posted("merged"), [])
 
     def test_green_batch_fast_forwards_main_to_the_tested_commit(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")

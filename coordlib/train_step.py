@@ -102,9 +102,17 @@ class Step:
             self.note(f"could not delete {name}: {error}")
 
     def batch_run(self, name: str, tip: str) -> Optional[Dict[str, Any]]:
+        """The batch's gate: the newest ci.yml run at the tip that THE TRAIN dispatched.
+
+        Any other run on the branch (someone's narrow `lanes=docs` dispatch) must never
+        count as the gate, or a green partial run could move main while the real gate
+        is red (Codex P1 on #989). The train dispatches with the Actions token, so its
+        runs' initial actor is the Actions bot; `actor` stays that on a re-run, where
+        `triggering_actor` would change.
+        """
         pages = self.gh.rest_paginated(
             f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={name}&per_page=20")
-        runs = [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
+        runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
         return max(runs, key=lambda r: r["id"]) if runs else None
 
     def failed_jobs(self, run_id: int) -> List[str]:

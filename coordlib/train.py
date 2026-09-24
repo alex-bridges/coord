@@ -131,6 +131,16 @@ def parse_members(log: str) -> List[Dict[str, Any]]:
     return members
 
 
+GATE_ACTOR = "github-actions[bot]"
+
+
+def is_gate_run(run: Dict[str, Any], tip: str) -> bool:
+    """A ci.yml run the train itself dispatched for this batch tip."""
+    return (run.get("head_sha") == tip
+            and run.get("event") == "workflow_dispatch"
+            and ((run.get("actor") or {}).get("login") == GATE_ACTOR))
+
+
 def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
     """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon."""
     if run is None:

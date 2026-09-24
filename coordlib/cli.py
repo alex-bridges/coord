@@ -85,7 +85,8 @@ def find_or_create_mailbox(gh: GitHub) -> int:
 
 def cmd_whoami(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
-    info = {"agent": me, "repo": gh.repo, "branch": identity.git_branch(), "cacheDir": cache.cache_dir(gh.repo)}
+    info = {"agent": me, "repo": gh.repo, "branch": identity.git_branch() or identity.detached_description(),
+            "graphql": "no (REST only)" if snapshot.rest_only(gh) else "yes", "cacheDir": cache.cache_dir(gh.repo)}
     print(json.dumps(info, indent=2) if args.json else "\n".join(f"{k}: {v}" for k, v in info.items()))
     return EXIT_OK
 
@@ -149,7 +150,12 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
               "(say why in --note)." % args.issue, file=sys.stderr)
         return EXIT_CONFLICT
 
-    files = args.files or []
+    files = []
+    for raw in args.files or []:
+        normal = snapshot.normalize_path(raw)
+        if not normal:
+            raise UsageError(f"{raw!r}: name files by their path from the repository root (no leading /, no ..)")
+        files.append(normal)
     payload = {"kind": "claim", "v": 1, "agent": me, "issue": args.issue, "branch": branch, "files": files}
     if args.note:
         payload["note"] = args.note
@@ -180,18 +186,12 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
 
     print(f"claimed #{args.issue} as {me} on {branch}: {posted.get('html_url')}")
     warnings = []
-    for pr in snap["prs"]:
-        if pr["branch"] == branch:
-            continue
-        shared = sorted({f for f in files for g in pr["files"] if snapshot._paths_overlap(f, g)})
+    for label, other, owner in snapshot.work_items(snap["prs"], snap["claims"]):
+        if owner.get("branch") == branch or owner.get("issue") == args.issue:
+            continue  # this work itself
+        shared = snapshot.overlapping(files, other)
         if shared:
-            warnings.append(f"  PR #{pr['number']} ({pr['branch']}) also touches: {', '.join(shared[:5])}")
-    for claim in snap["claims"]:
-        if claim["issue"] == args.issue or claim["pr"] is not None:
-            continue
-        shared = sorted({f for f in files for g in claim["files"] if snapshot._paths_overlap(f, g)})
-        if shared:
-            warnings.append(f"  claim #{claim['issue']} ({claim['agent']}) expects: {', '.join(shared[:5])}")
+            warnings.append(f"  {label} ({owner.get('branch')}) touches or expects: {', '.join(shared[:5])}")
     if warnings:
         print("overlaps (a warning, nothing is locked):")
         print("\n".join(warnings))
@@ -318,6 +318,8 @@ def cmd_ci(args: argparse.Namespace, gh: GitHub) -> int:
     ref = args.ref or identity.git_branch()
     if not ref:
         raise UsageError("no branch: pass --ref")
+    if ref.startswith(train.BATCH_PREFIX):
+        raise UsageError(f"{ref} is a merge-train batch; only the train dispatches its gate")
     gh.dispatch_workflow("ci.yml", ref, {"lanes": args.lanes})
     cache.invalidate_snapshot(gh.repo)
     runs = snapshot.fetch_runs(gh)
@@ -337,8 +339,6 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     if verdict == train.DROP:
         print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
         return EXIT_CONFLICT
-    train_step.ensure_labels(gh)
-    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
     text = (
         f"**Added to the merge train** by `{me}` at head `{pr['head'][:9]}`"
         + (f" ({args.note})" if args.note else "") + ".\n\n"
@@ -346,7 +346,11 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
         "without a migration, a public API break); those carry `needs-alex` until Alex adds "
         "`alex-approved`. A new push after this point takes the PR out of the train."
     )
+    # The head marker first, the label second: the label is what queues the PR, so it
+    # must never exist without the record of the head it was added at (Codex on #989).
     post_comment(gh, args.pr, text, {"kind": "train-add", "v": 1, "agent": me, "pr": args.pr, "head": pr["head"]})
+    train_step.ensure_labels(gh)
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
     cache.invalidate_snapshot(gh.repo)
     try:
         gh.dispatch_workflow("merge-train.yml", "main")
@@ -444,7 +448,8 @@ def parser() -> argparse.ArgumentParser:
     claim = sub.add_parser("claim", help="announce that you are working on an issue")
     claim.add_argument("issue", type=int)
     claim.add_argument("--branch", help="default: the current branch")
-    claim.add_argument("--files", nargs="+", metavar="PATH", help="files or directories you expect to touch")
+    claim.add_argument("--files", nargs="+", metavar="PATH",
+                       help="files or directories you expect to touch, as paths from the repository root")
     claim.add_argument("--note", help="one line of context")
     claim.add_argument("--force", action="store_true", help="claim even though another agent holds it (say why in --note)")
     claim.add_argument("--dry-run", action="store_true", help="print the comment instead of posting it")

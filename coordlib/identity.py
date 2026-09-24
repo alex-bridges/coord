@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import subprocess
+import uuid
 from typing import Mapping, Optional
 
 
@@ -63,6 +64,16 @@ def git_branch(cwd: Optional[str] = None) -> str:
         return ""
 
 
+def detached_description(cwd: Optional[str] = None) -> str:
+    """For a checkout with no branch (a cloud session checks out FETCH_HEAD)."""
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                             cwd=cwd, timeout=5).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        sha = ""
+    return f"(detached at {sha}; pass --branch to claim)" if sha else "(no git checkout)"
+
+
 def agent_id(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None) -> str:
     env = os.environ if env is None else env
     explicit = env.get("COORD_AGENT")
@@ -70,7 +81,36 @@ def agent_id(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None)
         return explicit
     toplevel = git_toplevel(cwd)
     worktree = os.path.basename(toplevel) if toplevel else "nogit"
-    return f"{detect_harness(env, toplevel)}@{detect_host()}:{worktree}"
+    harness = detect_harness(env, toplevel)
+    if harness == "claude-cloud":
+        # Every cloud container reports host "vm" and checkout "INISA" (probed
+        # 2026-09-24), so host:worktree would give all cloud sessions ONE identity and
+        # mix their claims and messages. A container is one session: name it by that.
+        session = env.get("CLAUDE_CODE_REMOTE_SESSION_ID") or env.get("CLAUDE_CODE_SESSION_ID") or container_id()
+        return f"claude-cloud@{re.sub(r'[^A-Za-z0-9]', '', session)[:8] or 'unknown'}:{worktree}"
+    return f"{harness}@{detect_host()}:{worktree}"
+
+
+def container_id() -> str:
+    """A random id created once per machine and kept in the coord cache."""
+    base = os.environ.get("COORD_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "inisa-coord")
+    path = os.path.join(base, "container-id")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            existing = handle.read().strip()
+            if existing:
+                return existing
+    except OSError:
+        pass
+    fresh = uuid.uuid4().hex
+    try:
+        os.makedirs(base, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(fresh)
+    except OSError:
+        pass
+    return fresh
 
 
 def matches(address: str, agent: str) -> bool:

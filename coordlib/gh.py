@@ -152,7 +152,8 @@ class GitHub:
                 raw = response.read().decode()
                 headers = {k.lower(): v for k, v in response.headers.items()}
         except urllib.error.HTTPError as error:
-            detail = error.read().decode(errors="replace")[:500]
+            # Whole, or nearly: a proxy's 403 can carry the list of routes to use instead.
+            detail = error.read().decode(errors="replace")[:4000]
             if error.code == 404:
                 raise NotFound(f"HTTP 404 {method} {url}: {detail}") from error
             raise GitHubError(f"HTTP {error.code} {method} {url}: {detail}") from error

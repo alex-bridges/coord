@@ -14,11 +14,14 @@ A board costs about 5 + (running workflow runs) calls; `calls` records it.
 from __future__ import annotations
 
 import datetime as dt
+import os
+import posixpath
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import urllib.parse
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import marker, review
-from .gh import GitHub
+from .gh import GitHub, GitHubError, NotFound
 
 CLAIM_WINDOW_DAYS = 14
 STALE_HOURS = 48
@@ -28,7 +31,7 @@ WAITING_RUN_STATUSES = ("queued", "waiting", "requested", "pending")
 
 PR_FIELDS = """
 number title url isDraft isCrossRepository headRefName headRefOid baseRefName createdAt updatedAt mergeable
-labels(first: 20) { nodes { name } }
+labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
 files(first: 100) { totalCount nodes { path } }
 reactions(first: 50) { nodes { content createdAt user { login } } }
 closingIssuesReferences(first: 10) { nodes { number } }
@@ -93,6 +96,12 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     if files.get("totalCount", 0) > len(files.get("nodes") or []):
         listed = gh.rest_paginated(f"repos/{{repo}}/pulls/{node['number']}/files?per_page=100")
         node["files"] = {"totalCount": len(listed), "nodes": [{"path": f["filename"]} for f in listed]}
+    labels = node.get("labels") or {}
+    if (labels.get("pageInfo") or {}).get("hasNextPage"):
+        # Labels carry policy (needs-alex, alex-approved, train:solo): never decide on a
+        # truncated list (Codex on #989).
+        listed = gh.rest_paginated(f"repos/{{repo}}/issues/{node['number']}/labels?per_page=100")
+        node["labels"] = {"pageInfo": {"hasNextPage": False}, "nodes": [{"name": l["name"]} for l in listed]}
     threads = node.get("reviewThreads") or {}
     page_info = threads.get("pageInfo") or {}
     cursor = page_info.get("endCursor")
@@ -106,6 +115,10 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
 
 
 def fetch_prs(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    return with_rest_fallback(gh, lambda: fetch_prs_graphql(gh), lambda: fetch_prs_rest(gh))
+
+
+def fetch_prs_graphql(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     nodes: List[Dict[str, Any]] = []
     cursor = None
     main: Dict[str, Any] = {}
@@ -200,11 +213,17 @@ def fetch_coord_comments(gh: GitHub, since: dt.datetime) -> List[Dict[str, Any]]
 
 
 def fetch_targets(gh: GitHub, numbers: Iterable[int], branches: Iterable[str]) -> Dict[str, Any]:
-    """State of claimed issues and existence of claimed branches, in one query."""
+    """State of claimed issues and existence of claimed branches."""
     numbers = sorted(set(numbers))
     branches = sorted(set(b for b in branches if b))
     if not numbers and not branches:
         return {"issues": {}, "branches": {}}
+    return with_rest_fallback(gh, lambda: fetch_targets_graphql(gh, numbers, branches),
+                              lambda: fetch_targets_rest(gh, numbers, branches))
+
+
+def fetch_targets_graphql(gh: GitHub, numbers: List[int], branches: List[str]) -> Dict[str, Any]:
+    """The GraphQL form: every claimed issue and branch in one aliased query."""
     parts = []
     for n in numbers:
         parts.append(
@@ -225,6 +244,139 @@ def fetch_targets(gh: GitHub, numbers: Iterable[int], branches: Iterable[str]) -
             "sha": (ref.get("target") or {}).get("oid"),
             "committedAt": (ref.get("target") or {}).get("committedDate"),
         }
+    return {"issues": issues, "branches": found}
+
+
+# MARK: - REST fallback
+#
+# Claude cloud sessions reach GitHub through a proxy that refuses GraphQL (HTTP 403,
+# "GitHub GraphQL is not available from Claude Code sessions; use the REST API"),
+# while REST works, writes included (probed 2026-09-24). The REST path builds the SAME
+# node shape the GraphQL query returns, so review.py's rules stay the one
+# implementation. It costs about seven calls per open PR instead of one query for
+# all of them, so it is used only where GraphQL is unavailable.
+
+
+def rest_only(gh: GitHub) -> bool:
+    return (os.environ.get("COORD_REST_ONLY") == "1"
+            or os.environ.get("CLAUDE_CODE_REMOTE") == "true"
+            or bool(getattr(gh, "graphql_blocked", False)))
+
+
+def with_rest_fallback(gh: GitHub, graphql_call: Callable[[], Any], rest_call: Callable[[], Any]) -> Any:
+    if rest_only(gh):
+        return rest_call()
+    try:
+        return graphql_call()
+    except GitHubError as error:
+        message = str(error)
+        if "403" in message and "graphql" in message.lower():
+            gh.graphql_blocked = True  # type: ignore[attr-defined]
+            return rest_call()
+        raise
+
+
+_CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)")
+
+
+def _upper(value: Optional[str]) -> Optional[str]:
+    return value.upper() if isinstance(value, str) else value
+
+
+def rest_review_threads(comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Review threads rebuilt from review comments: a reply's in_reply_to_id names the
+    thread's first comment. REST cannot say whether a thread was resolved, so every
+    thread counts as unresolved; the house rule replies to every finding, so a
+    replied thread still reads as answered."""
+    threads: Dict[int, List[Dict[str, Any]]] = {}
+    for comment in sorted(comments, key=lambda c: (c.get("created_at") or "", c.get("id") or 0)):
+        root = comment.get("in_reply_to_id") or comment.get("id")
+        threads.setdefault(root, []).append(comment)
+    return [{"isResolved": False,
+             "comments": {"nodes": [{"author": {"login": (c.get("user") or {}).get("login")}} for c in thread]}}
+            for thread in threads.values()]
+
+
+def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
+    number = pull["number"]
+    sha = pull["head"]["sha"]
+    detail = gh.rest(f"repos/{{repo}}/pulls/{number}")  # `mergeable` is only on the single-PR form
+    files = gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/files?per_page=100")
+    reactions = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
+    check_runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
+                  for r in page.get("check_runs", [])]
+    statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
+    suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
+              for c in page.get("check_suites", [])]
+    committed = None
+    if not suites:
+        committed = ((gh.rest(f"repos/{{repo}}/commits/{sha}") or {}).get("commit") or {}).get("committer", {}).get("date")
+    review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/comments?per_page=100")
+    head_repo = (pull["head"].get("repo") or {}).get("full_name")
+    mergeable = detail.get("mergeable")
+    reaction_names = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
+    return {
+        "number": number,
+        "title": pull.get("title", ""),
+        "url": pull.get("html_url"),
+        "isDraft": bool(pull.get("draft")),
+        "isCrossRepository": head_repo != gh.repo,
+        "headRefName": pull["head"].get("ref"),
+        "headRefOid": sha,
+        "baseRefName": (pull.get("base") or {}).get("ref"),
+        "createdAt": pull.get("created_at"),
+        "updatedAt": pull.get("updated_at"),
+        "mergeable": "MERGEABLE" if mergeable is True else "CONFLICTING" if mergeable is False else "UNKNOWN",
+        "labels": {"pageInfo": {"hasNextPage": False}, "nodes": [{"name": l["name"]} for l in pull.get("labels") or []]},
+        "files": {"totalCount": len(files), "nodes": [{"path": f["filename"]} for f in files]},
+        "reactions": {"nodes": [{"content": reaction_names.get(r.get("content"), _upper(r.get("content"))),
+                                 "createdAt": r.get("created_at"), "user": {"login": (r.get("user") or {}).get("login")}}
+                                for r in reactions]},
+        "closingIssuesReferences": {"nodes": [{"number": int(n)} for n in _CLOSES.findall(pull.get("body") or "")]},
+        "commits": {"nodes": [{"commit": {
+            "oid": sha,
+            "committedDate": committed,
+            "checkSuites": {"nodes": [{"createdAt": c.get("created_at")} for c in suites]},
+            "statusCheckRollup": {"contexts": {"nodes": (
+                [{"__typename": "CheckRun", "name": r.get("name"), "status": _upper(r.get("status")),
+                  "conclusion": _upper(r.get("conclusion"))} for r in check_runs]
+                + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
+                   for c in statuses]
+            )}},
+        }}]},
+        "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": rest_review_threads(review_comments)},
+    }
+
+
+def fetch_prs_rest(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    ref = gh.rest("repos/{repo}/git/ref/heads/main") or {}
+    main = {"name": "main", "sha": (ref.get("object") or {}).get("sha", "")}
+    pulls = gh.rest_paginated("repos/{repo}/pulls?state=open&per_page=100")
+    return main, [rest_pr_node(gh, pull) for pull in pulls]
+
+
+def fetch_targets_rest(gh: GitHub, numbers: List[int], branches: List[str]) -> Dict[str, Any]:
+    issues: Dict[int, Any] = {}
+    for number in numbers:
+        try:
+            issue = gh.rest(f"repos/{{repo}}/issues/{number}")
+        except NotFound:
+            issues[number] = None
+            continue
+        state = (issue.get("state") or "").upper()
+        if (issue.get("pull_request") or {}).get("merged_at"):
+            state = "MERGED"
+        issues[number] = {"number": number, "title": issue.get("title", ""), "state": state, "url": issue.get("html_url")}
+    found: Dict[str, Any] = {}
+    for branch in branches:
+        try:
+            data = gh.rest(f"repos/{{repo}}/branches/{urllib.parse.quote(branch, safe='/')}")
+        except NotFound:
+            found[branch] = None
+            continue
+        commit = (data or {}).get("commit") or {}
+        found[branch] = {"sha": commit.get("sha"),
+                         "committedAt": ((commit.get("commit") or {}).get("committer") or {}).get("date")}
     return {"issues": issues, "branches": found}
 
 
@@ -313,7 +465,7 @@ def resolve_claims(
             "title": target.get("title", ""),
             "agent": agent,
             "branch": branch,
-            "files": [str(f) for f in payload.get("files") or []],
+            "files": [n for n in (normalize_path(str(f)) for f in payload.get("files") or []) if n],
             "note": payload.get("note", ""),
             "claimedAt": comment["createdAt"],
             "commentId": comment["id"],
@@ -333,26 +485,58 @@ def resolve_claims(
     return claims
 
 
+def normalize_path(path: str) -> str:
+    """A claimed path in the repository-relative form GitHub uses for PR files.
+
+    `./a/b`, `a//b`, `a/c/../b` and `a/b/` all become `a/b`, so a claim spelled either
+    way overlaps the same PR file (Codex on #989). Returns "" for a path that leaves the
+    repository or names its root; callers reject those.
+    """
+    text = (path or "").strip().replace("\\", "/")
+    if not text or text.startswith("/"):
+        return ""
+    normal = posixpath.normpath(text)
+    if normal in (".", "..") or normal.startswith("../"):
+        return ""
+    return normal
+
+
 def _paths_overlap(a: str, b: str) -> bool:
     a = a.rstrip("/")
     b = b.rstrip("/")
     return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
-def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Pairs of in-flight work touching the same files. A warning, never a lock."""
-    items: List[Tuple[str, List[str]]] = []
+def work_items(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Tuple[str, List[str], Dict[str, Any]]]:
+    """Each piece of in-flight work with every file it touches or expects to.
+
+    A PR's entry includes the declared files of the claims linked to it: files the
+    claim expects but the PR has not touched yet still count. Shared by the board's
+    overlap list and by `coord claim`'s warning, so the two cannot disagree.
+    """
+    items: List[Tuple[str, List[str], Dict[str, Any]]] = []
     for pr in prs:
-        # Files the claim expects but the PR has not touched yet still count.
         declared = [f for c in claims if c["pr"] == pr["number"] for f in c["files"]]
-        items.append((f"PR #{pr['number']}", sorted(set(pr["files"]) | set(declared))))
+        items.append((f"PR #{pr['number']}", sorted(set(pr["files"]) | set(declared)),
+                      {"pr": pr["number"], "branch": pr["branch"]}))
     for claim in claims:
         if claim["pr"] is None and claim["files"]:
-            items.append((f"claim #{claim['issue']} ({claim['agent']})", claim["files"]))
+            items.append((f"claim #{claim['issue']} ({claim['agent']})", claim["files"],
+                          {"issue": claim["issue"], "branch": claim.get("branch", "")}))
+    return items
+
+
+def overlapping(files: List[str], other: List[str]) -> List[str]:
+    return sorted({f for f in files for g in other if _paths_overlap(f, g)})
+
+
+def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Pairs of in-flight work touching the same files. A warning, never a lock."""
+    items = [(label, files) for label, files, _ in work_items(prs, claims)]
     out = []
     for i in range(len(items)):
         for j in range(i + 1, len(items)):
-            shared = sorted({a for a in items[i][1] for b in items[j][1] if _paths_overlap(a, b)})
+            shared = overlapping(items[i][1], items[j][1])
             if shared:
                 out.append({"a": items[i][0], "b": items[j][0], "files": shared})
     return out

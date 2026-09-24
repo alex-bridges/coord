@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -95,6 +96,24 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual(identity.detect_harness({}, "/Users/a/.codex/worktrees/x/INISA"), "codex")
         self.assertEqual(identity.detect_harness({"CODEX_SANDBOX": "seatbelt"}, "/w"), "codex")
         self.assertEqual(identity.detect_harness({"CODEX_COMPANION_SESSION_ID": "x"}, "/w"), "human")
+
+    def test_cloud_sessions_get_distinct_ids(self):
+        first = identity.agent_id({"CLAUDE_CODE_REMOTE": "true", "CLAUDE_CODE_SESSION_ID": "0a1b2c3d-4e5f"})
+        second = identity.agent_id({"CLAUDE_CODE_REMOTE": "true", "CLAUDE_CODE_SESSION_ID": "9f8e7d6c-5b4a"})
+        self.assertTrue(first.startswith("claude-cloud@0a1b2c3d:"), first)
+        self.assertNotEqual(first, second)
+        with tempfile.TemporaryDirectory() as cache:
+            saved = os.environ.get("COORD_CACHE_DIR")
+            os.environ["COORD_CACHE_DIR"] = cache
+            try:
+                a = identity.agent_id({"CLAUDE_CODE_REMOTE": "true"})
+                b = identity.agent_id({"CLAUDE_CODE_REMOTE": "true"})
+            finally:
+                if saved is None:
+                    os.environ.pop("COORD_CACHE_DIR", None)
+                else:
+                    os.environ["COORD_CACHE_DIR"] = saved
+        self.assertEqual(a, b, "without a session id, one container keeps one id")
 
     def test_override(self):
         self.assertEqual(identity.agent_id({"COORD_AGENT": "me@here:x"}), "me@here:x")
@@ -306,6 +325,184 @@ class CodexRoundTwoTests(unittest.TestCase):
 
         runs = snapshot.fetch_runs(Fake())
         self.assertEqual(sorted(r["status"] for r in runs["queued"]), ["pending", "queued", "requested", "waiting"])
+
+
+class CodexRoundThreeTests(unittest.TestCase):
+    """Findings from Codex's review of 9e5077302 on #989."""
+
+    def test_claim_paths_are_normalized_to_the_pr_file_form(self):
+        self.assertEqual(snapshot.normalize_path("./Packages/Foo.swift"), "Packages/Foo.swift")
+        self.assertEqual(snapshot.normalize_path("Packages//X/../Foo.swift"), "Packages/Foo.swift")
+        self.assertEqual(snapshot.normalize_path("Packages/Sources/"), "Packages/Sources")
+        for bad in ("/abs/path", "../outside", ".", "", "a/../.."):
+            self.assertEqual(snapshot.normalize_path(bad), "", bad)
+        comments = [coord_comment(1, 7, 10, {"kind": "claim", "agent": "a", "issue": 7, "branch": "b",
+                                               "files": ["./Packages/CoreKit/Sources/A.swift", "../x"]})]
+        claims = snapshot.resolve_claims(comments, {"issues": {7: {"state": "OPEN"}}, "branches": {}}, [], NOW)
+        self.assertEqual(claims[0]["files"], ["Packages/CoreKit/Sources/A.swift"])
+        pr = snapshot.summarize_pr(pr_node(number=5, headRefName="other"))
+        self.assertEqual(len(snapshot.overlaps([pr], claims)), 1)
+
+    def test_the_claim_warning_sees_files_a_pr_linked_claim_declares(self):
+        pr = snapshot.summarize_pr(pr_node())  # branch bughunt/example, touches A.swift, Docs/X.md
+        claims = [{"issue": 55, "agent": "a", "pr": 101, "branch": "bughunt/example",
+                   "files": ["Packages/CoreKit/Sources/B.swift"]}]
+        items = snapshot.work_items([pr], claims)
+        hits = [(label, snapshot.overlapping(["Packages/CoreKit/Sources/B.swift"], files)) for label, files, _ in items]
+        self.assertEqual(hits, [("PR #101", ["Packages/CoreKit/Sources/B.swift"])])
+
+    def test_every_label_is_fetched_before_a_policy_decision(self):
+        class Fake:
+            owner, name = "o", "r"
+
+            def rest_paginated(self, path):
+                assert "issues/101/labels" in path, path
+                return [{"name": f"l{i}"} for i in range(120)] + [{"name": "needs-alex"}]
+
+        node = pr_node(labels={"pageInfo": {"hasNextPage": True}, "nodes": [{"name": "train"}]})
+        snapshot.complete_pr_node(Fake(), node)
+        self.assertIn("needs-alex", snapshot.summarize_pr(node)["labels"])
+
+    def test_train_add_records_the_head_before_applying_the_label(self):
+        calls = []
+
+        class Fake:
+            repo, owner, name = "o/r", "o", "r"
+
+            def rest(self, path, method="GET", body=None):
+                calls.append((method, path))
+                return {"html_url": "h"}
+
+            def dispatch_workflow(self, *args, **kwargs):
+                calls.append(("DISPATCH", args[0]))
+
+        pr = snapshot.summarize_pr(pr_node(reactions={"nodes": [reaction("THUMBS_UP", 30)]}))
+        original = cli.get_snapshot
+        cli.get_snapshot = lambda gh, max_age: {"prs": [pr], "claims": []}
+        try:
+            args = cli.parser().parse_args(["train", "add", "101"])
+            with open(os.devnull, "w") as quiet:
+                saved, sys.stdout = sys.stdout, quiet
+                try:
+                    self.assertEqual(cli.cmd_train_add(args, Fake()), 0)
+                finally:
+                    sys.stdout = saved
+        finally:
+            cli.get_snapshot = original
+        comment = calls.index(("POST", "repos/{repo}/issues/101/comments"))
+        label = calls.index(("POST", "repos/{repo}/issues/101/labels"))
+        self.assertLess(comment, label)
+
+    def test_coord_ci_refuses_a_train_batch(self):
+        args = cli.parser().parse_args(["ci", "docs", "--ref", "train/20260924-170000"])
+        with self.assertRaises(cli.UsageError):
+            cli.cmd_ci(args, None)
+
+
+class RestFallbackTests(unittest.TestCase):
+    """Claude cloud sessions: the proxy refuses GraphQL, REST works (probed 2026-09-24)."""
+
+    class Fake:
+        repo, owner, name = "o/r", "o", "r"
+
+        def __init__(self, graphql_error=None):
+            self.graphql_error = graphql_error
+            self.graphql_calls = 0
+            self.paths = []
+
+        def graphql(self, query, variables=None):
+            self.graphql_calls += 1
+            raise self.graphql_error
+
+        def rest(self, path, method="GET", body=None):
+            self.paths.append(path)
+            if path.endswith("git/ref/heads/main"):
+                return {"object": {"sha": "m" * 40}}
+            if path.endswith("pulls/7"):
+                return {"mergeable": False}
+            if path.endswith("/status"):
+                return {"statuses": [{"context": "LegacyCI | AppBeta · Test (PR + main)", "state": "failure"}]}
+            if path.endswith("issues/7"):
+                return {"state": "closed", "title": "T", "html_url": "u", "pull_request": {"merged_at": "x"}}
+            if path.endswith("issues/8"):
+                return {"state": "open", "title": "Open one", "html_url": "u"}
+            if "issues/9" in path or "branches/gone" in path:
+                from coordlib.gh import NotFound
+                raise NotFound("HTTP 404")
+            if "branches/feature/x" in path:
+                return {"commit": {"sha": "b" * 40, "commit": {"committer": {"date": t(5)}}}}
+            raise AssertionError(path)
+
+        def rest_paginated(self, path):
+            self.paths.append(path)
+            if "pulls?state=open" in path:
+                return [{"number": 7, "title": "Seven", "html_url": "u", "draft": False, "body": "Fixes #55 and closes #56",
+                         "head": {"ref": "bughunt/seven", "sha": "a" * 40, "repo": {"full_name": "o/r"}},
+                         "base": {"ref": "main"}, "labels": [{"name": "train"}], "updated_at": t(3), "created_at": t(90)}]
+            if "pulls/7/files" in path:
+                return [{"filename": "Packages/CoreKit/Sources/A.swift"}]
+            if "issues/7/reactions" in path:
+                return [{"content": "+1", "created_at": t(10), "user": {"login": BOT}}]
+            if "check-runs" in path:
+                return [{"check_runs": [{"name": "CI verdict", "status": "completed", "conclusion": "success"}]}]
+            if "check-suites" in path:
+                return [{"check_suites": [{"created_at": t(40)}]}]
+            if "pulls/7/comments" in path:
+                return [
+                    {"id": 1, "in_reply_to_id": None, "user": {"login": BOT}, "created_at": t(30)},
+                    {"id": 2, "in_reply_to_id": 1, "user": {"login": "alex-bridges"}, "created_at": t(20)},
+                    {"id": 3, "in_reply_to_id": None, "user": {"login": BOT}, "created_at": t(15)},
+                ]
+            raise AssertionError(path)
+
+    def test_a_graphql_403_falls_back_to_rest_and_stays_there(self):
+        from coordlib.gh import GitHubError
+        fake = self.Fake(GitHubError("HTTP 403 POST https://api.github.com/graphql: GitHub GraphQL is not available"))
+        saved = os.environ.pop("CLAUDE_CODE_REMOTE", None)
+        try:
+            main, nodes = snapshot.fetch_prs(fake)
+            snapshot.fetch_prs(fake)
+        finally:
+            if saved is not None:
+                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        self.assertEqual(fake.graphql_calls, 1, "after one 403 the session stays on REST")
+        pr = snapshot.summarize_pr(nodes[0])
+        self.assertEqual(main["sha"], "m" * 40)
+        self.assertTrue(pr["codex"]["approved"])
+        self.assertEqual(pr["unansweredFindings"], 1, "thread 1 answered, thread 3 not")
+        self.assertEqual(pr["ci"], {"verdict": "success", "failing": [], "pending": []}, "Xcode Cloud ignored")
+        self.assertEqual((pr["mergeable"], pr["fromFork"], pr["labels"], pr["closes"]),
+                         ("CONFLICTING", False, ["train"], [55, 56]))
+
+    def test_other_graphql_errors_are_not_swallowed(self):
+        from coordlib.gh import GitHubError
+        fake = self.Fake(GitHubError("HTTP 502 POST https://api.github.com/graphql: bad gateway"))
+        saved = os.environ.pop("CLAUDE_CODE_REMOTE", None)
+        try:
+            with self.assertRaises(GitHubError):
+                snapshot.fetch_prs(fake)
+        finally:
+            if saved is not None:
+                os.environ["CLAUDE_CODE_REMOTE"] = saved
+
+    def test_cloud_sessions_skip_graphql_entirely(self):
+        fake = self.Fake(AssertionError("GraphQL must not be tried"))
+        saved = os.environ.get("CLAUDE_CODE_REMOTE")
+        os.environ["CLAUDE_CODE_REMOTE"] = "true"
+        try:
+            snapshot.fetch_prs(fake)
+            targets = snapshot.fetch_targets(fake, [7, 8, 9], ["feature/x", "gone"])
+        finally:
+            if saved is None:
+                os.environ.pop("CLAUDE_CODE_REMOTE", None)
+            else:
+                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        self.assertEqual(fake.graphql_calls, 0)
+        self.assertEqual(targets["issues"][7]["state"], "MERGED")
+        self.assertEqual(targets["issues"][8]["state"], "OPEN")
+        self.assertIsNone(targets["issues"][9])
+        self.assertEqual(targets["branches"]["feature/x"]["sha"], "b" * 40)
+        self.assertIsNone(targets["branches"]["gone"])
 
 
 class OverlapAndTrainTests(unittest.TestCase):
