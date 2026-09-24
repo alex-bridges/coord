@@ -178,7 +178,12 @@ class StepTests(unittest.TestCase):
         sh(self.work, "remote", "add", "origin", self.origin)
         sh(self.work, "push", "-q", "origin", "main")
         self.main = sh(self.work, "rev-parse", "HEAD")
-        subprocess.check_call(["git", "clone", "-q", self.origin, self.clone])
+        # The workflow's clone: blob-less, no checkout. A plain-path clone would
+        # silently ignore --filter, so go through file:// and let the origin serve it.
+        sh(self.origin, "config", "uploadpack.allowFilter", "true")
+        sh(self.origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+        subprocess.check_call(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
+                               "file://" + self.origin, self.clone])
 
     def write(self, path, text):
         with open(os.path.join(self.work, path), "w") as handle:
@@ -245,6 +250,19 @@ class StepTests(unittest.TestCase):
         self.assertEqual([m["pr"] for m in members], [1])
         self.assertTrue(any("#2 held: it does not merge cleanly on top of #1" in line for line in lines), lines)
         self.assertEqual(fake.posted("removed"), [], "a conflict with a batch-mate is not the PR's fault")
+
+    def test_the_clone_is_partial_and_a_content_merge_fetches_what_it_needs(self):
+        self.assertEqual(sh(self.clone, "config", "remote.origin.promisor"), "true")
+        h1 = self.pr_branch(1, "a.txt", "ONE\nline 2\nline 3\n")
+        h2 = self.pr_branch(2, "a.txt", "line 1\nline 2\nTHREE\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1"), ready_node(2, h2, "pr2")], self.main)
+        self.queue(fake, 1, h1, 20)
+        self.queue(fake, 2, h2, 10)
+        lines = self.step(fake).run()
+        name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+        self.assertTrue(name, lines)
+        self.assertEqual(sh(self.origin, "show", f"{name}:a.txt"), "ONE\nline 2\nTHREE",
+                         "both edits to one file, merged without a checkout")
 
     def build_batch(self, fake_nodes_heads):
         """Build a batch with the step itself, return (fake, name, tip)."""
