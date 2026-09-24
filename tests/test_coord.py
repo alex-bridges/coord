@@ -46,7 +46,17 @@ def pr_node(**overrides):
         "reviewThreads": {"totalCount": 0, "nodes": []},
     }
     node.update(overrides)
+    if "comments" not in overrides:
+        node["comments"] = {"totalCount": 1, "nodes": [codex_summary(node["headRefOid"])]}
     return node
+
+
+def codex_summary(sha: str, status: str = "✅ **Completed** <relative-time>now</relative-time>"):
+    """Codex's pinned summary comment naming `sha` as reviewed (shape as seen on #975/#984)."""
+    return {"author": {"login": "chatgpt-codex-connector"}, "body": (
+        "<!-- codex-pull-request-review-summary -->\n\n## Codex Review Summary\n\n"
+        "| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n"
+        f"| 📝 **Code Review** | {status} | `{sha[:7]}` | New commits |\n")}
 
 
 def reaction(content: str, minutes_ago: float, login: str = BOT):
@@ -143,6 +153,17 @@ class CodexStateTests(unittest.TestCase):
         state = review.codex_state(pr_node(reactions={"nodes": [reaction("THUMBS_UP", 70)]}))
         self.assertFalse(state["approved"])
         self.assertTrue(state["stale"])
+
+    def test_a_thumb_counts_only_for_the_commit_the_summary_names(self):
+        # An old 👍 (for another head) with the summary naming a different commit.
+        other = pr_node(reactions={"nodes": [reaction("THUMBS_UP", 30)]},
+                        comments={"nodes": [codex_summary("b" * 40)]})
+        self.assertFalse(review.codex_state(other)["approved"])
+        running = pr_node(reactions={"nodes": [reaction("THUMBS_UP", 30)]},
+                          comments={"nodes": [codex_summary("a" * 40, status="⏳ **Running**")]})
+        self.assertFalse(review.codex_state(running)["approved"], "a review in progress is not a verdict")
+        missing = pr_node(reactions={"nodes": [reaction("THUMBS_UP", 30)]}, comments={"nodes": []})
+        self.assertFalse(review.codex_state(missing)["approved"], "no summary, no approval")
 
     def test_eyes_means_re_review_in_progress(self):
         state = review.codex_state(pr_node(reactions={"nodes": [reaction("THUMBS_UP", 30), reaction("EYES", 5)]}))
@@ -541,6 +562,8 @@ class RestFallbackTests(unittest.TestCase):
                 return [{"check_runs": [{"name": "CI verdict", "status": "completed", "conclusion": "success"}]}]
             if "check-suites" in path:
                 return [{"check_suites": [{"created_at": t(40)}]}]
+            if "issues/7/comments" in path:
+                return [{"user": {"login": BOT}, "body": codex_summary("a" * 40)["body"]}]
             if "pulls/7/comments" in path:
                 return [
                     {"id": 1, "in_reply_to_id": None, "user": {"login": BOT}, "created_at": t(30)},

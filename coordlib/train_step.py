@@ -102,6 +102,40 @@ class Step:
         except (NotFound, GitHubError) as error:
             self.note(f"could not delete {name}: {error}")
 
+    def runs_at(self, name: str, tip: str) -> List[Dict[str, Any]]:
+        pages = self.gh.rest_paginated(
+            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
+        return [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
+
+    def daily_budget_left(self) -> int:
+        """Batch CI runs the train may still start today (see train.DAILY_RUNS_DEFAULT)."""
+        try:
+            limit = int(os.environ.get("COORD_TRAIN_DAILY_RUNS") or train.DAILY_RUNS_DEFAULT)
+        except ValueError:
+            limit = train.DAILY_RUNS_DEFAULT
+        since = snapshot.iso(self.now - dt.timedelta(hours=24))
+        pages = self.gh.rest_paginated(
+            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?event=workflow_dispatch"
+            f"&created={urllib.parse.quote('>=' + since, safe='')}&per_page=100")
+        used = sum(1 for page in pages for r in page.get("workflow_runs", [])
+                   if (r.get("head_branch") or "").startswith(train.BATCH_PREFIX))
+        return limit - used
+
+    def main_ci(self, main: str) -> Dict[str, Any]:
+        """The newest finished ci.yml run at main's exact commit: {conclusion, failed, url}.
+
+        {} when main's commit has no finished run yet (a hand merge whose run is still
+        queued): unknown is not red, so it does not stop the train.
+        """
+        pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?head_sha={main}&per_page=20")
+        runs = [r for page in pages for r in page.get("workflow_runs", [])
+                if r.get("status") == "completed" and r.get("conclusion") in ("success", "failure")]
+        if not runs:
+            return {}
+        newest = max(runs, key=lambda r: r["id"])
+        failed = self.failed_jobs(newest["id"]) if newest["conclusion"] == "failure" else []
+        return {"conclusion": newest["conclusion"], "failed": failed, "url": newest.get("html_url")}
+
     def batch_run(self, name: str, tip: str) -> Optional[Dict[str, Any]]:
         """The batch's gate: the newest ci.yml run at the tip that THE TRAIN dispatched.
 
@@ -111,9 +145,7 @@ class Step:
         runs' initial actor is the Actions bot; `actor` stays that on a re-run, where
         `triggering_actor` would change.
         """
-        pages = self.gh.rest_paginated(
-            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
-        runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
+        runs = [r for r in self.runs_at(name, tip) if train.is_gate_run(r, tip)]
         return max(runs, key=lambda r: r["id"]) if runs else None
 
     def failed_jobs(self, run_id: int) -> List[str]:
@@ -159,8 +191,8 @@ class Step:
         return {node["number"]: snapshot.summarize_pr(node) for node in nodes}
 
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
-        """The newest train-add marker on the PR (when it joined, at which head), and the
-        head its newest review-substitute comment names, which is set on `pr`."""
+        """The newest train-add marker on the PR (when it joined, at which head). Also sets
+        on `pr` the heads its newest review-substitute and alex-approve comments name."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
@@ -169,8 +201,8 @@ class Step:
                 continue
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
-            elif payload.get("kind") == "review-substitute":
-                pr["substituteReviewHead"] = payload.get("head")
+            elif payload.get("kind") in snapshot.HEAD_RECORDS:
+                pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
         return latest
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
@@ -187,7 +219,18 @@ class Step:
         main = self.git.out("rev-parse", "refs/remotes/origin/main")
         refs = self.git.out("for-each-ref", "--sort=refname", "--format=%(refname:strip=3) %(objectname)",
                             "refs/remotes/origin/train/")
-        batches = [line.split() for line in refs.splitlines() if line.strip()]
+        batches = []
+        for line in refs.splitlines():
+            if not line.strip():
+                continue
+            name, tip = line.split()
+            # Only branches the train built: their tip carries its Train-Batch trailer. A
+            # person's `train/fix-cache` is left alone, never deleted (substitute review).
+            trailer = self.git.out("log", "-1", "--format=%(trailers:key=Train-Batch,valueonly,separator=%x2C)", tip)
+            if trailer.strip() == name:
+                batches.append((name, tip))
+            else:
+                self.note(f"{name} is not a batch (no Train-Batch trailer); ignoring it")
         prs = self.open_prs()
         if batches:
             name, tip = batches[0]
@@ -248,8 +291,7 @@ class Step:
             self.git.out("log", "--first-parent", f"--max-count={train.BATCH_CAP + 1}",
                          f"--format={train.LOG_FORMAT}", tip), name)
         if not members:
-            self.note(f"{name}: no merges of this batch on it; deleting")
-            self.delete_branch(name)
+            self.note(f"{name}: its tip names the batch but no batch merges were found; leaving it for a person")
             return
         numbers = ", ".join(f"#{m['pr']}" for m in members)
         run = self.batch_run(name, tip)
@@ -260,19 +302,36 @@ class Step:
             return
         action = train.run_action(run, len(members))
         if action == "dispatch":
+            others = self.runs_at(name, tip)
+            if others:
+                # A run exists but is not recognised as the train's own: never dispatch
+                # again on top of it (that would repeat a full CI run every tick). Wait for
+                # a person to look (substitute review of #989).
+                actors = sorted({(r.get("actor") or {}).get("login", "?") for r in others})
+                self.note(f"{name} ({numbers}): {len(others)} ci.yml run(s) at {tip[:9]} by {', '.join(actors)}, "
+                          "none dispatched by the train; not dispatching again")
+                return
             built = dt.datetime.fromtimestamp(int(self.git.out("log", "-1", "--format=%ct", tip)), dt.timezone.utc)
             if self.now - built < dt.timedelta(minutes=DISPATCH_GRACE_MINUTES):
                 self.note(f"{name} ({numbers}): CI dispatched {int((self.now - built).total_seconds())}s ago, not registered yet")
                 return
+            if self.daily_budget_left() <= 0:
+                self.note(f"{name} ({numbers}): the daily budget of batch CI runs is used up; waiting")
+                return
             self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
-            self.note(f"{name} ({numbers}): no CI run found at {tip[:9]}; dispatched ci.yml again")
+            self.note(f"{name} ({numbers}): no CI run at {tip[:9]} at all (the dispatch was lost); dispatched once more")
             return
         url = run["html_url"]
         if action == "wait":
             self.note(f"{name} ({numbers}): CI {run.get('status')} {url}")
             return
         if action == "rerun":
-            self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/rerun-failed-jobs", method="POST")
+            try:
+                self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/rerun-failed-jobs", method="POST")
+            except GitHubError as error:
+                self.note(f"{name} ({numbers}): CI red and the re-run was refused ({error}); deleting the batch")
+                self.delete_branch(name)
+                return
             self.note(f"{name} ({numbers}): CI red on attempt {run.get('run_attempt')}; re-running the failed jobs once {url}")
             return
         if action == "abandon":
@@ -282,6 +341,15 @@ class Step:
         if action in ("eject", "split"):
             failed = self.failed_jobs(run["id"])
             jobs = ", ".join(failed[:5]) or "see the run"
+            main_state = self.main_ci(main)
+            shared = sorted(set(failed) & set(main_state.get("failed") or []))
+            if shared:
+                # Red on main too: not these PRs' fault. Removing them one by one would
+                # empty the queue while main is broken (substitute review of #989).
+                self.note(f"{name} ({numbers}): CI red in {', '.join(shared[:5])}, which is red on main too "
+                          f"({main_state.get('url')}); not blaming the PRs, the queue waits for main")
+                self.delete_branch(name)
+                return
             for member in members:
                 number = member["pr"]
                 if action == "eject":
@@ -302,9 +370,14 @@ class Step:
             return
         # action == "merge": check everything again; the batch was green at `tip`.
         if main != base:
-            self.note(f"{name} ({numbers}): green, but main moved from {base[:9]} to {main[:9]}; rebuilding")
-            self.delete_branch(name)
-            return
+            if self.mode == "live":
+                self.note(f"{name} ({numbers}): green, but main moved from {base[:9]} to {main[:9]}; rebuilding")
+                self.delete_branch(name)
+                return
+            # Dry run: report the green result instead of re-testing on every hand merge,
+            # which on a busy day would mean a dry-run batch never reports at all.
+            self.note(f"{name} ({numbers}): green on {base[:9]}; main has since moved to {main[:9]} "
+                      "(live mode would rebuild and re-test)")
         # Fresh state for the final check: a push or a `train remove` since this step
         # started must stop the merge (Codex on #989). What main receives is still the
         # tested tip; the window left is the second between this read and the update.
@@ -373,6 +446,14 @@ class Step:
             self.note("nothing ready")
             return
 
+        main_state = self.main_ci(main)
+        if main_state.get("conclusion") == "failure":
+            self.note(f"main {main[:9]} is red ({', '.join(main_state.get('failed', [])[:3]) or 'see the run'}, "
+                      f"{main_state.get('url')}); not building a batch on it")
+            return
+        if self.daily_budget_left() <= 0:
+            self.note("the daily budget of batch CI runs is used up; not building a batch")
+            return
         name = train.batch_name(self.now)
         identity = {"GIT_AUTHOR_NAME": BOT_NAME, "GIT_AUTHOR_EMAIL": BOT_EMAIL,
                     "GIT_COMMITTER_NAME": BOT_NAME, "GIT_COMMITTER_EMAIL": BOT_EMAIL}

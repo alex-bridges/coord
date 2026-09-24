@@ -23,6 +23,7 @@ cannot judge the reply's content — only that one exists.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Any, Dict, List, Optional
 
 CODEX_LOGIN_PREFIX = "chatgpt-codex-connector"
@@ -67,7 +68,37 @@ def head_pushed_at(pr: Dict[str, Any]) -> Optional[dt.datetime]:
     return parse_time(commit.get("committedDate"))
 
 
+SUMMARY_MARKER = "codex-pull-request-review-summary"
+_SUMMARY_ROW = re.compile(r"\*\*Code Review\*\*\s*\|(?P<status>[^|]*)\|\s*`(?P<sha>[0-9a-f]{7,40})`")
+
+
+def summary_reviewed_commit(pr: Dict[str, Any]) -> Optional[str]:
+    """The commit Codex's pinned summary comment says it finished reviewing, or None.
+
+    Codex edits one summary comment in place; its Code Review row names the reviewed
+    commit and says Completed when the review is done (on #975/#984/#986 it names
+    exactly the approved head). None while a review runs or when there is no summary.
+    """
+    for comment in ((pr.get("comments") or {}).get("nodes")) or []:
+        login = (comment.get("author") or {}).get("login") or ""
+        body = comment.get("body") or ""
+        if login.startswith(CODEX_LOGIN_PREFIX) and SUMMARY_MARKER in body:
+            match = _SUMMARY_ROW.search(body)
+            if match and "Completed" in match.group("status"):
+                return match.group("sha")
+            return None
+    return None
+
+
 def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """Approved = a bot 👍, no bot 👀, the 👍 newer than the head's first check suite,
+    AND Codex's summary naming the current head as reviewed and completed.
+
+    The summary check is what binds the 👍 to this head. The push-time test alone
+    trusted the head's earliest check suite, which can predate the PR (a SHA pushed to
+    another branch, or a force-push back to an older head), so an old 👍 could pass
+    for a head Codex never reviewed (substitute review of #989).
+    """
     reactions = ((pr.get("reactions") or {}).get("nodes")) or []
     bot = [r for r in reactions if ((r.get("user") or {}).get("login") or "").startswith(CODEX_LOGIN_PREFIX)]
     thumbs = [parse_time(r.get("createdAt")) for r in bot if r.get("content") == "THUMBS_UP"]
@@ -75,11 +106,15 @@ def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     pushed = head_pushed_at(pr)
     newest_thumb = max((t for t in thumbs if t is not None), default=None)
     fresh = newest_thumb is not None and (pushed is None or newest_thumb >= pushed)
+    reviewed = summary_reviewed_commit(pr)
+    head = pr.get("headRefOid") or ""
+    reviewed_head = bool(reviewed) and head.startswith(reviewed)
     return {
-        "approved": bool(fresh and not eyes),
+        "approved": bool(fresh and reviewed_head and not eyes),
         "thumbsUp": newest_thumb is not None,
-        "stale": newest_thumb is not None and not fresh,
+        "stale": newest_thumb is not None and not (fresh and reviewed_head),
         "reviewing": eyes,
+        "reviewedCommit": reviewed,
     }
 
 

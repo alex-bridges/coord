@@ -431,6 +431,21 @@ def cmd_train_substitute_review(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
+    """Alex approves a needs-alex PR at its CURRENT head. Every agent posts as Alex's
+    login, so this is procedure, not authentication: run it only on Alex's word."""
+    me = identity.agent_id()
+    pr = gh.rest(f"repos/{{repo}}/pulls/{args.pr}")
+    head = (pr.get("head") or {}).get("sha", "")
+    text = (f"**Approved by Alex** for head `{head[:9]}` (recorded by `{me}`).\n\n{args.note}\n\n"
+            "This covers this head only; a new push needs a new approval.")
+    post_comment(gh, args.pr, text, {"kind": "alex-approve", "v": 1, "agent": me, "pr": args.pr, "head": head})
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.ALEX_APPROVED_LABEL]})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"recorded Alex's approval of #{args.pr} at {head[:9]}")
+    return EXIT_OK
+
+
 def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, args.max_age)
     prs = {p["number"]: p for p in snap["prs"]}
@@ -560,6 +575,10 @@ def parser() -> argparse.ArgumentParser:
     substitute.add_argument("pr", type=int)
     substitute.add_argument("--note", required=True, help="who reviewed and where the review is")
     substitute.set_defaults(func=cmd_train_substitute_review)
+    approve = train_sub.add_parser("approve", help="record Alex's approval of a needs-alex PR at its current head")
+    approve.add_argument("pr", type=int)
+    approve.add_argument("--note", required=True, help="Alex's words, or where he approved")
+    approve.set_defaults(func=cmd_train_approve)
     status = train_sub.add_parser("status", help="the current batch and every queued PR's readiness")
     status.add_argument("--json", action="store_true")
     status.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)

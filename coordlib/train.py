@@ -19,8 +19,9 @@ AND again just before main moves — the `train` label is intent, not approval:
 - no unanswered Codex findings;
 - CI at the head not red (pending is fine: the batch runs the gates anyway);
 - not a carve-out: sound-character changes, persistence changes without a
-  migration and public API breaks carry `needs-alex` until Alex adds
-  `alex-approved`. Adding a PR to the train asserts it is not a carve-out.
+  migration and public API breaks carry `needs-alex` until Alex approves THE
+  CURRENT HEAD (`coord train approve`, which records the head and adds
+  `alex-approved`). Adding a PR to the train asserts it is not a carve-out.
 """
 
 from __future__ import annotations
@@ -40,6 +41,11 @@ CI_WORKFLOW = "ci.yml"
 CI_LANES = "changed"
 WORKFLOW_DIR = ".github/workflows/"
 MAX_ATTEMPTS = 2
+# The most batch CI runs the train will start in 24 hours, whatever goes wrong: a
+# loop, a red main, a lost dispatch. At ~1 h of heavy runner time each, 12 is the
+# heavy runner's whole day. `COORD_TRAIN_DAILY_RUNS` (a repository variable passed by
+# merge-train.yml) overrides it.
+DAILY_RUNS_DEFAULT = 12
 
 READY, HOLD, DROP = "ready", "hold", "drop"
 
@@ -76,8 +82,14 @@ def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     if pr.get("incomplete"):
         return HOLD, ("GitHub returned only part of its " + ", ".join(pr["incomplete"])
                       + "; the train does not decide on partial data")
-    if NEEDS_ALEX_LABEL in labels and ALEX_APPROVED_LABEL not in labels:
-        return HOLD, "it is labelled needs-alex and waits for alex-approved"
+    if NEEDS_ALEX_LABEL in labels:
+        # Alex's approval covers the head he approved, not later pushes: labels persist
+        # across pushes (substitute review of #989, P1). `coord train approve` records it.
+        if ALEX_APPROVED_LABEL not in labels:
+            return HOLD, "it is labelled needs-alex and waits for Alex (`coord train approve`)"
+        if pr.get("alexApprovedHead") != pr.get("head"):
+            return HOLD, (f"alex-approved does not name the current head {str(pr.get('head'))[:9]}; "
+                          "Alex's approval covers only the head he approved")
     codex = pr.get("codex") or {}
     if codex.get("reviewing"):
         return HOLD, "Codex is re-reviewing it"
@@ -166,7 +178,13 @@ def is_gate_run(run: Dict[str, Any], tip: str) -> bool:
 
 
 def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
-    """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon."""
+    """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon.
+
+    Only a plain `failure` can be the PRs' fault. `timed_out` and `startup_failure` are
+    what a lost runner, a full disk or a hung machine look like, so they abandon the
+    batch (rebuild later, within the daily budget) instead of splitting it and
+    ejecting PRs one by one (substitute review of #989).
+    """
     if run is None:
         return "dispatch"
     if run.get("status") != "completed":
@@ -174,11 +192,11 @@ def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
     conclusion = run.get("conclusion")
     if conclusion == "success":
         return "merge"
-    if conclusion in ("failure", "timed_out", "startup_failure"):
+    if conclusion == "failure":
         if (run.get("run_attempt") or 1) < MAX_ATTEMPTS:
             return "rerun"
         return "eject" if batch_size == 1 else "split"
-    return "abandon"  # cancelled, skipped, neutral, stale: build again next step
+    return "abandon"  # timed_out, startup_failure, cancelled, skipped, neutral, stale
 
 
 def batch_name(now: dt.datetime) -> str:

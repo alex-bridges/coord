@@ -34,6 +34,7 @@ number title url isDraft isCrossRepository headRefName headRefOid baseRefName cr
 labels(first: 100) { totalCount nodes { name } }
 files(first: 100) { totalCount nodes { path changeType } }
 reactions(first: 100) { totalCount nodes { content createdAt user { login } } }
+comments(first: 10) { totalCount nodes { author { login } body } }
 closingIssuesReferences(first: 10) { totalCount nodes { number } }
 commits(last: 1) { nodes { commit {
   oid committedDate
@@ -105,6 +106,16 @@ def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
                for c in statuses])
 
 
+def rest_codex_summary(gh: GitHub, number: int) -> List[Dict[str, Any]]:
+    """Codex's pinned summary comment on a PR, in the GraphQL comment node shape."""
+    out = []
+    for comment in gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
+        login = (comment.get("user") or {}).get("login") or ""
+        if login.startswith(review.CODEX_LOGIN_PREFIX) and review.SUMMARY_MARKER in (comment.get("body") or ""):
+            out.append({"author": {"login": login}, "body": comment.get("body")})
+    return out
+
+
 def rest_files(gh: GitHub, number: int) -> List[str]:
     """Every path a PR touches, BOTH sides of a rename: a PR renaming A to B conflicts
     with work on A as surely as with work on B (Codex on #989)."""
@@ -136,6 +147,11 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     if truncated(node.get("labels")):
         listed = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/labels?per_page=100")
         node["labels"] = {"totalCount": len(listed), "nodes": [{"name": l["name"]} for l in listed]}
+    if review.summary_reviewed_commit(node) is None and truncated(node.get("comments")):
+        # Codex's summary is usually among the first comments; if not, find it.
+        summaries = rest_codex_summary(gh, number)
+        if summaries:
+            node["comments"] = {"totalCount": len(summaries), "nodes": summaries}
     if truncated(node.get("reactions")):
         listed = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
         node["reactions"] = {"totalCount": len(listed), "nodes": [
@@ -374,6 +390,7 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
     if not suites:
         committed = ((gh.rest(f"repos/{{repo}}/commits/{sha}") or {}).get("commit") or {}).get("committer", {}).get("date")
     review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/comments?per_page=100")
+    summaries = rest_codex_summary(gh, number)
     head_repo = (pull["head"].get("repo") or {}).get("full_name")
     mergeable = detail.get("mergeable")
     return {
@@ -401,6 +418,7 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
             "statusCheckRollup": {"contexts": {"nodes": contexts}},
         }}]},
         "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": rest_review_threads(review_comments)},
+        "comments": {"totalCount": len(summaries), "nodes": summaries},
         "incomplete": [],
     }
 
@@ -606,15 +624,21 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
     return out
 
 
+HEAD_RECORDS = {"review-substitute": "substituteReviewHead", "alex-approve": "alexApprovedHead"}
+
+
 def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
-    """Set each PR's `substituteReviewHead`: the head its newest review-substitute comment names."""
-    latest: Dict[int, str] = {}
+    """Set each PR's `substituteReviewHead` and `alexApprovedHead`: the head its newest
+    review-substitute / alex-approve comment names."""
+    latest: Dict[Tuple[int, str], str] = {}
     for comment in comments:  # oldest first
         payload = comment["payload"]
-        if payload.get("kind") == "review-substitute" and isinstance(payload.get("pr"), int):
-            latest[payload["pr"]] = payload.get("head")
+        field = HEAD_RECORDS.get(payload.get("kind"))
+        if field and isinstance(payload.get("pr"), int):
+            latest[(payload["pr"], field)] = payload.get("head")
     for pr in prs:
-        pr["substituteReviewHead"] = latest.get(pr["number"])
+        for field in HEAD_RECORDS.values():
+            pr[field] = latest.get((pr["number"], field))
 
 
 def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

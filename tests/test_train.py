@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
-from test_coord import BOT, NOW, check, pr_node, reaction  # noqa: E402
+from test_coord import BOT, NOW, check, codex_summary, pr_node, reaction  # noqa: E402
 
 
 def ready_node(number: int, head: str, branch: str, files=("Packages/CoreKit/Sources/A.swift",), labels=("train",)):
@@ -62,7 +62,11 @@ class EligibilityTests(unittest.TestCase):
         pr = self.summary()
         self.assertEqual(train.eligibility(dict(pr, isDraft=True))[0], train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, labels=["train", "needs-alex"]))[0], train.HOLD)
-        self.assertEqual(train.eligibility(dict(pr, labels=["train", "needs-alex", "alex-approved"]))[0], train.READY)
+        approved = dict(pr, labels=["train", "needs-alex", "alex-approved"])
+        self.assertEqual(train.eligibility(dict(approved, alexApprovedHead=pr["head"]))[0], train.READY)
+        self.assertEqual(train.eligibility(dict(approved, alexApprovedHead="0" * 40))[0], train.HOLD,
+                         "Alex's approval of an older head does not cover a new push")
+        self.assertEqual(train.eligibility(approved)[0], train.HOLD, "the label alone is not an approval")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
@@ -110,6 +114,9 @@ class PlanAndRunTests(unittest.TestCase):
         self.assertEqual(train.run_action({"status": "completed", "conclusion": "failure", "run_attempt": 2}, 2), "split")
         self.assertEqual(train.run_action({"status": "completed", "conclusion": "failure", "run_attempt": 2}, 1), "eject")
         self.assertEqual(train.run_action({"status": "completed", "conclusion": "cancelled"}, 1), "abandon")
+        for infrastructure in ("timed_out", "startup_failure"):
+            self.assertEqual(train.run_action({"status": "completed", "conclusion": infrastructure, "run_attempt": 2}, 1),
+                             "abandon", "an outage is not the PR's fault")
 
     def test_parse_batch_reads_only_this_batchs_merges(self):
         log = ("c3\tc2 p3\ttrain/B\tMerge pull request #30 from o/c\n"
@@ -135,6 +142,8 @@ class FakeGitHub:
         self.dispatched: List[tuple] = []
         self.branch_runs: Dict[str, List[Dict[str, Any]]] = {}
         self.fail_writes = 0
+        self.main_runs: List[Dict[str, Any]] = []
+        self.dispatches_today: List[Dict[str, Any]] = []
         self.patch_error = ""
         self.reread_error = ""
         self.reread_main = ""
@@ -172,6 +181,10 @@ class FakeGitHub:
         match = re.search(r"actions/runs/(\d+)/jobs", path)
         if match:
             return [{"jobs": self.jobs.get(int(match.group(1)), [])}]
+        if "ci.yml/runs?head_sha=" in path:
+            return [{"workflow_runs": self.main_runs}]
+        if "ci.yml/runs?event=workflow_dispatch" in path:
+            return [{"workflow_runs": self.dispatches_today}]
         if "actions/runs?branch=" in path:
             branch = urllib.parse.unquote(path.split("branch=")[1].split("&")[0])
             return [{"workflow_runs": self.branch_runs.get(branch, [])}]
@@ -498,6 +511,63 @@ class StepTests(unittest.TestCase):
                          "a failed cancel keeps the batch for the next step")
         self.assertTrue(any("601" in line for line in lines), lines)
         self.assertFalse(any("602" in line for line in lines), "409: the run finished, nothing to retry")
+
+    def test_a_person_s_train_branch_is_never_touched(self):
+        sh(self.work, "push", "-q", "origin", f"{self.main}:refs/heads/train/fix-cache")
+        fake = FakeGitHub([], self.main)
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "DELETE" for method, _, _ in fake.writes), fake.writes)
+        self.assertTrue(any("train/fix-cache is not a batch" in line for line in lines), lines)
+
+    def test_a_run_the_train_does_not_recognise_is_never_dispatched_over(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, status="in_progress", actor={"login": "someone-else[bot]"})
+        for minutes in (30, 45, 60, 75):
+            self.step(fake, now=snapshot.now_utc() + dt.timedelta(minutes=minutes)).run()
+        self.assertEqual(fake.dispatched, [], "no repeat dispatch on top of an existing run, however many ticks")
+
+    def test_the_daily_budget_stops_new_batches_and_redispatches(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.queue(fake, 1, h1, 20)
+        fake.dispatches_today = [{"head_branch": f"train/2026092{i}"} for i in range(train.DAILY_RUNS_DEFAULT)]
+        lines = self.step(fake).run()
+        self.assertEqual(fake.dispatched, [])
+        self.assertTrue(any("daily budget" in line for line in lines), lines)
+        self.assertEqual(sh(self.origin, "for-each-ref", "refs/heads/train/"), "", "no batch branch built either")
+
+    def test_a_red_main_stops_batches_and_is_never_blamed_on_prs(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.queue(fake, 1, h1, 20)
+        fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
+        fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}]
+        lines = self.step(fake).run()
+        self.assertEqual(fake.dispatched, [])
+        self.assertTrue(any("is red" in line for line in lines), lines)
+        # A batch that went red in the same job main is red in: nobody is ejected.
+        fake.main_runs = []
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.jobs[77] = [{"name": "Android", "conclusion": "failure"}]
+        fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
+        fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}]
+        lines = self.step(fake).run()
+        self.assertEqual(fake.posted("ejected"), [])
+        self.assertTrue(any("red on main too" in line for line in lines), lines)
+
+    def test_dry_run_reports_green_even_when_main_moved(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        self.write("z.txt", "a hand merge\n")
+        sh(self.work, "checkout", "-q", "main")
+        self.commit("hand merge")
+        sh(self.work, "push", "-q", "origin", "main")
+        self.step(fake, mode="dry-run").run()
+        self.assertEqual(fake.posted("green-dry-run"), [1])
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
 
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
