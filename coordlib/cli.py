@@ -34,10 +34,15 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
     return fresh
 
 
-def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str]) -> int:
-    """Messages addressed to `me` newer than the inbox cursor, from the snapshot alone."""
+def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "") -> int:
+    """Messages addressed to `me` newer than the inbox cursor, from the snapshot alone.
+
+    "Mine" is what `inbox_items` treats as mine: claimed issues, their PRs, and the PR
+    of the current branch (an agent on a PR whose claim aged out still gets its mail).
+    """
     since = review.parse_time(cursor) if cursor else None
     mine = {f"#{n}" for c in snap["claims"] if c["agent"] == me for n in (c["issue"], c["pr"]) if n}
+    mine |= {f"#{pr['number']}" for pr in snap["prs"] if current_branch and pr["branch"] == current_branch}
     count = 0
     for message in snap["messages"]:
         payload = message["payload"]
@@ -94,7 +99,7 @@ def cmd_whoami(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     snap = get_snapshot(gh, 0 if args.fresh else args.max_age)
-    unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me))
+    unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch())
     if args.json:
         out = {k: v for k, v in snap.items() if k != "claimComments"}
         out["me"] = me

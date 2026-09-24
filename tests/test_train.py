@@ -127,6 +127,7 @@ class FakeGitHub:
         self.issue_comments: Dict[int, List[Dict[str, Any]]] = {}
         self.writes: List[tuple] = []
         self.dispatched: List[tuple] = []
+        self.branch_runs: Dict[str, List[Dict[str, Any]]] = {}
         self.calls = 0
 
     def graphql(self, query, variables=None):
@@ -146,7 +147,8 @@ class FakeGitHub:
         if match:
             return [{"jobs": self.jobs.get(int(match.group(1)), [])}]
         if "actions/runs?branch=" in path:
-            return [{"workflow_runs": []}]
+            branch = path.split("branch=")[1].split("&")[0]
+            return [{"workflow_runs": self.branch_runs.get(branch, [])}]
         match = re.search(r"issues/(\d+)/comments", path)
         if match:
             return self.issue_comments.get(int(match.group(1)), [])
@@ -308,8 +310,13 @@ class StepTests(unittest.TestCase):
         h2 = self.pr_branch(2, "d.txt", "d\n")
         fake, name, tip = self.build_batch([(1, h1), (2, h2)])
         self.run_on(fake, name, tip, conclusion="success")
+        fake.branch_runs["pr1"] = [{"id": 501, "status": status} for status in
+                                   ("queued", "in_progress", "requested", "waiting", "pending")] + [
+                                  {"id": 507, "status": "completed"}]
         self.step(fake).run()
         self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        cancelled = [path for method, path, _ in fake.writes if path.endswith("/cancel")]
+        self.assertEqual(len(cancelled), 5, "every run that has not completed, in any waiting state")
         self.assertEqual(sorted(fake.posted("merged")), [1, 2])
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         # GitHub marks a PR merged when its head becomes reachable from main.

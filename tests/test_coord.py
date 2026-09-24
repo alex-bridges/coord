@@ -276,12 +276,20 @@ class CodexRoundTwoTests(unittest.TestCase):
 
     def test_unread_count_includes_messages_sent_to_an_issue_i_work_on(self):
         me = "claude@Eidolon:wt"
-        snap = {"claims": [{"agent": me, "issue": 40, "pr": 41}], "messages": [
+        snap = {"claims": [{"agent": me, "issue": 40, "pr": 41}], "prs": [], "messages": [
             {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#40"]}},
             {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#41"]}},
             {"createdAt": t(5), "payload": {"kind": "msg", "agent": "codex@x:y", "to": ["#99"]}},
         ]}
         self.assertEqual(cli.unread_direct(snap, me, None), 2)
+
+    def test_unread_count_includes_messages_to_the_pr_of_the_current_branch(self):
+        me = "codex@Eidolon:wt"
+        snap = {"claims": [], "prs": [{"number": 70, "branch": "codex/thing"}], "messages": [
+            {"createdAt": t(5), "payload": {"kind": "msg", "agent": "claude@x:y", "to": ["#70"]}},
+        ]}
+        self.assertEqual(cli.unread_direct(snap, me, None, current_branch="codex/thing"), 1)
+        self.assertEqual(cli.unread_direct(snap, me, None, current_branch="other"), 0)
 
     def test_truncated_files_and_review_threads_are_completed(self):
         class Fake:

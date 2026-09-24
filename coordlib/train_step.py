@@ -121,13 +121,19 @@ class Step:
                 if j.get("conclusion") in ("failure", "timed_out", "startup_failure")]
 
     def cancel_branch_runs(self, branch: str) -> None:
-        for status in ("in_progress", "queued"):
-            try:
-                pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs?branch={branch}&status={status}&per_page=50")
-                for run in [r for page in pages for r in page.get("workflow_runs", [])]:
+        """Cancel every run of a merged PR's branch that has not completed.
+
+        ONE unfiltered snapshot, like cancel-merged-branch-runs.yml: filtering by
+        status would miss runs in `requested`, `waiting` or `pending` and race runs
+        moving between states (Codex on #989).
+        """
+        try:
+            pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs?branch={branch}&per_page=100")
+            for run in [r for page in pages for r in page.get("workflow_runs", [])]:
+                if run.get("status") != "completed":
                     self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/cancel", method="POST")
-            except GitHubError as error:
-                self.note(f"could not cancel runs of {branch}: {error}")
+        except GitHubError as error:
+            self.note(f"could not cancel runs of {branch}: {error}")
 
     def open_prs(self) -> Dict[int, Dict[str, Any]]:
         _, nodes = snapshot.fetch_prs(self.gh)
