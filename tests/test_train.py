@@ -256,9 +256,9 @@ class StepTests(unittest.TestCase):
         log = sh(self.origin, "log", "--first-parent", "--max-count=10", f"--format={train.LOG_FORMAT}", name)
         return train.parse_batch(log, name)[1]
 
-    def step(self, fake, mode="live", now=None):
+    def step(self, fake, mode="live", now=None, sleep=None):
         return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(),
-                               log=lambda line: None)
+                               log=lambda line: None, sleep=sleep or (lambda seconds: None))
 
     def queue(self, fake, number, head, minutes_ago):
         fake.issue_comments[number] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
@@ -568,6 +568,80 @@ class StepTests(unittest.TestCase):
         self.step(fake, mode="dry-run").run()
         self.assertEqual(fake.posted("green-dry-run"), [1])
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+
+    def test_a_run_only_finishing_its_bookkeeping_is_waited_for(self):
+        # ci.yml's verdict job wakes the train as its last step, so the step can start
+        # before GitHub marks the run completed.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        run = self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = [{"name": "Select lanes", "status": "completed"}, {"name": "CI verdict", "status": "in_progress"}]
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            run.update(status="completed", conclusion="success")
+            fake.jobs[77] = [dict(job, status="completed") for job in fake.jobs[77]]
+
+        self.step(fake, sleep=sleep).run()
+        self.assertEqual(slept, [train_step.SETTLE_POLL_SECONDS])
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+
+    def test_a_run_with_real_work_left_is_not_waited_for(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = [{"name": "CoreKit release gate", "status": "in_progress"},
+                         {"name": "CI verdict", "status": "queued"}]
+        slept = []
+        self.step(fake, sleep=slept.append).run()
+        self.assertEqual(slept, [], "a gate still running is an ordinary wait, not a poll")
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+
+    def settle_calls(self, jobs, finishes_after_sleep=True):
+        """How many times settle sleeps for a batch run with these jobs listed."""
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        run = self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = jobs
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if finishes_after_sleep:
+                run.update(status="completed", conclusion="success")
+
+        self.step(fake, sleep=sleep).run()
+        return len(slept)
+
+    def test_settle_waits_when_every_job_has_finished(self):
+        done = {"name": "CoreKit release gate", "status": "completed"}
+        self.assertEqual(self.settle_calls([done, {"name": "CI verdict", "status": "completed"},
+                                            {"name": "Wake the merge train", "status": "completed"}]), 1)
+
+    def test_settle_waits_while_only_the_wake_job_runs(self):
+        done = {"name": "CoreKit release gate", "status": "completed"}
+        self.assertEqual(self.settle_calls([done, {"name": "CI verdict", "status": "completed"},
+                                            {"name": "Wake the merge train", "status": "in_progress"}]), 1)
+
+    def test_settle_never_waits_for_a_final_job_that_has_not_started(self):
+        # A verdict queued behind THIS step on the one light runner can never start
+        # while the step waits.
+        self.assertEqual(self.settle_calls([{"name": "CI verdict", "status": "queued"}]), 0)
+
+    def test_settle_never_waits_before_any_job_is_listed(self):
+        self.assertEqual(self.settle_calls([]), 0)
+
+    def test_the_aggregate_verdict_is_never_a_shared_failure(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"},
+                         {"name": "CI verdict", "conclusion": "failure"}]
+        fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
+        fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}, {"name": "CI verdict", "conclusion": "failure"}]
+        self.step(fake).run()
+        self.assertEqual(fake.posted("ejected"), [1], "main red in Android does not excuse a red release gate")
 
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
