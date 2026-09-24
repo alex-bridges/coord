@@ -14,7 +14,7 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def cache_dir(repo: str) -> str:
@@ -86,5 +86,13 @@ def load_cursor(repo: str, agent: str) -> Optional[str]:
     return (data or {}).get("seenThrough")
 
 
-def store_cursor(repo: str, agent: str, seen_through: str) -> None:
-    _write(_cursor_path(repo, agent), {"seenThrough": seen_through})
+def load_seen_ids(repo: str, agent: str) -> List[int]:
+    data = _read(_cursor_path(repo, agent))
+    return [int(i) for i in (data or {}).get("seenIds", []) if isinstance(i, int)]
+
+
+def store_cursor(repo: str, agent: str, seen_through: str, seen_ids: Optional[List[int]] = None) -> None:
+    """`seenIds`: the ids delivered in the overlap window before `seenThrough`. Readers
+    look back that far and skip these, so a comment created in the same second as the
+    cursor is neither lost nor shown twice (Codex on #989)."""
+    _write(_cursor_path(repo, agent), {"seenThrough": seen_through, "seenIds": sorted(set(seen_ids or []))})

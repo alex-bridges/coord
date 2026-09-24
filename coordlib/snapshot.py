@@ -31,20 +31,20 @@ WAITING_RUN_STATUSES = ("queued", "waiting", "requested", "pending")
 
 PR_FIELDS = """
 number title url isDraft isCrossRepository headRefName headRefOid baseRefName createdAt updatedAt mergeable
-labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
-files(first: 100) { totalCount nodes { path } }
-reactions(first: 50) { nodes { content createdAt user { login } } }
-closingIssuesReferences(first: 10) { nodes { number } }
+labels(first: 100) { totalCount nodes { name } }
+files(first: 100) { totalCount nodes { path changeType } }
+reactions(first: 100) { totalCount nodes { content createdAt user { login } } }
+closingIssuesReferences(first: 10) { totalCount nodes { number } }
 commits(last: 1) { nodes { commit {
   oid committedDate
-  checkSuites(first: 10) { nodes { createdAt } }
-  statusCheckRollup { state contexts(first: 80) { nodes {
+  checkSuites(first: 20) { totalCount nodes { createdAt } }
+  statusCheckRollup { state contexts(first: 100) { totalCount nodes {
     __typename
     ... on CheckRun { name status conclusion }
     ... on StatusContext { context state }
   } } }
 } } }
-reviewThreads(first: 50) { totalCount pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 10) { nodes { author { login } } } } }
+reviewThreads(first: 50) { totalCount pageInfo { hasNextPage endCursor } nodes { isResolved comments(first: 50) { totalCount nodes { author { login } } } } }
 """
 
 PRS_QUERY = """
@@ -74,7 +74,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
     pullRequest(number: $number) {
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        nodes { isResolved comments(first: 10) { nodes { author { login } } } }
+        nodes { isResolved comments(first: 50) { totalCount nodes { author { login } } } }
       }
     }
   }
@@ -85,33 +85,88 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 # MARK: - Fetch
 
 
-def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
-    """Fill in what the batched query truncates, for the few PRs that need it.
+def truncated(connection: Optional[Dict[str, Any]]) -> bool:
+    connection = connection or {}
+    return (connection.get("totalCount", 0) > len(connection.get("nodes") or [])
+            or bool((connection.get("pageInfo") or {}).get("hasNextPage")))
 
-    The PR query takes the first 100 files and 50 review threads; a PR past either
-    limit would otherwise show fewer overlaps or fewer unanswered findings than it
-    has (Codex on #989). The extra calls are spent only on those PRs.
+
+REACTION_NAMES = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
+
+
+def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
+    """Every check run and commit status at `sha`, in the GraphQL rollup's node shape."""
+    runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
+            for r in page.get("check_runs", [])]
+    statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
+    return ([{"__typename": "CheckRun", "name": r.get("name"), "status": _upper(r.get("status")),
+              "conclusion": _upper(r.get("conclusion"))} for r in runs]
+            + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
+               for c in statuses])
+
+
+def rest_files(gh: GitHub, number: int) -> List[str]:
+    """Every path a PR touches, BOTH sides of a rename: a PR renaming A to B conflicts
+    with work on A as surely as with work on B (Codex on #989)."""
+    paths: List[str] = []
+    for f in gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/files?per_page=100"):
+        paths.append(f["filename"])
+        if f.get("previous_filename"):
+            paths.append(f["previous_filename"])
+    return paths
+
+
+def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
+    """Make every list in a PR node whole before any rule reads it.
+
+    The batched query caps each connection (files, labels, reactions, checks, review
+    threads and their comments). Codex found these one at a time on #989 — files, then
+    threads, then labels, then reactions and thread comments — so this is the class
+    fix: every connection reports totalCount, each one that feeds a rule is completed
+    over REST when cut short, and the one that cannot be completed cheaply (the
+    comments inside a very long review thread) marks the node `incomplete`, which
+    holds the PR in the train instead of letting a guess decide.
     """
+    number = node["number"]
+    incomplete: List[str] = []
     files = node.get("files") or {}
-    if files.get("totalCount", 0) > len(files.get("nodes") or []):
-        listed = gh.rest_paginated(f"repos/{{repo}}/pulls/{node['number']}/files?per_page=100")
-        node["files"] = {"totalCount": len(listed), "nodes": [{"path": f["filename"]} for f in listed]}
-    labels = node.get("labels") or {}
-    if (labels.get("pageInfo") or {}).get("hasNextPage"):
-        # Labels carry policy (needs-alex, alex-approved, train:solo): never decide on a
-        # truncated list (Codex on #989).
-        listed = gh.rest_paginated(f"repos/{{repo}}/issues/{node['number']}/labels?per_page=100")
-        node["labels"] = {"pageInfo": {"hasNextPage": False}, "nodes": [{"name": l["name"]} for l in listed]}
+    if truncated(files) or any(f.get("changeType") == "RENAMED" for f in files.get("nodes") or []):
+        paths = rest_files(gh, number)
+        node["files"] = {"totalCount": len(paths), "nodes": [{"path": p} for p in paths]}
+    if truncated(node.get("labels")):
+        listed = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/labels?per_page=100")
+        node["labels"] = {"totalCount": len(listed), "nodes": [{"name": l["name"]} for l in listed]}
+    if truncated(node.get("reactions")):
+        listed = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
+        node["reactions"] = {"totalCount": len(listed), "nodes": [
+            {"content": REACTION_NAMES.get(r.get("content"), _upper(r.get("content"))), "createdAt": r.get("created_at"),
+             "user": {"login": (r.get("user") or {}).get("login")}} for r in listed]}
+    commits = ((node.get("commits") or {}).get("nodes")) or []
+    if commits:
+        commit = commits[-1].get("commit") or {}
+        sha = commit.get("oid") or node.get("headRefOid")
+        rollup = commit.get("statusCheckRollup") or {}
+        if truncated(rollup.get("contexts")):
+            contexts = rest_contexts(gh, sha)
+            rollup["contexts"] = {"totalCount": len(contexts), "nodes": contexts}
+            commit["statusCheckRollup"] = rollup
+        if truncated(commit.get("checkSuites")):
+            suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
+                      for c in page.get("check_suites", [])]
+            commit["checkSuites"] = {"totalCount": len(suites), "nodes": [{"createdAt": c.get("created_at")} for c in suites]}
     threads = node.get("reviewThreads") or {}
     page_info = threads.get("pageInfo") or {}
     cursor = page_info.get("endCursor")
     while page_info.get("hasNextPage"):
-        data = gh.graphql(THREADS_QUERY, {"owner": gh.owner, "name": gh.name, "number": node["number"], "cursor": cursor})
+        data = gh.graphql(THREADS_QUERY, {"owner": gh.owner, "name": gh.name, "number": number, "cursor": cursor})
         more = data["repository"]["pullRequest"]["reviewThreads"]
         threads.setdefault("nodes", []).extend(more["nodes"])
         page_info = more["pageInfo"]
         cursor = page_info.get("endCursor")
     threads["pageInfo"] = {"hasNextPage": False, "endCursor": cursor}
+    if any(truncated(t.get("comments")) for t in threads.get("nodes") or []):
+        incomplete.append("review-thread comments (a thread longer than 50)")
+    node["incomplete"] = incomplete
 
 
 def fetch_prs(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -310,11 +365,9 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
     number = pull["number"]
     sha = pull["head"]["sha"]
     detail = gh.rest(f"repos/{{repo}}/pulls/{number}")  # `mergeable` is only on the single-PR form
-    files = gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/files?per_page=100")
+    files = rest_files(gh, number)
     reactions = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
-    check_runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
-                  for r in page.get("check_runs", [])]
-    statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
+    contexts = rest_contexts(gh, sha)
     suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
               for c in page.get("check_suites", [])]
     committed = None
@@ -323,7 +376,6 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
     review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/{number}/comments?per_page=100")
     head_repo = (pull["head"].get("repo") or {}).get("full_name")
     mergeable = detail.get("mergeable")
-    reaction_names = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
     return {
         "number": number,
         "title": pull.get("title", ""),
@@ -336,9 +388,9 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
         "createdAt": pull.get("created_at"),
         "updatedAt": pull.get("updated_at"),
         "mergeable": "MERGEABLE" if mergeable is True else "CONFLICTING" if mergeable is False else "UNKNOWN",
-        "labels": {"pageInfo": {"hasNextPage": False}, "nodes": [{"name": l["name"]} for l in pull.get("labels") or []]},
-        "files": {"totalCount": len(files), "nodes": [{"path": f["filename"]} for f in files]},
-        "reactions": {"nodes": [{"content": reaction_names.get(r.get("content"), _upper(r.get("content"))),
+        "labels": {"nodes": [{"name": l["name"]} for l in pull.get("labels") or []]},
+        "files": {"totalCount": len(files), "nodes": [{"path": f} for f in files]},
+        "reactions": {"nodes": [{"content": REACTION_NAMES.get(r.get("content"), _upper(r.get("content"))),
                                  "createdAt": r.get("created_at"), "user": {"login": (r.get("user") or {}).get("login")}}
                                 for r in reactions]},
         "closingIssuesReferences": {"nodes": [{"number": int(n)} for n in _CLOSES.findall(pull.get("body") or "")]},
@@ -346,14 +398,10 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
             "oid": sha,
             "committedDate": committed,
             "checkSuites": {"nodes": [{"createdAt": c.get("created_at")} for c in suites]},
-            "statusCheckRollup": {"contexts": {"nodes": (
-                [{"__typename": "CheckRun", "name": r.get("name"), "status": _upper(r.get("status")),
-                  "conclusion": _upper(r.get("conclusion"))} for r in check_runs]
-                + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
-                   for c in statuses]
-            )}},
+            "statusCheckRollup": {"contexts": {"nodes": contexts}},
         }}]},
         "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": rest_review_threads(review_comments)},
+        "incomplete": [],
     }
 
 
@@ -413,7 +461,14 @@ def summarize_pr(pr: Dict[str, Any]) -> Dict[str, Any]:
         "ci": review.ci_state(pr),
         "codex": review.codex_state(pr),
         "unansweredFindings": review.unanswered_findings(pr),
+        "incomplete": list(pr.get("incomplete") or []),
     }
+
+
+def local_prs_by_branch(prs: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Open PRs from THIS repository by branch name. A fork's PR can use the same
+    branch name as local work; it must never be taken for it (Codex on #989)."""
+    return {pr["branch"]: pr for pr in prs if not pr.get("fromFork")}
 
 
 def resolve_claims(
@@ -450,7 +505,7 @@ def resolve_claims(
                 latest.pop((issue, previous), None)
         latest[(issue, agent)] = comment
 
-    pr_by_branch = {pr["branch"]: pr for pr in prs}
+    pr_by_branch = local_prs_by_branch(prs)
     claims: List[Dict[str, Any]] = []
     for (issue, agent), comment in latest.items():
         payload = comment["payload"]
@@ -527,7 +582,7 @@ def work_items(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[
     for pr in prs:
         declared = [f for c in claims if c["pr"] == pr["number"] for f in c["files"]]
         items.append((f"PR #{pr['number']}", sorted(set(pr["files"]) | set(declared)),
-                      {"pr": pr["number"], "branch": pr["branch"]}))
+                      {"pr": pr["number"], "branch": pr["branch"], "fork": bool(pr.get("fromFork"))}))
     for claim in claims:
         if claim["pr"] is None and claim["files"]:
             items.append((f"claim #{claim['issue']} ({claim['agent']})", claim["files"],

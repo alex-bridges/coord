@@ -395,7 +395,7 @@ class CodexRoundThreeTests(unittest.TestCase):
                 assert "issues/101/labels" in path, path
                 return [{"name": f"l{i}"} for i in range(120)] + [{"name": "needs-alex"}]
 
-        node = pr_node(labels={"pageInfo": {"hasNextPage": True}, "nodes": [{"name": "train"}]})
+        node = pr_node(labels={"totalCount": 121, "nodes": [{"name": "train"}]})
         snapshot.complete_pr_node(Fake(), node)
         self.assertIn("needs-alex", snapshot.summarize_pr(node)["labels"])
 
@@ -597,6 +597,71 @@ class RestFallbackTests(unittest.TestCase):
         self.assertIsNone(targets["issues"][9])
         self.assertEqual(targets["branches"]["feature/x"]["sha"], "b" * 40)
         self.assertIsNone(targets["branches"]["gone"])
+
+
+class CodexRoundSevenTests(unittest.TestCase):
+    """Findings from Codex's review of 0b36f6df4 on #989, fixed as classes."""
+
+    class Fake:
+        owner, name, repo = "o", "r", "o/r"
+
+        def rest_paginated(self, path):
+            if "pulls/101/files" in path:
+                return [{"filename": "B.swift", "previous_filename": "A.swift"}, {"filename": "C.swift"}]
+            if "issues/101/reactions" in path:
+                return [{"content": "+1", "created_at": t(5), "user": {"login": BOT}}]
+            if "check-runs" in path:
+                return [{"check_runs": [{"name": "Android", "status": "completed", "conclusion": "failure"}]}]
+            raise AssertionError(path)
+
+        def rest(self, path, method="GET", body=None):
+            if path.endswith("/status"):
+                return {"statuses": []}
+            raise AssertionError(path)
+
+    def test_every_capped_list_is_completed_or_the_pr_is_held(self):
+        node = pr_node(
+            files={"totalCount": 2, "nodes": [{"path": "B.swift", "changeType": "RENAMED"}, {"path": "C.swift"}]},
+            reactions={"totalCount": 101, "nodes": []},
+            reviewThreads={"totalCount": 1, "nodes": [{"isResolved": False, "comments": {
+                "totalCount": 60, "nodes": [{"author": {"login": BOT}}]}}]},
+        )
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = {"totalCount": 101, "nodes": []}
+        snapshot.complete_pr_node(self.Fake(), node)
+        pr = snapshot.summarize_pr(node)
+        self.assertEqual(sorted(pr["files"]), ["A.swift", "B.swift", "C.swift"], "both sides of the rename")
+        self.assertTrue(pr["codex"]["approved"], "the 👍 beyond the first page was found")
+        self.assertEqual(pr["ci"]["failing"], ["Android"], "a red check beyond the first page was found")
+        self.assertEqual(pr["incomplete"], ["review-thread comments (a thread longer than 50)"])
+        from coordlib import train
+        verdict, reason = train.eligibility(dict(pr, ci={"failing": [], "pending": [], "started": []}))
+        self.assertEqual(verdict, train.HOLD)
+        self.assertIn("only part of", reason)
+
+    def test_a_fork_pr_with_the_same_branch_name_is_never_taken_for_local_work(self):
+        fork = snapshot.summarize_pr(pr_node(number=200, headRefName="feature/x", isCrossRepository=True))
+        comments = [coord_comment(1, 7, 10, {"kind": "claim", "agent": "me", "issue": 7, "branch": "feature/x"})]
+        claims = snapshot.resolve_claims(comments, {"issues": {7: {"state": "OPEN"}}, "branches": {}}, [fork], NOW)
+        self.assertIsNone(claims[0]["pr"])
+        self.assertIsNone(render.claim_owner({"claims": claims}, fork))
+        snap = {"claims": [], "prs": [fork], "messages": [
+            {"id": 1, "createdAt": t(5), "payload": {"kind": "msg", "agent": "x", "to": ["#200"]}}]}
+        self.assertEqual(cli.unread_direct(snap, "me", None, current_branch="feature/x"), 0)
+
+    def test_a_comment_in_the_cursor_second_is_delivered_once(self):
+        me = "claude@Eidolon:wt"
+        cursor = t(1)  # the previous read stopped one minute ago
+        # Created 30 s before the cursor time, after that read had fetched: never shown.
+        late = {"id": 11, "createdAt": t(1.5), "payload": {"kind": "msg", "agent": "x", "to": [me]}}
+        shown = {"id": 10, "createdAt": t(1.6), "payload": {"kind": "msg", "agent": "x", "to": [me]}}
+        snap = {"claims": [], "prs": [], "messages": [late, shown]}
+        self.assertEqual(cli.unread_direct(snap, me, cursor, seen_ids=[10]), 1)
+        comment = {"id": 11, "issue_url": "https://api.github.com/repos/o/r/issues/5", "created_at": t(1.5),
+                   "html_url": "h", "user": {"login": "alex-bridges"},
+                   "body": marker.compose("hi", {"kind": "msg", "agent": "x", "to": [me]})}
+        since = review.parse_time(cursor) - cli.CURSOR_OVERLAP
+        self.assertEqual(len(cli.inbox_items([comment], [], snap, me, since, "", [10])), 1)
+        self.assertEqual(cli.inbox_items([comment], [], snap, me, since, "", [10, 11]), [])
 
 
 class OverlapAndTrainTests(unittest.TestCase):

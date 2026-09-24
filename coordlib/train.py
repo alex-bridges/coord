@@ -73,6 +73,9 @@ def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         return DROP, "it conflicts with main; merge main into it (or rebase) and add it again"
     if pr.get("isDraft"):
         return HOLD, "it is a draft"
+    if pr.get("incomplete"):
+        return HOLD, ("GitHub returned only part of its " + ", ".join(pr["incomplete"])
+                      + "; the train does not decide on partial data")
     if NEEDS_ALEX_LABEL in labels and ALEX_APPROVED_LABEL not in labels:
         return HOLD, "it is labelled needs-alex and waits for alex-approved"
     codex = pr.get("codex") or {}

@@ -121,26 +121,38 @@ class Step:
         return [j["name"] for page in pages for j in page.get("jobs", [])
                 if j.get("conclusion") in ("failure", "timed_out", "startup_failure")]
 
-    def cancel_branch_runs(self, branch: str) -> None:
-        """Cancel every run of a merged PR's branch that has not completed.
+    def cancel_branch_runs(self, branch: str) -> bool:
+        """Cancel every run of a merged PR's branch that has not completed. True when done.
 
         ONE unfiltered snapshot, like cancel-merged-branch-runs.yml: filtering by
         status would miss runs in `requested`, `waiting` or `pending` and race runs
-        moving between states (Codex on #989).
+        moving between states (Codex on #989). Each cancel is tried on its own; a run
+        that finished in between answers 409 and is fine; any other failure returns
+        False so the caller keeps the batch and the next step tries again.
         """
         try:
             # Encoded: a branch named `feature#1` or `a&b` must not change the query.
             pages = self.gh.rest_paginated(
                 f"repos/{{repo}}/actions/runs?branch={urllib.parse.quote(branch, safe='')}&per_page=100")
-            for run in [r for page in pages for r in page.get("workflow_runs", [])]:
-                # The branch filter also matches a FORK's branch of the same name; leave
-                # other repositories' runs alone, as cancel-merged-branch-runs.yml does.
-                if (run.get("head_repository") or {}).get("full_name") != self.gh.repo:
-                    continue
-                if run.get("status") != "completed":
-                    self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/cancel", method="POST")
         except GitHubError as error:
-            self.note(f"could not cancel runs of {branch}: {error}")
+            self.note(f"could not list runs of {branch}: {error}")
+            return False
+        done = True
+        for run in [r for page in pages for r in page.get("workflow_runs", [])]:
+            # The branch filter also matches a FORK's branch of the same name; leave
+            # other repositories' runs alone, as cancel-merged-branch-runs.yml does.
+            if (run.get("head_repository") or {}).get("full_name") != self.gh.repo:
+                continue
+            if run.get("status") == "completed":
+                continue
+            try:
+                self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/cancel", method="POST")
+            except GitHubError as error:
+                if "409" in str(error):
+                    continue
+                self.note(f"could not cancel run {run['id']} of {branch}: {error}")
+                done = False
+        return done
 
     def open_prs(self) -> Dict[int, Dict[str, Any]]:
         _, nodes = snapshot.fetch_prs(self.gh)
@@ -222,8 +234,8 @@ class Step:
                 if self.mode == "live":
                     branch = (prs.get(number) or {}).get("branch") \
                         or ((self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}).get("head") or {}).get("ref")
-                    if branch:
-                        self.cancel_branch_runs(branch)
+                    if branch and not self.cancel_branch_runs(branch):
+                        failures.append(f"#{number}: some runs of {branch} were not cancelled")
             except GitHubError as error:
                 failures.append(f"#{number}: {error}")
         if failures:
@@ -293,6 +305,10 @@ class Step:
             self.note(f"{name} ({numbers}): green, but main moved from {base[:9]} to {main[:9]}; rebuilding")
             self.delete_branch(name)
             return
+        # Fresh state for the final check: a push or a `train remove` since this step
+        # started must stop the merge (Codex on #989). What main receives is still the
+        # tested tip; the window left is the second between this read and the update.
+        prs = self.open_prs()
         for member in members:
             number = member["pr"]
             pr = prs.get(number)

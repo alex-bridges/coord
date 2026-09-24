@@ -69,7 +69,7 @@ def codex_words(pr: Dict[str, Any]) -> str:
 
 def claim_owner(snapshot: Dict[str, Any], pr: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     for claim in snapshot["claims"]:
-        if claim["pr"] == pr["number"] or claim["branch"] == pr["branch"]:
+        if claim["pr"] == pr["number"] or (claim["branch"] == pr["branch"] and not pr.get("fromFork")):
             return claim
     return None
 

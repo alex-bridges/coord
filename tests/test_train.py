@@ -458,6 +458,47 @@ class StepTests(unittest.TestCase):
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         self.assertEqual(fake.posted("merged"), [])
 
+    def test_the_final_check_reads_fresh_pr_state(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        dequeued = ready_node(1, h1, "pr1", labels=())  # someone ran `train remove` mid-step
+        calls = []
+        original = fake.graphql
+        def graphql(query, variables=None):
+            calls.append(1)
+            data = original(query, variables)
+            if len(calls) > 1:
+                data["repository"]["pullRequests"]["nodes"] = [dequeued]
+            return data
+        fake.graphql = graphql
+        lines = self.step(fake).run()
+        self.assertGreaterEqual(len(calls), 2, "the PRs are read again before main moves")
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+
+    def test_one_failed_cancel_does_not_stop_the_others_and_keeps_the_batch(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        here = {"full_name": "o/r"}
+        fake.branch_runs["pr1"] = [{"id": n, "status": "queued", "head_repository": here} for n in (601, 602, 603)]
+        original = fake.rest
+        def rest(path, method="GET", body=None):
+            if path.endswith("/601/cancel"):
+                from coordlib.gh import GitHubError
+                raise GitHubError("HTTP 502")
+            if path.endswith("/602/cancel"):
+                from coordlib.gh import GitHubError
+                raise GitHubError("HTTP 409 Cannot cancel a workflow run that is completed")
+            return original(path, method, body)
+        fake.rest = rest
+        lines = self.step(fake).run()
+        self.assertIn(("POST", "repos/{repo}/actions/runs/603/cancel", None), fake.writes, "the rest still cancelled")
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes,
+                         "a failed cancel keeps the batch for the next step")
+        self.assertTrue(any("601" in line for line in lines), lines)
+        self.assertFalse(any("602" in line for line in lines), "409: the run finished, nothing to retry")
+
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
         seen = []

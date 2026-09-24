@@ -16,6 +16,10 @@ from .gh import GitHub, GitHubError, NotFound
 
 INBOX_DEFAULT_DAYS = 7
 DEFAULT_MAX_AGE = 60
+# GitHub timestamps have one-second precision, so a read that stops "now" can miss a
+# comment created later in that same second. Every read looks back this far and skips
+# the ids it already delivered.
+CURSOR_OVERLAP = dt.timedelta(seconds=120)
 
 
 class UsageError(Exception):
@@ -44,15 +48,19 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
     return fresh
 
 
-def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "") -> int:
+def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "",
+                  seen_ids: Optional[List[int]] = None) -> int:
     """Messages addressed to `me` newer than the inbox cursor, from the snapshot alone.
 
     "Mine" is what `inbox_items` treats as mine: claimed issues, their PRs, and the PR
     of the current branch (an agent on a PR whose claim aged out still gets its mail).
     """
-    since = review.parse_time(cursor) if cursor else None
+    since = (review.parse_time(cursor) - CURSOR_OVERLAP) if cursor else None
+    seen = set(seen_ids or [])
     mine = {f"#{n}" for c in snap["claims"] if c["agent"] == me for n in (c["issue"], c["pr"]) if n}
-    mine |= {f"#{pr['number']}" for pr in snap["prs"] if current_branch and pr["branch"] == current_branch}
+    local = snapshot.local_prs_by_branch(snap["prs"])
+    if current_branch and current_branch in local:
+        mine.add(f"#{local[current_branch]['number']}")
     count = 0
     for message in snap["messages"]:
         payload = message["payload"]
@@ -60,6 +68,8 @@ def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_
             continue
         # `send --on N` addresses "#N": whoever works on N.
         if not any(identity.matches(str(to), me) or str(to) in mine for to in payload.get("to") or []):
+            continue
+        if message.get("id") in seen:
             continue
         created = review.parse_time(message["createdAt"])
         if since is None or (created is not None and created > since):
@@ -109,7 +119,8 @@ def cmd_whoami(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     snap = get_snapshot(gh, 0 if args.fresh else args.max_age)
-    unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch())
+    unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
+                           cache.load_seen_ids(gh.repo, me))
     if args.json:
         out = {k: v for k, v in snap.items() if k != "claimComments"}
         out["me"] = me
@@ -202,8 +213,8 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     print(f"claimed #{args.issue} as {me} on {branch}: {posted.get('html_url')}")
     warnings = []
     for label, other, owner in snapshot.work_items(snap["prs"], snap["claims"]):
-        if owner.get("branch") == branch or owner.get("issue") == args.issue:
-            continue  # this work itself
+        if (owner.get("branch") == branch and not owner.get("fork")) or owner.get("issue") == args.issue:
+            continue  # this work itself (a fork's PR with the same branch name is not)
         shared = snapshot.overlapping(files, other)
         if shared:
             warnings.append(f"  {label} ({owner.get('branch')}) touches or expects: {', '.join(shared[:5])}")
@@ -255,6 +266,7 @@ def inbox_items(
     me: str,
     since: dt.datetime,
     current_branch: str,
+    seen_ids: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Messages to `me`, plus comments by others on the issues and PRs `me` works on."""
     mine = set()
@@ -263,15 +275,18 @@ def inbox_items(
             mine.add(claim["issue"])
             if claim["pr"]:
                 mine.add(claim["pr"])
-    for pr in snap["prs"]:
-        if current_branch and pr["branch"] == current_branch:
-            mine.add(pr["number"])
+    local = snapshot.local_prs_by_branch(snap["prs"])
+    if current_branch and current_branch in local:
+        mine.add(local[current_branch]["number"])
+    seen = set(seen_ids or [])
 
     items = []
     for comment, number, kind in (
         [(c, _number_from_url(c.get("issue_url", "")), "comment") for c in issue_comments]
         + [(c, _number_from_url(c.get("pull_request_url", "")), "review comment") for c in review_comments]
     ):
+        if comment.get("id") in seen:
+            continue  # delivered by an earlier read inside the overlap window
         created = review.parse_time(comment.get("created_at"))
         if created is None or created <= since:
             continue  # `since` filters on updated_at; an old comment edited later is not new
@@ -289,6 +304,7 @@ def inbox_items(
         if reason is None:
             continue
         items.append({
+            "id": comment.get("id"),
             "at": comment.get("created_at"),
             "from": sender,
             "on": number,
@@ -304,13 +320,19 @@ def inbox_items(
 
 def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
-    cursor = None if args.all else (args.since or cache.load_cursor(gh.repo, me))
-    since = review.parse_time(cursor) if cursor else snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
+    stored = None if (args.all or args.since) else cache.load_cursor(gh.repo, me)
+    seen_ids = cache.load_seen_ids(gh.repo, me) if stored else []
+    if args.since:
+        since = review.parse_time(args.since)
+    elif stored:
+        since = review.parse_time(stored) - CURSOR_OVERLAP
+    else:
+        since = snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
     started = snapshot.now_utc()
     snap = get_snapshot(gh, args.max_age)
     issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
     review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
-    items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch())
+    items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
     if args.json:
         print(json.dumps({"me": me, "since": snapshot.iso(since), "items": items}, indent=2))
     else:
@@ -325,7 +347,12 @@ def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
             print("  " + text.replace("\n", "\n  "))
             print(f"  {item['url']}")
     if not args.peek and not args.all and not args.since:
-        cache.store_cursor(gh.repo, me, snapshot.iso(started))
+        window = started - CURSOR_OVERLAP
+        # Earlier ids matter only while the earlier read's window overlaps the new one.
+        previous = seen_ids if stored and review.parse_time(stored) >= window else []
+        keep = previous + [item["id"] for item in items if item.get("id") is not None
+                           and (review.parse_time(item["at"]) or started) >= window]
+        cache.store_cursor(gh.repo, me, snapshot.iso(started), keep)
     return EXIT_OK
 
 
