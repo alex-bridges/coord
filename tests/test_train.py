@@ -598,6 +598,51 @@ class StepTests(unittest.TestCase):
         self.assertEqual(slept, [], "a gate still running is an ordinary wait, not a poll")
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
 
+    def settle_calls(self, jobs, finishes_after_sleep=True):
+        """How many times settle sleeps for a batch run with these jobs listed."""
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        run = self.run_on(fake, name, tip, status="in_progress", conclusion=None)
+        fake.jobs[77] = jobs
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            if finishes_after_sleep:
+                run.update(status="completed", conclusion="success")
+
+        self.step(fake, sleep=sleep).run()
+        return len(slept)
+
+    def test_settle_waits_when_every_job_has_finished(self):
+        done = {"name": "CoreKit release gate", "status": "completed"}
+        self.assertEqual(self.settle_calls([done, {"name": "CI verdict", "status": "completed"},
+                                            {"name": "Wake the merge train", "status": "completed"}]), 1)
+
+    def test_settle_waits_while_only_the_wake_job_runs(self):
+        done = {"name": "CoreKit release gate", "status": "completed"}
+        self.assertEqual(self.settle_calls([done, {"name": "CI verdict", "status": "completed"},
+                                            {"name": "Wake the merge train", "status": "in_progress"}]), 1)
+
+    def test_settle_never_waits_for_a_final_job_that_has_not_started(self):
+        # A verdict queued behind THIS step on the one light runner can never start
+        # while the step waits.
+        self.assertEqual(self.settle_calls([{"name": "CI verdict", "status": "queued"}]), 0)
+
+    def test_settle_never_waits_before_any_job_is_listed(self):
+        self.assertEqual(self.settle_calls([]), 0)
+
+    def test_the_aggregate_verdict_is_never_a_shared_failure(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"},
+                         {"name": "CI verdict", "conclusion": "failure"}]
+        fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
+        fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}, {"name": "CI verdict", "conclusion": "failure"}]
+        self.step(fake).run()
+        self.assertEqual(fake.posted("ejected"), [1], "main red in Android does not excuse a red release gate")
+
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
         seen = []

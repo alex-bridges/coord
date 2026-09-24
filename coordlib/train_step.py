@@ -1,10 +1,12 @@
 """One step of the merge train, run by .github/workflows/merge-train.yml.
 
 Each step reads the state from GitHub and git, does ONE thing, and exits; the
-workflow's concurrency group guarantees one step at a time. A step never waits on
-CI: the workflow is woken again when a CI run on a train/ branch completes, and a
-cron tick catches anything that event misses. Holding a runner slot while a gate
-runs is exactly the waste #915 removed.
+workflow's concurrency group guarantees one step at a time. A step never waits on a
+gate: ci.yml's `wake-train` job dispatches the next step when a batch's CI has its
+verdict (GitHub's `workflow_run` does not fire for runs the Actions token dispatched),
+and a cron tick is the backstop. The one wait is `settle`: up to two minutes for a
+batch run whose jobs have all finished to be marked completed. Holding a runner slot
+while a gate runs is exactly the waste #915 removed.
 
 State lives only in GitHub:
 - the queue: open PRs labelled `train`, ordered by their `train-add` comment;
@@ -41,6 +43,8 @@ DISPATCH_GRACE_MINUTES = 10
 SETTLE_SECONDS = 120
 SETTLE_POLL_SECONDS = 10
 VERDICT_JOB = "CI verdict"
+WAKE_JOB = "Wake the merge train"
+FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
 
 
 class GitError(RuntimeError):
@@ -148,18 +152,30 @@ class Step:
     def settle(self, name: str, tip: str, run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Give a batch run that is only finishing its bookkeeping time to be marked done.
 
-        Bounded (SETTLE_SECONDS) and only when no real work is left, so a step never
-        holds the runner through a gate.
+        ci.yml's wake-train job starts this step as the run's last act, so the run can
+        still read "in progress". Wait (SETTLE_SECONDS at most) only when that is all it
+        is: every job completed, or only the verdict and wake jobs left and actually
+        running. Never while a lane runs, nor while a final job is still queued (it may be
+        queued behind THIS step on the one light runner), nor before any job is listed.
         """
         waited = 0
+        announced = False
         while run is not None and run.get("status") != "completed" and waited < SETTLE_SECONDS:
             pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100")
-            unfinished = [j for page in pages for j in page.get("jobs", []) if j.get("status") != "completed"]
-            if any(j.get("name") != VERDICT_JOB for j in unfinished):
-                break  # real work is still running: an ordinary wait
+            jobs = [j for page in pages for j in page.get("jobs", [])]
+            if not jobs:
+                break
+            unfinished = [j for j in jobs if j.get("status") != "completed"]
+            if any(j.get("name") not in FINAL_JOBS or j.get("status") != "in_progress" for j in unfinished):
+                break  # real work, or a final job not yet started: an ordinary wait
+            if not announced:
+                self.note(f"{name}: run {run['id']} has finished its jobs; waiting up to {SETTLE_SECONDS}s "
+                          "for GitHub to mark it completed")
+                announced = True
             self.sleep(SETTLE_POLL_SECONDS)
             waited += SETTLE_POLL_SECONDS
-            run = self.batch_run(name, tip)
+            fresh = self.batch_run(name, tip)
+            run = fresh if fresh is not None else run
         return run
 
     def batch_run(self, name: str, tip: str) -> Optional[Dict[str, Any]]:
@@ -368,7 +384,9 @@ class Step:
             failed = self.failed_jobs(run["id"])
             jobs = ", ".join(failed[:5]) or "see the run"
             main_state = self.main_ci(main)
-            shared = sorted(set(failed) & set(main_state.get("failed") or []))
+            # Lane jobs only: the aggregate verdict is red whenever anything is, so it
+            # would always look "shared" between two red runs.
+            shared = sorted((set(failed) & set(main_state.get("failed") or [])) - set(FINAL_JOBS))
             if shared:
                 # Red on main too: not these PRs' fault. Removing them one by one would
                 # empty the queue while main is broken (substitute review of #989).
