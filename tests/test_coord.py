@@ -335,6 +335,8 @@ class CodexRoundTwoTests(unittest.TestCase):
 
             def rest_paginated(self, path):
                 self.paths.append(path)
+                if "/jobs" in path:
+                    return [{"jobs": [{"status": "queued"}]}]
                 status = path.split("status=")[1].split("&")[0]
                 if status == "in_progress":
                     return [{"workflow_runs": []}]
@@ -342,6 +344,23 @@ class CodexRoundTwoTests(unittest.TestCase):
 
         runs = snapshot.fetch_runs(Fake())
         self.assertEqual(sorted(r["status"] for r in runs["queued"]), ["pending", "queued", "requested", "waiting"])
+
+    def test_a_queued_run_with_a_job_in_progress_counts_as_running(self):
+        class Fake:
+            def rest_paginated(self, path):
+                if "/jobs" in path:
+                    return [{"jobs": [{"status": "in_progress", "name": "CoreKit release gate", "runner_name": "Tycho",
+                                       "steps": [{"name": "Test", "status": "in_progress"}]},
+                                      {"status": "queued", "name": "Android"}]}]
+                if "status=queued" in path:
+                    return [{"workflow_runs": [{"id": 9, "status": "queued", "head_branch": "main", "created_at": t(120)}]}]
+                return [{"workflow_runs": []}]
+
+        runs = snapshot.fetch_runs(Fake())
+        self.assertEqual([r["id"] for r in runs["running"]], [9])
+        self.assertEqual(runs["running"][0]["jobsRunning"][0]["runner"], "Tycho")
+        self.assertEqual(runs["running"][0]["jobsQueued"], 1)
+        self.assertEqual(runs["queued"], [])
 
 
 class CodexRoundThreeTests(unittest.TestCase):

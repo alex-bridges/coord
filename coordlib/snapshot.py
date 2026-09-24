@@ -163,8 +163,7 @@ def fetch_runs(gh: GitHub) -> Dict[str, List[Dict[str, Any]]]:
             "status": run.get("status"),
         }
 
-    out_running = []
-    for run in running:
+    def with_jobs(run: Dict[str, Any]) -> Dict[str, Any]:
         item = summary(run)
         jobs: List[Dict[str, Any]] = []
         for page in gh.rest_paginated(f"repos/{{repo}}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100"):
@@ -178,10 +177,20 @@ def fetch_runs(gh: GitHub) -> Dict[str, List[Dict[str, Any]]]:
             }
             for job in jobs if job.get("status") == "in_progress"
         ]
-        item["jobsQueued"] = sum(1 for job in jobs if job.get("status") in ("queued", "waiting", "pending"))
+        item["jobsQueued"] = sum(1 for job in jobs if job.get("status") in ("queued", "waiting", "pending", "requested"))
         item["jobsDone"] = sum(1 for job in jobs if job.get("status") == "completed")
-        out_running.append(item)
-    return {"running": out_running, "queued": [summary(run) for run in queued]}
+        return item
+
+    # A run's own status says "queued" while any of its jobs still wait, even when
+    # others are running on Tycho (observed 2026-09-24: main's run, 2 h old, one job
+    # in progress, listed as queued). So read the jobs of every active run and call a
+    # run running when one of its jobs is.
+    out_running, out_queued = [], []
+    for run in running + queued:
+        item = with_jobs(run)
+        (out_running if item["jobsRunning"] else out_queued).append(item)
+    out_queued.sort(key=lambda item: item.get("createdAt") or "")
+    return {"running": out_running, "queued": out_queued}
 
 
 _ISSUE_URL = re.compile(r"/issues/(\d+)$")
