@@ -8,6 +8,7 @@ cursors (the next inbox shows the last 7 days again).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -73,7 +74,11 @@ def invalidate_snapshot(repo: str) -> None:
 
 
 def _cursor_path(repo: str, agent: str) -> str:
-    return os.path.join(cache_dir(repo), "inbox", re.sub(r"[^A-Za-z0-9._-]", "_", agent) + ".json")
+    """Readable prefix plus a digest of the FULL id: `a+b` and `a_b` both read `a_b`, and
+    two agents sharing a cursor would mark each other's messages read (Codex on #989)."""
+    readable = re.sub(r"[^A-Za-z0-9._-]", "_", agent)[:60]
+    digest = hashlib.sha256(agent.encode()).hexdigest()[:12]
+    return os.path.join(cache_dir(repo), "inbox", f"{readable}-{digest}.json")
 
 
 def load_cursor(repo: str, agent: str) -> Optional[str]:

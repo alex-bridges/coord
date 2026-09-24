@@ -66,8 +66,12 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
-        self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False},
-                                                labels=["train", "codex-unavailable"]))[0], train.READY)
+        unavailable = dict(pr, codex={"approved": False, "reviewing": False}, labels=["train", "codex-unavailable"])
+        self.assertEqual(train.eligibility(dict(unavailable, substituteReviewHead=pr["head"]))[0], train.READY)
+        verdict, reason = train.eligibility(dict(unavailable, substituteReviewHead="0" * 40))
+        self.assertEqual(verdict, train.HOLD, "a substitute review of an OLDER head does not cover a new push")
+        self.assertIn("substitute review", reason)
+        self.assertEqual(train.eligibility(unavailable)[0], train.HOLD, "the label alone is not a review")
         self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings")
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": ["Android"], "pending": [], "verdict": "failure"}))[0],
                          train.HOLD)
@@ -131,6 +135,9 @@ class FakeGitHub:
         self.dispatched: List[tuple] = []
         self.branch_runs: Dict[str, List[Dict[str, Any]]] = {}
         self.fail_writes = 0
+        self.patch_error = ""
+        self.reread_error = ""
+        self.reread_main = ""
         self.calls = 0
 
     def graphql(self, query, variables=None):
@@ -139,6 +146,14 @@ class FakeGitHub:
                                                 "nodes": self.nodes}}}
 
     def rest(self, path, method="GET", body=None):
+        from coordlib.gh import GitHubError
+        if method == "PATCH" and self.patch_error:
+            self.writes.append((method, path, body))
+            raise GitHubError(self.patch_error)
+        if path.endswith("git/ref/heads/main"):
+            if self.reread_error:
+                raise GitHubError(self.reread_error)
+            return {"object": {"sha": self.reread_main}}
         if self.fail_writes and method in ("POST", "DELETE"):
             self.fail_writes -= 1
             from coordlib.gh import GitHubError
@@ -323,13 +338,16 @@ class StepTests(unittest.TestCase):
         h2 = self.pr_branch(2, "d.txt", "d\n")
         fake, name, tip = self.build_batch([(1, h1), (2, h2)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.branch_runs["pr1"] = [{"id": 501, "status": status} for status in
+        here = {"full_name": "o/r"}
+        fake.branch_runs["pr1"] = [{"id": 501, "status": status, "head_repository": here} for status in
                                    ("queued", "in_progress", "requested", "waiting", "pending")] + [
-                                  {"id": 507, "status": "completed"}]
+                                  {"id": 507, "status": "completed", "head_repository": here},
+                                  {"id": 508, "status": "queued", "head_repository": {"full_name": "someone/fork"}}]
         self.step(fake).run()
         self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
         cancelled = [path for method, path, _ in fake.writes if path.endswith("/cancel")]
         self.assertEqual(len(cancelled), 5, "every run that has not completed, in any waiting state")
+        self.assertFalse(any("/508/" in path for path in cancelled), "a fork's run with the same branch name is not ours")
         self.assertEqual(sorted(fake.posted("merged")), [1, 2])
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         # GitHub marks a PR merged when its head becomes reachable from main.
@@ -415,6 +433,30 @@ class StepTests(unittest.TestCase):
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), "main is not moved twice")
         self.assertEqual(sorted(first_round + fake.posted("merged")), [1, 2], "one receipt per PR, none twice")
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_an_ambiguous_main_update_never_throws_away_the_batch(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        # 1. The update WAS applied, the response was lost: finish the merge.
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.patch_error, fake.reread_main = "HTTP 502 (response lost)", tip
+        self.step(fake).run()
+        self.assertEqual(fake.posted("merged"), [1])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        # 2. Main cannot even be re-read: keep the batch branch for the next step.
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.patch_error, fake.reread_error = "HTTP 502", "HTTP 502 again"
+        lines = self.step(fake).run()
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("keeping the batch" in line for line in lines), lines)
+        # 3. The update really failed (main elsewhere): rebuild.
+        fake.writes.clear()
+        fake.reread_error, fake.reread_main = "", self.main
+        self.step(fake).run()
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertEqual(fake.posted("merged"), [])
 
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)

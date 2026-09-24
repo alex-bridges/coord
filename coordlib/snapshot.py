@@ -551,6 +551,17 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
     return out
 
 
+def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
+    """Set each PR's `substituteReviewHead`: the head its newest review-substitute comment names."""
+    latest: Dict[int, str] = {}
+    for comment in comments:  # oldest first
+        payload = comment["payload"]
+        if payload.get("kind") == "review-substitute" and isinstance(payload.get("pr"), int):
+            latest[payload["pr"]] = payload.get("head")
+    for pr in prs:
+        pr["substituteReviewHead"] = latest.get(pr["number"])
+
+
 def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """PRs carrying the train label, in the order they were added."""
     added: Dict[int, Dict[str, Any]] = {}
@@ -586,6 +597,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p["issue"] for p in claim_payloads if isinstance(p.get("issue"), int)],
         [p.get("branch") or "" for p in claim_payloads],
     )
+    attach_substitute_reviews(prs, comments)
     claims = resolve_claims(comments, targets, prs, now)
     messages = [c for c in comments if c["payload"].get("kind") == "msg"]
     return {

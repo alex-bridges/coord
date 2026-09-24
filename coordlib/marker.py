@@ -23,7 +23,7 @@ from typing import Any, Dict, Optional
 PREFIX = "<!-- coord:v1 "
 SUFFIX = " -->"
 
-KINDS = ("claim", "release", "msg", "train-add", "train-remove", "train")
+KINDS = ("claim", "release", "msg", "train-add", "train-remove", "train", "review-substitute")
 
 
 def encode(payload: Dict[str, Any]) -> str:

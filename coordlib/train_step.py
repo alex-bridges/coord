@@ -133,6 +133,10 @@ class Step:
             pages = self.gh.rest_paginated(
                 f"repos/{{repo}}/actions/runs?branch={urllib.parse.quote(branch, safe='')}&per_page=100")
             for run in [r for page in pages for r in page.get("workflow_runs", [])]:
+                # The branch filter also matches a FORK's branch of the same name; leave
+                # other repositories' runs alone, as cancel-merged-branch-runs.yml does.
+                if (run.get("head_repository") or {}).get("full_name") != self.gh.repo:
+                    continue
                 if run.get("status") != "completed":
                     self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/cancel", method="POST")
         except GitHubError as error:
@@ -142,13 +146,19 @@ class Step:
         _, nodes = snapshot.fetch_prs(self.gh)
         return {node["number"]: snapshot.summarize_pr(node) for node in nodes}
 
-    def train_added(self, number: int) -> Dict[str, Any]:
-        """The newest train-add marker on the PR: when it joined and at which head."""
+    def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
+        """The newest train-add marker on the PR (when it joined, at which head), and the
+        head its newest review-substitute comment names, which is set on `pr`."""
+        number = pr["number"]
         latest: Dict[str, Any] = {}
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
-            if payload and payload.get("kind") == "train-add" and payload.get("pr") == number:
+            if not payload or payload.get("pr") != number:
+                continue
+            if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
+            elif payload.get("kind") == "review-substitute":
+                pr["substituteReviewHead"] = payload.get("head")
         return latest
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
@@ -294,6 +304,7 @@ class Step:
             elif train.TRAIN_LABEL not in pr["labels"]:
                 problem = "was taken out of the train"
             else:
+                self.train_added(pr)  # refresh the substitute-review head for the final check
                 verdict, reason = train.eligibility(pr, all_files=self.all_files(pr))
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"
@@ -305,9 +316,20 @@ class Step:
             try:
                 self.gh.rest("repos/{repo}/git/refs/heads/main", method="PATCH", body={"sha": tip, "force": False})
             except GitHubError as error:
-                self.note(f"{name} ({numbers}): green, but main could not be fast-forwarded ({error}); rebuilding")
-                self.delete_branch(name)
-                return
+                # The update may have been applied with its response lost. The batch
+                # branch is the only record of what to clean up, so look before deleting
+                # it, and keep it when even that cannot be told (Codex on #989).
+                try:
+                    now_main = ((self.gh.rest("repos/{repo}/git/ref/heads/main") or {}).get("object") or {}).get("sha")
+                except GitHubError as reread:
+                    self.note(f"{name} ({numbers}): main update failed ({error}) and main cannot be re-read "
+                              f"({reread}); keeping the batch for the next step")
+                    return
+                if now_main != tip:
+                    self.note(f"{name} ({numbers}): green, but main could not be fast-forwarded ({error}); rebuilding")
+                    self.delete_branch(name)
+                    return
+                self.note(f"{name} ({numbers}): the main update reported {error}, but main is at {tip[:9]}")
         verb = "main fast-forwarded to" if self.mode == "live" else "dry run: would have fast-forwarded main to"
         self.note(f"{name} ({numbers}): CI green; {verb} {tip[:9]}")
         self.finish(name, tip, members, prs, run)
@@ -320,7 +342,7 @@ class Step:
         entries = []
         verdicts = {}
         for pr in queued:
-            added = self.train_added(pr["number"])
+            added = self.train_added(pr)
             entries.append({"pr": pr["number"], "at": added.get("at") or "9999"})
             verdicts[pr["number"]] = train.eligibility(pr, added.get("head"), self.all_files(pr))
         entries.sort(key=lambda e: (e["at"], e["pr"]))

@@ -389,6 +389,21 @@ def cmd_train_remove(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def cmd_train_substitute_review(args: argparse.Namespace, gh: GitHub) -> int:
+    """Codex out of quota (Alex's rule): record that a substitute review covered THIS head."""
+    me = identity.agent_id()
+    pr = gh.rest(f"repos/{{repo}}/pulls/{args.pr}")
+    head = (pr.get("head") or {}).get("sha", "")
+    text = (f"**Substitute review** recorded by `{me}` for head `{head[:9]}` (Codex unavailable).\n\n{args.note}\n\n"
+            "This stands in for Codex's 👍 on this head only; a new push needs a new review.")
+    post_comment(gh, args.pr, text, {"kind": "review-substitute", "v": 1, "agent": me, "pr": args.pr, "head": head})
+    train_step.ensure_labels(gh)
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"recorded a substitute review of #{args.pr} at {head[:9]}")
+    return EXIT_OK
+
+
 def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, args.max_age)
     prs = {p["number"]: p for p in snap["prs"]}
@@ -403,7 +418,7 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         tip = (ref.get("object") or {}).get("sha", "")
         pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
                                   f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
-        runs = [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
+        runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
         run = max(runs, key=lambda r: r["id"]) if runs else None
         batches.append({"branch": name, "tip": tip, "run": None if run is None else {
             "status": run.get("status"), "conclusion": run.get("conclusion"),
@@ -513,6 +528,11 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("pr", type=int)
     remove.add_argument("--note")
     remove.set_defaults(func=cmd_train_remove)
+    substitute = train_sub.add_parser("substitute-review",
+                                      help="Codex out of quota: record a substitute review of the PR's current head")
+    substitute.add_argument("pr", type=int)
+    substitute.add_argument("--note", required=True, help="who reviewed and where the review is")
+    substitute.set_defaults(func=cmd_train_substitute_review)
     status = train_sub.add_parser("status", help="the current batch and every queued PR's readiness")
     status.add_argument("--json", action="store_true")
     status.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)

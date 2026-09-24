@@ -13,9 +13,9 @@ cover every branch of the state machine without GitHub.
 
 Merge rule (memory: feedback-pr-train-protocol), re-checked when a batch is built
 AND again just before main moves — the `train` label is intent, not approval:
-- Codex 👍 on the current head (review.codex_state), or the `codex-unavailable`
-  label when a substitute review was recorded on the PR (Alex's rule for quota
-  outages);
+- Codex 👍 on the current head (review.codex_state), or, during a Codex quota
+  outage (Alex's rule), the `codex-unavailable` label PLUS a `review-substitute`
+  comment naming the current head (`coord train substitute-review`);
 - no unanswered Codex findings;
 - CI at the head not red (pending is fine: the batch runs the gates anyway);
 - not a carve-out: sound-character changes, persistence changes without a
@@ -46,6 +46,7 @@ READY, HOLD, DROP = "ready", "hold", "drop"
 LABELS = {
     TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
     SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
+    CODEX_UNAVAILABLE_LABEL: ("d93f0b", "coord: Codex out of quota; a substitute review is recorded per head"),
 }
 
 
@@ -77,8 +78,15 @@ def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     codex = pr.get("codex") or {}
     if codex.get("reviewing"):
         return HOLD, "Codex is re-reviewing it"
-    if not codex.get("approved") and CODEX_UNAVAILABLE_LABEL not in labels:
-        return HOLD, "no Codex 👍 on its current head"
+    if not codex.get("approved"):
+        if CODEX_UNAVAILABLE_LABEL not in labels:
+            return HOLD, "no Codex 👍 on its current head"
+        # The label persists across pushes; the substitute review covers one head only,
+        # the one its `review-substitute` comment names (Codex P1 on #989).
+        reviewed = pr.get("substituteReviewHead")
+        if reviewed != pr.get("head"):
+            return HOLD, ("codex-unavailable is set, but no substitute review names the current head "
+                          f"{str(pr.get('head'))[:9]} (`coord train substitute-review {pr.get('number')}`)")
     if pr.get("unansweredFindings"):
         count = pr["unansweredFindings"]
         return HOLD, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")

@@ -441,7 +441,10 @@ class CodexRoundThreeTests(unittest.TestCase):
                         {"ref": "refs/heads/training-notes", "object": {"sha": "x" * 40}}]
 
             def rest_paginated(self, path):
-                return [{"workflow_runs": []}]
+                # A human's narrow dispatch at the batch tip: not the train's gate.
+                return [{"workflow_runs": [{"id": 5, "head_sha": "t" * 40, "event": "workflow_dispatch",
+                                            "actor": {"login": "alex-bridges"}, "status": "completed",
+                                            "conclusion": "success", "run_attempt": 1, "html_url": "u"}]}]
 
         original = cli.get_snapshot
         cli.get_snapshot = lambda gh, max_age: {"prs": [], "claims": [], "train": []}
@@ -456,7 +459,9 @@ class CodexRoundThreeTests(unittest.TestCase):
         finally:
             cli.get_snapshot = original
         self.assertEqual(requested, ["repos/{repo}/git/matching-refs/heads/train"])
-        self.assertEqual([b["branch"] for b in json.loads(captured.getvalue())["batches"]], ["train/20260924-180000"])
+        batches = json.loads(captured.getvalue())["batches"]
+        self.assertEqual([b["branch"] for b in batches], ["train/20260924-180000"])
+        self.assertIsNone(batches[0]["run"], "someone else's green run is not the batch's gate")
 
     def test_a_bad_invocation_exits_with_the_usage_code_not_the_conflict_code(self):
         for argv in (["claim", "not-a-number"], ["nonsense"], ["train", "step", "--mode", "yolo"]):
@@ -468,6 +473,19 @@ class CodexRoundThreeTests(unittest.TestCase):
                 finally:
                     sys.stderr = saved
             self.assertEqual(raised.exception.code, 1, argv)
+
+    def test_inbox_cursors_never_collide(self):
+        from coordlib import cache
+        self.assertNotEqual(cache._cursor_path("o/r", "codex@h:foo+bar"), cache._cursor_path("o/r", "codex@h:foo_bar"))
+
+    def test_substitute_review_heads_come_from_the_newest_comment(self):
+        prs = [{"number": 7}, {"number": 8}]
+        comments = [
+            coord_comment(1, 7, 30, {"kind": "review-substitute", "pr": 7, "head": "old"}),
+            coord_comment(2, 7, 10, {"kind": "review-substitute", "pr": 7, "head": "new"}),
+        ]
+        snapshot.attach_substitute_reviews(prs, comments)
+        self.assertEqual([p["substituteReviewHead"] for p in prs], ["new", None])
 
     def test_coord_ci_refuses_a_train_batch(self):
         args = cli.parser().parse_args(["ci", "docs", "--ref", "train/20260924-170000"])
