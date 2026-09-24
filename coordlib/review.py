@@ -1,0 +1,144 @@
+"""What the reviewer and CI say about a PR, computed from one GraphQL PR node.
+
+Pure functions over the node shape PR_FIELDS (snapshot.py) asks for, so the
+rules can be tested against recorded responses.
+
+Codex approval (memory: reference_codex_review_signals, re-checked 2026-09-24
+on #975/#984/#986):
+- Codex approves with a 👍 reaction on the PR itself. It posts a review object
+  ONLY when it has findings, so "a review exists at the head commit" is NOT part
+  of approval — the approved heads of #984 and #986 have no review object.
+- On a new push it removes the 👍, shows 👀 while re-reviewing, then re-adds 👍.
+  So: approved = bot 👍 present, no bot 👀, and the 👍 is newer than the head
+  was pushed. Push time is taken from the head commit's earliest check suite
+  (created within seconds of the push); the commit date is the fallback, and it
+  can be older than the push, never newer.
+
+Unanswered findings: a review thread the bot started that is neither resolved
+nor answered by a non-bot comment. The merge rule wants a fix commit or a filed
+issue behind every finding; the reply is where that is recorded, and a script
+cannot judge the reply's content — only that one exists.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import Any, Dict, List, Optional
+
+CODEX_LOGIN_PREFIX = "chatgpt-codex-connector"
+VERDICT_CHECK = "CI verdict"
+
+# CANCELLED is absent on purpose: a cancelled check is a superseded run, not a red.
+_FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
+# Xcode Cloud checks are billing-dead (memory: reference_xcode_cloud_out_of_credits)
+# and report failure on every PR; they are not CI for this repository.
+_IGNORED_CHECK_PREFIXES = ("LegacyCI | ",)
+
+
+def parse_time(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def is_bot(login: Optional[str]) -> bool:
+    login = login or ""
+    return login.endswith("[bot]") or login.startswith(CODEX_LOGIN_PREFIX)
+
+
+def _head_commit(pr: Dict[str, Any]) -> Dict[str, Any]:
+    nodes = ((pr.get("commits") or {}).get("nodes")) or []
+    return (nodes[-1].get("commit") or {}) if nodes else {}
+
+
+def head_pushed_at(pr: Dict[str, Any]) -> Optional[dt.datetime]:
+    commit = _head_commit(pr)
+    suites = ((commit.get("checkSuites") or {}).get("nodes")) or []
+    times = [parse_time(s.get("createdAt")) for s in suites if s.get("createdAt")]
+    times = [t for t in times if t is not None]
+    if times:
+        return min(times)
+    return parse_time(commit.get("committedDate"))
+
+
+def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
+    reactions = ((pr.get("reactions") or {}).get("nodes")) or []
+    bot = [r for r in reactions if ((r.get("user") or {}).get("login") or "").startswith(CODEX_LOGIN_PREFIX)]
+    thumbs = [parse_time(r.get("createdAt")) for r in bot if r.get("content") == "THUMBS_UP"]
+    eyes = any(r.get("content") == "EYES" for r in bot)
+    pushed = head_pushed_at(pr)
+    newest_thumb = max((t for t in thumbs if t is not None), default=None)
+    fresh = newest_thumb is not None and (pushed is None or newest_thumb >= pushed)
+    return {
+        "approved": bool(fresh and not eyes),
+        "thumbsUp": newest_thumb is not None,
+        "stale": newest_thumb is not None and not fresh,
+        "reviewing": eyes,
+    }
+
+
+def unanswered_findings(pr: Dict[str, Any]) -> int:
+    threads = ((pr.get("reviewThreads") or {}).get("nodes")) or []
+    count = 0
+    for thread in threads:
+        if thread.get("isResolved"):
+            continue
+        comments = ((thread.get("comments") or {}).get("nodes")) or []
+        if not comments:
+            continue
+        starter = (comments[0].get("author") or {}).get("login")
+        if not is_bot(starter):
+            continue
+        answered = any(not is_bot((c.get("author") or {}).get("login")) for c in comments[1:])
+        if not answered:
+            count += 1
+    return count
+
+
+def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
+    """The CI picture at the head commit.
+
+    `verdict` is the `CI verdict` aggregate job when present (success, failure,
+    pending, skipped, cancelled, or none). `failing`/`pending` list the individual checks,
+    minus the ignored Xcode Cloud ones.
+    """
+    rollup = _head_commit(pr).get("statusCheckRollup") or {}
+    contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
+    failing: List[str] = []
+    pending: List[str] = []
+    verdict = "none"
+    for context in contexts:
+        if context.get("__typename") == "CheckRun":
+            name = context.get("name") or ""
+            status = context.get("status")
+            conclusion = context.get("conclusion")
+            done = status == "COMPLETED"
+            failed = done and conclusion in _FAILED
+            if name == VERDICT_CHECK:
+                if not done:
+                    verdict = "pending"
+                elif conclusion == "SUCCESS":
+                    verdict = "success"
+                elif conclusion in ("SKIPPED", "CANCELLED"):
+                    verdict = conclusion.lower()
+                else:
+                    verdict = "failure"
+        else:
+            name = context.get("context") or ""
+            state = context.get("state")
+            done = state not in ("PENDING", "EXPECTED")
+            failed = state in _FAILED
+        if name.startswith(_IGNORED_CHECK_PREFIXES):
+            continue
+        if failed:
+            failing.append(name)
+        elif not done:
+            pending.append(name)
+    return {"verdict": verdict, "failing": sorted(set(failing)), "pending": sorted(set(pending))}
+
