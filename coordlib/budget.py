@@ -6,8 +6,9 @@ hour), both times mostly from cloud workers polling `coord train status` after t
 PRs were queued, and the lockout stopped every agent and Alex's `gh` alike.
 
 The reading comes from real responses: every HTTPS response carries
-`X-RateLimit-Remaining`, `-Reset` and `-Resource`, and `gh.GitHub._http` records them
-here, per resource (core and graphql are separate budgets). The `gh` transport sees no
+`X-RateLimit-Remaining`, `-Used`, `-Limit`, `-Reset` and `-Resource`, and
+`gh.GitHub._http` records them here, per resource (core and graphql are separate
+budgets); `-Limit` stands in for a missing `-Used` (Used = Limit - Remaining). The `gh` transport sees no
 headers, so before a gated command it probes with one `gh api -i` call when the
 reading is older than PROBE_AFTER_SECONDS (`GitHub.probe_budget`).
 
@@ -32,6 +33,7 @@ fails open, and on gh the next probe replaces it.
 
 from __future__ import annotations
 
+import math
 import os
 import time
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -43,6 +45,7 @@ READ_FLOOR_DEFAULT = 1500
 HARD_FLOOR_DEFAULT = 300
 USER_LIMIT_DEFAULT = 5000
 WINDOW_SECONDS = 3600
+AT_SKEW_SECONDS = 300  # how far in the future a reading's `at` may be (clock skew between writers)
 
 # Command classes. Reads degrade to the cached snapshot below the read floor; `ci`
 # is a read whose one write (the dispatch) still needs the hard floor. `send` always
@@ -138,12 +141,20 @@ def _is_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def valid(reading: Any) -> bool:
+def valid(reading: Any, now: Optional[float] = None) -> bool:
     """A reading of the shape `record` writes. Anything else (a hand edit, a half-written
-    file, another version's format) is treated as absent, so the guard fails open."""
-    at = reading.get("at") if isinstance(reading, dict) else None
-    return (isinstance(reading, dict) and all(_is_int(reading.get(key)) for key in ("remaining", "used", "reset"))
-            and isinstance(at, (int, float)) and not isinstance(at, bool))
+    file, another version's format) is treated as absent, so the guard fails open.
+
+    `at` must be a finite time no later than AT_SKEW_SECONDS from now: `until()` caps a
+    hold at `at` plus an hour, and a NaN, infinite or far-future `at` would defeat that
+    cap (min(reset, nan) is reset) and keep `needs_probe` from ever firing.
+    """
+    if not isinstance(reading, dict) or not all(_is_int(reading.get(key)) for key in ("remaining", "used", "reset")):
+        return False
+    at = reading.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+        return False
+    return at <= (time.time() if now is None else now) + AT_SKEW_SECONDS
 
 
 def until(reading: Dict[str, Any]) -> float:
@@ -156,7 +167,7 @@ def live(reading: Any, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     """The reading while its window lasts; None when there is none, it has the wrong
     shape, or its window is over (a new window: the budget is full again)."""
     now = time.time() if now is None else now
-    if not valid(reading) or until(reading) <= now:
+    if not valid(reading, now) or until(reading) <= now:
         return None
     return reading
 
@@ -180,7 +191,7 @@ def summary(repo: str, resource: str = "core", now: Optional[float] = None) -> O
 
 def needs_probe(reading: Any, now: Optional[float] = None) -> bool:
     now = time.time() if now is None else now
-    return not valid(reading) or now - reading["at"] > PROBE_AFTER_SECONDS
+    return not valid(reading, now) or now - reading["at"] > PROBE_AFTER_SECONDS
 
 
 def clock(epoch: float) -> str:

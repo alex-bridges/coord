@@ -42,7 +42,8 @@ def probe_output(remaining: int, reset: int = BILLING_RESET, status: str = "200 
 class BudgetTestCase(unittest.TestCase):
     """A private cache directory, default floors, and not in Actions."""
 
-    ENV = ("COORD_CACHE_DIR", "COORD_BUDGET_READ_FLOOR", "COORD_BUDGET_HARD_FLOOR", "GITHUB_ACTIONS", "COORD_AGENT")
+    ENV = ("COORD_CACHE_DIR", "COORD_BUDGET_READ_FLOOR", "COORD_BUDGET_HARD_FLOOR", "COORD_BUDGET_USER_LIMIT",
+           "GITHUB_ACTIONS", "COORD_AGENT")
 
     def setUp(self):
         self.saved = {name: os.environ.get(name) for name in self.ENV}
@@ -432,6 +433,23 @@ class SharedCounterTests(BudgetTestCase):
         self.assertEqual(budget.left(budget.current(REPO)), 10000)
         self.assertEqual(budget.decision("train add", budget.current(REPO))[0], budget.OK)
 
+    def test_left_never_goes_below_zero(self):
+        self.seed(8000, limit=15000, used=7000)  # 2,000 past the shared 5,000
+        self.assertEqual(budget.left(budget.current(REPO)), 0)
+        self.assertEqual(budget.header_words(REPO), f"API: 0 left (resets {self.until})")
+        self.assertIn("budget low: 0 left", budget.decision("train add", budget.current(REPO))[1])
+
+    def test_left_never_exceeds_remaining(self):
+        # A 5,000 token read 1,234 left with the user limit raised: Remaining is the bound.
+        self.seed(1234, limit=5000, used=3766)
+        os.environ["COORD_BUDGET_USER_LIMIT"] = "15000"
+        self.assertEqual(budget.left(budget.current(REPO)), 1234)
+        os.environ.pop("COORD_BUDGET_USER_LIMIT")
+        # A token with a smaller limit than the user's: its own Remaining is the bound.
+        self.seed(200, limit=1000, used=800)
+        self.assertEqual(budget.left(budget.current(REPO)), 200)
+        self.assertEqual(budget.decision("train add", budget.current(REPO))[0], budget.REFUSE)
+
     def test_used_is_derived_from_the_limit_when_absent_and_nothing_is_recorded_without_either(self):
         derived = budget.reading_from_headers({"X-RateLimit-Limit": "15000", "X-RateLimit-Remaining": "10000",
                                                "X-RateLimit-Reset": str(BILLING_RESET)})
@@ -474,6 +492,23 @@ class BadShapeTests(BudgetTestCase):
             runner = lambda args, stdin: subprocess.CompletedProcess(args, 0, probe_output(4321), "")  # noqa: E731
             self.assertIsNone(cli.gate(cli.parser().parse_args(["board"]), GitHub(REPO, runner=runner)), shape)
             self.assertEqual(budget.current(REPO)["remaining"], 4321, shape)
+
+    def test_a_nan_infinite_or_future_at_is_no_reading(self):
+        # Only a hand edit writes these; each would defeat the one-hour cap (min(reset, nan)
+        # is reset) and keep the gh probe from ever refreshing the reading.
+        now = time.time()
+        far = int(now) + 10 * 3600
+        for at in (float("nan"), float("inf"), now + 10 * 3600):
+            self.write_budget_file('{"core": {"remaining": 100, "limit": 5000, "used": 4900, '
+                                   f'"reset": {far}, "at": {json.dumps(at)}}}}}')
+            raw = cache.load_budget(REPO)["core"]
+            self.assertFalse(budget.valid(raw), at)
+            self.assertIsNone(budget.current(REPO), at)
+            self.assertTrue(budget.needs_probe(raw), at)
+            self.assertIsNone(cli.gate(cli.parser().parse_args(["train", "add", "7"]), self.silent_http()), at)
+        # A few seconds of clock skew between writers is still a reading.
+        self.seed(100, age=-(budget.AT_SKEW_SECONDS - 30))
+        self.assertIsNotNone(budget.current(REPO))
 
     def test_a_far_future_reset_holds_for_an_hour_at_most(self):
         far = int(time.time()) + 10 * 3600
