@@ -14,9 +14,20 @@ reading is older than PROBE_AFTER_SECONDS (`GitHub.probe_budget`).
 Never the `rate_limit` endpoint: that night it reported 5000/5000 while real calls
 were refused with 403. Only the headers on real responses told the truth.
 
+What is left is not `Remaining` alone. The Claude cloud proxy's token authenticates as
+the same user but reports `X-RateLimit-Limit: 15000`, while Alex's gh token reports
+5000 for the same reset, and `X-RateLimit-Used` is ONE counter shared by both (probed
+2026-09-25 06:07Z: local Used 46, cloud 52 -> 106 over 50 calls, local 114). So when
+the 5,000 that locks out Alex's gh is spent, a cloud session still reads ~10,000
+remaining. The guard therefore uses `left()`: the lower of Remaining and
+COORD_BUDGET_USER_LIMIT (5000) minus Used.
+
 The guard (`decision`) gates on core, the budget that ran out; graphql is recorded and
 shown but not gated. Floors are environment variables so they can move without a
-release. A reading whose reset time has passed counts as a full budget.
+release. A reading whose reset time has passed counts as a full budget, and so does
+one older than an hour (a window never lasts longer, so a far-future or skewed reset
+cannot hold commands back). A reading of the wrong shape counts as absent: the guard
+fails open, and on gh the next probe replaces it.
 """
 
 from __future__ import annotations
@@ -30,6 +41,8 @@ from . import cache
 PROBE_AFTER_SECONDS = 120
 READ_FLOOR_DEFAULT = 1500
 HARD_FLOOR_DEFAULT = 300
+USER_LIMIT_DEFAULT = 5000
+WINDOW_SECONDS = 3600
 
 # Command classes. Reads degrade to the cached snapshot below the read floor; `ci`
 # is a read whose one write (the dispatch) still needs the hard floor. `send` always
@@ -64,6 +77,11 @@ def hard_floor() -> int:
     return floor("COORD_BUDGET_HARD_FLOOR", HARD_FLOOR_DEFAULT)
 
 
+def user_limit() -> int:
+    """The per-user budget the shared Used counter runs against (see the module doc)."""
+    return floor("COORD_BUDGET_USER_LIMIT", USER_LIMIT_DEFAULT)
+
+
 # MARK: - Readings
 
 
@@ -85,17 +103,21 @@ def reading_from_headers(headers: Mapping[str, str], default_resource: str = "co
     """(resource, reading) from response headers, or None when they carry no budget (a
     proxy that strips them must not overwrite a good reading)."""
     lower = {str(k).lower(): v for k, v in headers.items()}
-    try:
-        remaining = int(lower["x-ratelimit-remaining"])
-        reset = int(lower["x-ratelimit-reset"])
-    except (KeyError, TypeError, ValueError):
+
+    def number(name: str) -> Optional[int]:
+        try:
+            return int(lower[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    remaining, reset = number("x-ratelimit-remaining"), number("x-ratelimit-reset")
+    limit, used = number("x-ratelimit-limit"), number("x-ratelimit-used")
+    if used is None and limit is not None and remaining is not None:
+        used = limit - remaining
+    if remaining is None or reset is None or used is None:
         return None
-    try:
-        limit: Optional[int] = int(lower.get("x-ratelimit-limit", ""))
-    except ValueError:
-        limit = None
     resource = lower.get("x-ratelimit-resource") or default_resource
-    return resource, {"remaining": remaining, "limit": limit, "reset": reset,
+    return resource, {"remaining": remaining, "limit": limit, "used": used, "reset": reset,
                       "at": time.time() if now is None else now}
 
 
@@ -112,39 +134,70 @@ def record(repo: str, headers: Mapping[str, str], default_resource: str = "core"
     return reading
 
 
-def live(reading: Optional[Dict[str, Any]], now: Optional[float] = None) -> Optional[Dict[str, Any]]:
-    """The reading while its window lasts; None when there is none or its reset has passed
-    (a new window: the budget is full again)."""
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def valid(reading: Any) -> bool:
+    """A reading of the shape `record` writes. Anything else (a hand edit, a half-written
+    file, another version's format) is treated as absent, so the guard fails open."""
+    at = reading.get("at") if isinstance(reading, dict) else None
+    return (isinstance(reading, dict) and all(_is_int(reading.get(key)) for key in ("remaining", "used", "reset"))
+            and isinstance(at, (int, float)) and not isinstance(at, bool))
+
+
+def until(reading: Dict[str, Any]) -> float:
+    """When the reading stops holding anything back: its reset, but never more than a
+    window after it was taken (a far-future or skewed reset must not hold for hours)."""
+    return min(reading["reset"], reading["at"] + WINDOW_SECONDS)
+
+
+def live(reading: Any, now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """The reading while its window lasts; None when there is none, it has the wrong
+    shape, or its window is over (a new window: the budget is full again)."""
     now = time.time() if now is None else now
-    if not reading or not isinstance(reading.get("reset"), int) or reading["reset"] <= now:
+    if not valid(reading) or until(reading) <= now:
         return None
     return reading
+
+
+def left(reading: Dict[str, Any]) -> int:
+    """What the shared budget still allows: Remaining, but never more than the per-user
+    limit minus the shared Used counter (a 15,000-limit token must not read 10,000 left
+    when the 5,000 everyone shares is gone)."""
+    return max(0, min(reading["remaining"], user_limit() - reading["used"]))
 
 
 def current(repo: str, resource: str = "core", now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     return live(cache.load_budget(repo).get(resource), now)
 
 
-def needs_probe(reading: Optional[Dict[str, Any]], now: Optional[float] = None) -> bool:
+def summary(repo: str, resource: str = "core", now: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """A live reading and what the guard makes of it, for `board --json`."""
+    reading = current(repo, resource, now)
+    return None if reading is None else dict(reading, left=left(reading), until=int(until(reading)))
+
+
+def needs_probe(reading: Any, now: Optional[float] = None) -> bool:
     now = time.time() if now is None else now
-    return reading is None or not isinstance(reading.get("at"), (int, float)) or now - reading["at"] > PROBE_AFTER_SECONDS
+    return not valid(reading) or now - reading["at"] > PROBE_AFTER_SECONDS
 
 
-def clock(epoch: int) -> str:
+def clock(epoch: float) -> str:
     return time.strftime("%H:%MZ", time.gmtime(epoch))
 
 
 def low_words(reading: Dict[str, Any]) -> str:
-    return f"GitHub API budget low: {reading['remaining']} left until {clock(reading['reset'])}"
+    return f"GitHub API budget low: {left(reading)} left until {clock(until(reading))}"
 
 
 def header_words(repo: str, now: Optional[float] = None) -> str:
     """The board's budget line, from recorded readings only (it never spends a call)."""
     core = current(repo, "core", now)
-    words = f"API: {core['remaining']} left (resets {clock(core['reset'])})" if core else "API: no current reading"
+    words = f"API: {left(core)} left (resets {clock(until(core))})" if core else "API: no current reading"
     graphql = current(repo, "graphql", now)
     if graphql:
-        words += f", GraphQL {graphql['remaining']} left"
+        words += f", GraphQL {left(graphql)} left"
     return words
 
 
@@ -152,16 +205,17 @@ def header_words(repo: str, now: Optional[float] = None) -> str:
 
 
 def decision(command: str, reading: Optional[Dict[str, Any]]) -> Tuple[str, str]:
-    """(OK | LOW | REFUSE, message) for `command` given the live core reading.
+    """(OK | LOW | REFUSE, message) for `command` given the live core reading (`current`).
 
-    LOW: a read may not refresh; it serves the cached snapshot (the command decides how).
-    REFUSE: the command must not run. No reading, or a passed reset, is a full budget.
+    Floors compare against `left()`, not Remaining. LOW: a read may not refresh; it
+    serves the cached snapshot (the command decides how). REFUSE: the command must not
+    run. No reading, a passed reset or a bad shape is a full budget.
     """
     if command in UNGATED or reading is None:
         return OK, ""
-    remaining = reading["remaining"]
-    if remaining < hard_floor() and command not in CACHE_READS:
+    available = left(reading)
+    if available < hard_floor() and command not in CACHE_READS:
         return REFUSE, f"{low_words(reading)}; not running `coord {command}` (below {hard_floor()})"
-    if command in READS and remaining < read_floor():
+    if command in READS and available < read_floor():
         return LOW, low_words(reading)
     return OK, ""

@@ -85,7 +85,9 @@ def load_budget(repo: str) -> Dict[str, Any]:
     """The last GitHub API budget reading per resource (budget.py), shared by every agent
     on the machine: {"core": {"remaining", "limit", "reset", "at"}, "graphql": {…}}."""
     data = _read(budget_path(repo))
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}  # a file of the wrong shape is no reading (budget.valid checks each one's fields)
+    return {resource: reading for resource, reading in data.items() if isinstance(reading, dict)}
 
 
 def store_budget(repo: str, readings: Dict[str, Any]) -> None:

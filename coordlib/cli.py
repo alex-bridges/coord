@@ -176,7 +176,7 @@ def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
         out = {k: v for k, v in snap.items() if k != "claimComments"}
         out["me"] = me
         out["unreadDirectMessages"] = unread
-        out["apiBudget"] = {resource: budget.current(gh.repo, resource) for resource in ("core", "graphql")}
+        out["apiBudget"] = {resource: budget.summary(gh.repo, resource) for resource in ("core", "graphql")}
         print(json.dumps(out, indent=2))
     elif args.brief:
         sys.stdout.write(render.brief(snap, me, unread, budget=words))

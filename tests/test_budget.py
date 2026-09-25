@@ -31,11 +31,11 @@ REPO = "o/r"
 BILLING_RESET = int(time.time()) + 3600
 
 
-def probe_output(remaining: int, reset: int = BILLING_RESET, status: str = "200 OK") -> str:
+def probe_output(remaining: int, reset: int = BILLING_RESET, status: str = "200 OK", limit: int = 5000) -> str:
     """`gh api -i` output, as recorded from a real probe on 2026-09-25 (CRLF, canonical case)."""
-    return (f"HTTP/2.0 {status}\r\nContent-Type: application/json\r\nX-Ratelimit-Limit: 5000\r\n"
+    return (f"HTTP/2.0 {status}\r\nContent-Type: application/json\r\nX-Ratelimit-Limit: {limit}\r\n"
             f"X-Ratelimit-Remaining: {remaining}\r\nX-Ratelimit-Reset: {reset}\r\n"
-            f"X-Ratelimit-Resource: core\r\nX-Ratelimit-Used: {5000 - remaining}\r\n\r\n"
+            f"X-Ratelimit-Resource: core\r\nX-Ratelimit-Used: {limit - remaining}\r\n\r\n"
             '{"id":100000001,"full_name":"o/r"}')
 
 
@@ -62,11 +62,17 @@ class BudgetTestCase(unittest.TestCase):
 
     # MARK: fixtures
 
-    def seed(self, remaining, reset=None, age=0.0, resource="core"):
+    def seed(self, remaining, reset=None, age=0.0, resource="core", limit=5000, used=None):
         readings = cache.load_budget(REPO)
-        readings[resource] = {"remaining": remaining, "limit": 5000,
+        readings[resource] = {"remaining": remaining, "limit": limit, "used": limit - remaining if used is None else used,
                               "reset": BILLING_RESET if reset is None else reset, "at": time.time() - age}
         cache.store_budget(REPO, readings)
+
+    def write_budget_file(self, content):
+        """budget.json exactly as given: a hand edit, a half-written file, another format."""
+        os.makedirs(os.path.dirname(cache.budget_path(REPO)), exist_ok=True)
+        with open(cache.budget_path(REPO), "w", encoding="utf-8") as handle:
+            handle.write(content if isinstance(content, str) else json.dumps(content))
 
     def seed_snapshot(self, age_seconds=3600):
         then = time.time() - age_seconds
@@ -111,9 +117,10 @@ class FakeResponse:
         return False
 
 
-def rate_headers(remaining, resource, reset=BILLING_RESET):
-    return {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": str(remaining),
-            "X-RateLimit-Reset": str(reset), "X-RateLimit-Resource": resource}
+def rate_headers(remaining, resource, reset=BILLING_RESET, limit=5000):
+    return {"X-RateLimit-Limit": str(limit), "X-RateLimit-Remaining": str(remaining),
+            "X-RateLimit-Used": str(limit - remaining), "X-RateLimit-Reset": str(reset),
+            "X-RateLimit-Resource": resource}
 
 
 class RecordingTests(BudgetTestCase):
@@ -361,6 +368,122 @@ class HardFloorTests(BudgetTestCase):
         self.seed(budget.HARD_FLOOR_DEFAULT)
         for command in ("claim", "train add", "release"):
             self.assertEqual(budget.decision(command, budget.current(REPO))[0], budget.OK, command)
+
+
+class SharedCounterTests(BudgetTestCase):
+    """The cloud proxy's token reports Limit 15000 while Alex's gh reports 5000, and Used
+    is one counter shared by both (probed 2026-09-25 06:07Z). What is left is the lower of
+    Remaining and COORD_BUDGET_USER_LIMIT (5000) minus Used."""
+
+    def setUp(self):
+        super().setUp()
+        self.until = budget.clock(BILLING_RESET)
+
+    def assert_spent(self, gh):
+        """Used 5000 of the shared 5000: writes refused, reads cached-only, header says 0.
+        (On gh the first gated command is what probes, so the checks start with one.)"""
+        code, _, err = self.run_cli(["train", "add", "7"], gh)
+        self.assertEqual(code, EXIT_BUDGET)
+        self.assertIn(f"GitHub API budget low: 0 left until {self.until}; not running `coord train add`", err)
+        self.assertEqual(budget.left(budget.current(REPO)), 0)
+        self.assertEqual(budget.header_words(REPO), f"API: 0 left (resets {self.until})")
+        self.seed_snapshot()
+        code, out, err = self.run_cli(["board"], gh)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("showing the snapshot from 60m ago", err)
+        self.assertIn(f"API: 0 left (resets {self.until})", out.splitlines()[0])
+
+    def test_https_headers_of_a_15000_token_with_the_shared_5000_spent(self):
+        original = ghmodule.urllib.request.urlopen
+        ghmodule.urllib.request.urlopen = lambda request, timeout=None: FakeResponse(
+            {}, rate_headers(10000, "core", limit=15000))
+        try:
+            GitHub(REPO, transport="http", token="t").rest("repos/{repo}/issues/1")
+        finally:
+            ghmodule.urllib.request.urlopen = original
+        self.assertEqual({k: cache.load_budget(REPO)["core"][k] for k in ("remaining", "limit", "used")},
+                         {"remaining": 10000, "limit": 15000, "used": 5000})
+        gh = self.silent_http()
+        self.assert_spent(gh)
+        self.assertEqual(gh.calls, 0)
+
+    def test_the_gh_probe_of_a_15000_token_with_the_shared_5000_spent(self):
+        probes = []
+
+        def runner(args, stdin):
+            if list(args[:3]) != ["gh", "api", "-i"]:
+                raise AssertionError(f"only the probe may run here, got {args}")
+            probes.append(list(args))
+            return subprocess.CompletedProcess(args, 0, probe_output(10000, limit=15000), "")
+
+        self.assert_spent(GitHub(REPO, runner=runner))
+        self.assertEqual(len(probes), 1, "one probe; its reading serves the next command too")
+
+    def test_between_the_floors_on_a_15000_token(self):
+        self.seed(11400, limit=15000, used=3600)  # 1,400 of the shared 5,000 left
+        reading = budget.current(REPO)
+        self.assertEqual(budget.left(reading), 1400)
+        self.assertEqual(budget.decision("board", reading)[0], budget.LOW)
+        self.assertEqual(budget.decision("train add", reading)[0], budget.OK)
+
+    def test_the_user_limit_is_an_environment_variable(self):
+        self.seed(10000, limit=15000, used=5000)
+        os.environ["COORD_BUDGET_USER_LIMIT"] = "15000"
+        self.assertEqual(budget.left(budget.current(REPO)), 10000)
+        self.assertEqual(budget.decision("train add", budget.current(REPO))[0], budget.OK)
+
+    def test_used_is_derived_from_the_limit_when_absent_and_nothing_is_recorded_without_either(self):
+        derived = budget.reading_from_headers({"X-RateLimit-Limit": "15000", "X-RateLimit-Remaining": "10000",
+                                               "X-RateLimit-Reset": str(BILLING_RESET)})
+        self.assertEqual(derived[1]["used"], 5000)
+        self.assertIsNone(budget.reading_from_headers({"X-RateLimit-Remaining": "10000",
+                                                       "X-RateLimit-Reset": str(BILLING_RESET)}))
+
+
+class BadShapeTests(BudgetTestCase):
+    """A budget.json of the wrong shape is no reading: nothing crashes, the guard fails
+    open, and on gh the next probe replaces it."""
+
+    def shapes(self):
+        now = time.time()
+        good = {"remaining": 100, "limit": 5000, "used": 4900, "reset": BILLING_RESET, "at": now}
+        return [
+            '{"core": "x"}', '[1, 2]', '"text"', 'not json{', {"core": None},
+            {"core": {k: v for k, v in good.items() if k != "remaining"}},
+            {"core": {k: v for k, v in good.items() if k != "used"}},
+            {"core": dict(good, remaining="100")}, {"core": dict(good, used="4900")},
+            {"core": dict(good, reset=str(BILLING_RESET))}, {"core": dict(good, at="now")},
+            {"core": dict(good, remaining=True)},
+        ]
+
+    def test_every_gated_command_and_whoami_fail_open(self):
+        for shape in self.shapes():
+            self.write_budget_file(shape)
+            gh = self.silent_http()
+            for argv in (["board"], ["claim", "5", "--branch", "b"], ["train", "add", "7"]):
+                self.assertIsNone(cli.gate(cli.parser().parse_args(argv), gh), (shape, argv))
+            code, out, _ = self.run_cli(["whoami"], gh)
+            self.assertEqual(code, EXIT_OK, shape)
+            self.assertIn("apiBudget: API: no current reading", out, shape)
+            self.assertEqual(budget.header_words(REPO), "API: no current reading", shape)
+            self.assertEqual(gh.calls, 0)
+
+    def test_the_gh_transport_probes_a_bad_reading_away(self):
+        for shape in self.shapes():
+            self.write_budget_file(shape)
+            runner = lambda args, stdin: subprocess.CompletedProcess(args, 0, probe_output(4321), "")  # noqa: E731
+            self.assertIsNone(cli.gate(cli.parser().parse_args(["board"]), GitHub(REPO, runner=runner)), shape)
+            self.assertEqual(budget.current(REPO)["remaining"], 4321, shape)
+
+    def test_a_far_future_reset_holds_for_an_hour_at_most(self):
+        far = int(time.time()) + 10 * 3600
+        self.seed(100, reset=far)
+        reading = budget.current(REPO)
+        self.assertEqual(budget.until(reading), reading["at"] + budget.WINDOW_SECONDS)
+        self.assertIn(f"until {budget.clock(reading['at'] + budget.WINDOW_SECONDS)}", budget.low_words(reading))
+        self.seed(100, reset=far, age=budget.WINDOW_SECONDS + 1)
+        self.assertIsNone(budget.current(REPO), "an hour-old reading holds nothing back")
+        self.assertIsNone(cli.gate(cli.parser().parse_args(["claim", "5", "--branch", "b"]), self.silent_http()))
 
 
 class TrainStepTests(BudgetTestCase):
