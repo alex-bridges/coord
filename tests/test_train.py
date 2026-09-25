@@ -177,6 +177,7 @@ class FakeGitHub:
         self.calls = 0
         self.fail_held = ""       # every POST of a `held` notice raises GitHubError(this)
         self.fail_comment_reads = ""  # every read of a PR's comments raises GitHubError(this)
+        self.login = train_step.BOT_NAME  # who GitHub says posted what the step posts
 
     def graphql(self, query, variables=None):
         return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": self.main}},
@@ -202,9 +203,10 @@ class FakeGitHub:
             raise GitHubError(self.fail_held)
         self.writes.append((method, path, body))
         if method == "POST" and match:
-            # The train posts with the Actions token: GitHub names the bot as the author.
+            # GitHub names the token's user as the author: the bot for the Actions train,
+            # alex-bridges for a step run by hand (set `login`).
             self.issue_comments.setdefault(int(match.group(1)), []).append(
-                {"created_at": snapshot.iso(NOW), "body": body["body"], "user": {"login": train_step.BOT_NAME}})
+                {"created_at": snapshot.iso(NOW), "body": body["body"], "user": {"login": self.login}})
         return {"html_url": "h"} if method == "POST" else None
 
     def rest_paginated(self, path):
@@ -292,8 +294,8 @@ class StepTests(unittest.TestCase):
         log = sh(self.origin, "log", "--first-parent", "--max-count=10", f"--format={train.LOG_FORMAT}", name)
         return train.parse_batch(log, name)[1]
 
-    def step(self, fake, mode="live", now=None, sleep=None):
-        return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(),
+    def step(self, fake, mode="live", now=None, sleep=None, agent=train_step.TRAIN_AGENT):
+        return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(), agent=agent,
                                log=lambda line: None, sleep=sleep or (lambda seconds: None))
 
     def queue(self, fake, number, head, minutes_ago):
@@ -929,6 +931,52 @@ class StepTests(unittest.TestCase):
                                                                          "event": "merged", "pr": 1, "batch": name})})
         self.step(fake).run()
         self.assertEqual(fake.posted("merged"), [1])
+
+    HAND = "claude@Eidolon:INISA"  # `coord train step` run by hand: posts as alex-bridges under its own id
+
+    def test_hand_runs_never_repeat_what_the_actions_train_said(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1])
+        fake.writes.clear()
+        fake.login = "alex-bridges"
+        self.step(fake, agent=self.HAND).run()
+        self.step(fake, agent=self.HAND).run()
+        self.assertEqual(fake.posted("held"), [], "two hand runs after the Actions train")
+
+    def test_the_actions_train_repeats_a_hand_runs_notice_at_most_once(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        fake.login = "alex-bridges"
+        self.step(fake, agent=self.HAND).run()
+        self.step(fake, agent=self.HAND).run()
+        self.assertEqual(fake.posted("held"), [1], "a hand run counts its own notice")
+        fake.writes.clear()
+        fake.login = train_step.BOT_NAME
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1], "the Actions train: once, then its own counts")
+        self.assertEqual([p["agent"] for p, _ in self.held(fake, 1)], [self.HAND, "train@actions"])
+
+    def test_hand_runs_never_repeat_their_own_receipt(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.login = "alex-bridges"
+        self.step(fake, mode="dry-run", agent=self.HAND).run()
+        self.step(fake, mode="dry-run", agent=self.HAND).run()  # the batch branch is still there
+        self.assertEqual(fake.posted("green-dry-run"), [1])
+
+    def test_a_train_marker_from_another_login_never_silences_the_actions_train(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+                                       "body": marker.compose("held?", {
+                                           "kind": "train", "agent": "train@actions", "event": "held", "pr": 1,
+                                           "head": self.H1, "hold": "needs-alex"})})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1])
 
     # Errors the Actions token's REST calls raise (gh.py turns each into GitHubError).
     NOTICE_FAILURES = [

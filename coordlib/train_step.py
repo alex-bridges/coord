@@ -37,6 +37,9 @@ from . import marker, snapshot, train
 from .gh import GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
+# The Actions train's agent id (COORD_AGENT in merge-train.yml). A step run by hand
+# posts as alex-bridges under its own id.
+TRAIN_AGENT = "train@actions"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 DISPATCH_GRACE_MINUTES = 10
 # ci.yml's verdict job wakes the train as its last step, so the step can start before
@@ -73,7 +76,7 @@ class Git:
 
 class Step:
     def __init__(self, gh: GitHub, git: Git, mode: str, now: Optional[dt.datetime] = None,
-                 agent: str = "train@actions", log: Callable[[str], None] = print,
+                 agent: str = TRAIN_AGENT, log: Callable[[str], None] = print,
                  sleep: Callable[[float], None] = time.sleep):
         if mode not in ("dry-run", "live"):
             raise ValueError(f"mode must be dry-run or live, not {mode!r}")
@@ -259,13 +262,25 @@ class Step:
         return latest
 
     def own_record(self, comment: Dict[str, Any], payload: Dict[str, Any]) -> bool:
-        """A `kind: train` record this train wrote: its marker names this step's agent
-        (`train@actions` in merge-train.yml) AND GitHub says the Actions bot posted it.
-        Every agent posts as alex-bridges and can write any marker, so a marker alone
-        proves nothing (review of #1037). A record the train did not write never stops it
-        from speaking; at worst a hand-run step's receipt or notice is repeated once."""
-        return (payload.get("kind") == "train" and payload.get("agent") == self.agent
-                and (comment.get("user") or {}).get("login") == BOT_NAME)
+        """Whether a `kind: train` record counts as already said (a held notice, a receipt).
+
+        (a) The Actions train's record: the marker names TRAIN_AGENT AND GitHub lists
+            github-actions[bot] as its author. Every agent posts as alex-bridges and can
+            write any marker, so neither half alone proves anything (review of #1037).
+        (b) On a hand run only (this step's agent is not TRAIN_AGENT): the run's own
+            earlier records, by marker agent, so hand runs repeat nothing either.
+            Never on the Actions train, where it would let a `train@actions` marker from
+            any login silence it again.
+
+        So a thing is said at most once by the Actions train and once per hand-run agent
+        id: the Actions train may repeat, once, what a hand run said first; a hand run
+        never repeats what the Actions train said.
+        """
+        if payload.get("kind") != "train":
+            return False
+        if payload.get("agent") == TRAIN_AGENT and (comment.get("user") or {}).get("login") == BOT_NAME:
+            return True
+        return self.agent != TRAIN_AGENT and payload.get("agent") == self.agent
 
     def notify_held(self, pr: Dict[str, Any], head: str, hold: str, reason: str) -> None:
         """Tell whoever is still responsible that a queued PR is held (#1034), once per
