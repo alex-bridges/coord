@@ -175,6 +175,8 @@ class FakeGitHub:
         self.reread_error = ""
         self.reread_main = ""
         self.calls = 0
+        self.fail_held = ""       # every POST of a `held` notice raises GitHubError(this)
+        self.fail_comment_reads = ""  # every read of a PR's comments raises GitHubError(this)
 
     def graphql(self, query, variables=None):
         return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": self.main}},
@@ -194,11 +196,15 @@ class FakeGitHub:
             self.fail_writes -= 1
             from coordlib.gh import GitHubError
             raise GitHubError("HTTP 502 (injected)")
-        self.writes.append((method, path, body))
         match = re.search(r"issues/(\d+)/comments$", path)
+        if self.fail_held and method == "POST" and match \
+                and (marker.decode(body["body"]) or {}).get("event") == "held":
+            raise GitHubError(self.fail_held)
+        self.writes.append((method, path, body))
         if method == "POST" and match:
+            # The train posts with the Actions token: GitHub names the bot as the author.
             self.issue_comments.setdefault(int(match.group(1)), []).append(
-                {"created_at": snapshot.iso(NOW), "body": body["body"]})
+                {"created_at": snapshot.iso(NOW), "body": body["body"], "user": {"login": train_step.BOT_NAME}})
         return {"html_url": "h"} if method == "POST" else None
 
     def rest_paginated(self, path):
@@ -217,6 +223,9 @@ class FakeGitHub:
             return [{"workflow_runs": self.branch_runs.get(branch, [])}]
         match = re.search(r"issues/(\d+)/comments", path)
         if match:
+            if self.fail_comment_reads:
+                from coordlib.gh import GitHubError
+                raise GitHubError(self.fail_comment_reads)
             return self.issue_comments.get(int(match.group(1)), [])
         raise AssertionError(f"unexpected paginated call {path}")
 
@@ -893,6 +902,112 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.step(fake).run()
         self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)], [(moved, "head-moved")])
+
+    def test_only_the_trains_own_held_record_counts_as_told(self):
+        # Every agent posts as alex-bridges and can write any marker (review of #1037).
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        record = {"kind": "train", "v": 1, "event": "held", "pr": 1, "head": self.H1, "hold": "needs-alex"}
+        forged = [(dict(record, agent="claude@Eidolon:wt"), "alex-bridges"),  # another agent's marker
+                  (dict(record, agent="train@actions"), "alex-bridges"),      # the train's name, not the bot
+                  (dict(record, agent="claude@Eidolon:wt"), train_step.BOT_NAME)]
+        for payload, login in forged:
+            fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
+                                           "body": marker.compose("held?", payload)})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1], "none of those is the train's own notice")
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [], "the train's own one is")
+
+    def test_only_the_trains_own_receipt_stops_a_second_receipt(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+                                       "body": marker.compose("merged?", {"kind": "train", "agent": "train@actions",
+                                                                         "event": "merged", "pr": 1, "batch": name})})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("merged"), [1])
+
+    # Errors the Actions token's REST calls raise (gh.py turns each into GitHubError).
+    NOTICE_FAILURES = [
+        "HTTP 403 POST https://api.github.com/repos/o/r/issues/2/comments: You have exceeded a secondary rate limit. "
+        "Please wait a few minutes before you try again.",
+        "HTTP 403 POST https://api.github.com/repos/o/r/issues/2/comments: API rate limit exceeded for installation ID 1.",
+        "HTTP 502 POST https://api.github.com/repos/o/r/issues/2/comments: Bad Gateway",
+        "POST https://api.github.com/repos/o/r/issues/2/comments: The read operation timed out",
+    ]
+
+    def drop_batches(self):
+        for ref in sh(self.origin, "for-each-ref", "--format=%(refname)", "refs/heads/train/").splitlines():
+            sh(self.origin, "update-ref", "-d", ref)
+
+    def test_a_failed_notice_never_changes_what_build_decides(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in self.NOTICE_FAILURES:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake = FakeGitHub([ready_node(1, h1, "pr1"), self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)],
+                                  self.main)
+                self.add(fake, 1, h1, 30)
+                self.add(fake, 2, self.H2, 20)
+                fake.fail_held = error
+                lines = self.step(fake).run()
+                name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+                self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
+                self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})], "dispatched once")
+                self.assertEqual(fake.posted("testing"), [1])
+                self.assertEqual(self.held(fake, 2), [])
+                self.assertTrue(any("could not post the held notice" in line for line in lines), lines)
+
+    def test_a_failed_notice_never_changes_what_advance_decides(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in self.NOTICE_FAILURES:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake, name, tip = self.build_batch([(1, h1)])
+                self.run_on(fake, name, tip, conclusion="success")
+                fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+                fake.fail_held = error
+                lines = self.step(fake).run()
+                self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+                self.assertEqual(self.held(fake, 1), [])
+
+    def test_a_failed_read_for_the_notice_never_stops_the_rebuild(self):
+        # The head-moved member arrives fresh from open_prs(), so notify_held reads its
+        # comments itself; that read failing must not skip deleting the batch.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in [failure.replace("POST", "GET") for failure in self.NOTICE_FAILURES]:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake, name, tip = self.build_batch([(1, h1)])
+                self.run_on(fake, name, tip, conclusion="success")
+                fake.nodes[0]["headRefOid"] = "f" * 40
+                fake.fail_comment_reads = error
+                lines = self.step(fake).run()
+                self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+                self.assertTrue(any("could not post the held notice" in line for line in lines), lines)
+
+    def test_advance_deletes_the_batch_before_it_notifies(self):
+        # Whatever a notice does, even fail in a way nobody catches, the rebuild is done.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+        original = fake.rest
+
+        def rest(path, method="GET", body=None):
+            if method == "POST" and (marker.decode((body or {}).get("body")) or {}).get("event") == "held":
+                raise KeyError("an unexpected failure")
+            return original(path, method, body)
+
+        fake.rest = rest
+        with self.assertRaises(KeyError):
+            self.step(fake).run()
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
 
     def test_a_green_batch_member_that_is_no_longer_ready_is_told(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")

@@ -252,11 +252,20 @@ class Step:
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
                 pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
-            elif payload.get("kind") == "train" and payload.get("event") == "held":
+            elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
         pr["trainAddedBy"] = latest.get("agent")
         pr["heldNotices"] = held
         return latest
+
+    def own_record(self, comment: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        """A `kind: train` record this train wrote: its marker names this step's agent
+        (`train@actions` in merge-train.yml) AND GitHub says the Actions bot posted it.
+        Every agent posts as alex-bridges and can write any marker, so a marker alone
+        proves nothing (review of #1037). A record the train did not write never stops it
+        from speaking; at worst a hand-run step's receipt or notice is repeated once."""
+        return (payload.get("kind") == "train" and payload.get("agent") == self.agent
+                and (comment.get("user") or {}).get("login") == BOT_NAME)
 
     def notify_held(self, pr: Dict[str, Any], head: str, hold: str, reason: str) -> None:
         """Tell whoever is still responsible that a queued PR is held (#1034), once per
@@ -269,24 +278,29 @@ class Step:
         when no agent is running.
 
         "Already told" is read from the train's own earlier `held` comments on the PR
-        (`train_added` collects them in the read it already makes), which live on GitHub:
-        no runner state, so a restart never repeats one. The key is the hold's CLASS, never
+        (`own_record`; `train_added` collects them in the read it already makes, and
+        reads them here only for a PR it has not read yet), which live on GitHub: no
+        runner state, so a restart never repeats one. The key is the hold's CLASS, never
         its wording (which names the failing checks, the count of findings) or the time.
         A new head or a different class is a new notice.
+
+        Best effort: a notice never changes what the step decides. Any GitHub error,
+        reading or posting, is noted and the next step tries again; callers act on the
+        hold first and notify last.
         """
         number = pr["number"]
-        if "heldNotices" not in pr:
-            self.train_added(pr)
-        if (head, hold) in pr["heldNotices"]:
-            return
-        to = list(dict.fromkeys(agent for agent in (pr.get("trainAddedBy"), train.CONDUCTOR) if agent))
-        text = (f"**Held in the merge train** at head `{head[:9]}`: {reason}.\n\n"
-                + train.HOLD_ACTIONS[hold].format(pr=number) + "\n\n"
-                + "To " + ", ".join(f"`{agent}`" for agent in to)
-                + ". The train says this once per head and reason.")
-        if hold in train.OWNER_HOLDS:
-            text = f"{train.OWNER_MENTION}: this hold is yours to clear.\n\n" + text
         try:
+            if "heldNotices" not in pr:
+                self.train_added(pr)
+            if (head, hold) in pr["heldNotices"]:
+                return
+            to = list(dict.fromkeys(agent for agent in (pr.get("trainAddedBy"), train.CONDUCTOR) if agent))
+            text = (f"**Held in the merge train** at head `{head[:9]}`: {reason}.\n\n"
+                    + train.HOLD_ACTIONS[hold].format(pr=number) + "\n\n"
+                    + "To " + ", ".join(f"`{agent}`" for agent in to)
+                    + ". The train says this once per head and reason.")
+            if hold in train.OWNER_HOLDS:
+                text = f"{train.OWNER_MENTION}: this hold is yours to clear.\n\n" + text
             self.comment(number, text, "held", head=head, hold=hold, reason=reason, to=to)
         except GitHubError as error:
             self.note(f"#{number}: could not post the held notice ({error}); the next step tries again")
@@ -343,7 +357,7 @@ class Step:
     def already_posted(self, number: int, event: str, batch: str) -> bool:
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
-            if payload and payload.get("kind") == "train" and payload.get("event") == event \
+            if payload and self.own_record(comment, payload) and payload.get("event") == event \
                     and payload.get("batch") == batch:
                 return True
         return False
@@ -506,9 +520,9 @@ class Step:
                     problem = f"is no longer ready ({reason})"
             if problem:
                 self.note(f"{name} ({numbers}): green, but #{number} {problem}; rebuilding without it")
+                self.delete_branch(name)  # the decision first; the notice can never stop it
                 if hold:  # still queued and now held (a DROP is commented on by the next build)
                     self.notify_held(pr, pr["head"], hold, reason)
-                self.delete_branch(name)
                 return
         if self.mode == "live":
             try:
