@@ -641,40 +641,69 @@ GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..
 
 
 class GuardHookTests(unittest.TestCase):
-    """.claude/hooks/conductor-guard.py, the substitute review's P1: prefix deny rules missed these."""
+    """.claude/hooks/conductor-guard.py: the substitute reviews of 7afafab1 and 4d3b200b."""
 
-    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp", project="/tmp/home", raw=None):
-        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
-        env.update({"CLAUDE_PROJECT_DIR": project, "HOME": os.path.expanduser("~")})
+    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None):
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE", "CLAUDE_PROJECT_DIR")}
+        env["HOME"] = os.path.expanduser("~")
+        if project:
+            env["CLAUDE_PROJECT_DIR"] = project
         if agent:
             env["COORD_AGENT"] = agent
         payload = raw if raw is not None else json.dumps({"tool_name": tool, "tool_input": data, "cwd": cwd})
-        done = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env)
-        return done.returncode
+        return subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env).returncode
 
-    def test_what_the_prefix_rules_missed_is_blocked(self):
-        for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge --help",
-                        "git push origin --force --dry-run HEAD", "./Tools/coord/coord train approve 1 --note x",
+    def test_moving_main_merging_and_approving_are_blocked(self):
+        for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
+                        "./Tools/coord/coord train approve 1 --note x", "Tools/coord/coord train approve 1",
                         "git push origin +HEAD:main", "git push origin HEAD:main", "git push -uf origin x",
-                        "gh pr merge 5 --squash", "gh variable set X", "bash -c 'gh pr merge 5'",
-                        "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "sudo rm -rf /", "launchctl list",
-                        "gh auth token", "sed -i '' s/x/y/ /tmp/home/.claude/hooks/conductor-guard.py"):
+                        "gh pr merge 5 --squash", "gh pr -R example-owner/example-repo merge 5", "gh pr --repo o/r merge 5",
+                        "bash -c 'gh pr merge 5'", "sh -c \"git push origin main\"", "eval 'coord train approve 3'",
+                        "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "gh api repos/o/r/merges -f base=main",
+                        "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
+                        "gh auth token", "gh workflow disable ci.yml"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
-    def test_ordinary_work_is_allowed(self):
-        for command in ("git push -u origin conductor/fix-cache", "gh pr create --fill", "Tools/coord/coord train add 5",
-                        "gh run rerun 123 --failed", "git push origin conductor/main-red-fix",
-                        "Tools/coord/coord inbox", "cat .claude/hooks/README.md"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}, cwd="/tmp/elsewhere"), 0, command)
+    def test_ordinary_work_and_prose_are_allowed(self):
+        for command in ("git push -u origin conductor/fix-cache", "git push origin --delete conductor/old",
+                        "gh pr create --fill", "Tools/coord/coord train add 5", "gh run rerun 123 --failed",
+                        "git push origin conductor/main-red-fix", "Tools/coord/coord inbox > /tmp/inbox.txt",
+                        "gh pr view 5 --json mergeable,mergedAt", "gh api repos/o/r/git/ref/heads/main",
+                        "gh api repos/o/r/pulls/5/merge", "git commit -m 'docs: never push main by hand'",
+                        "Tools/coord/coord conductor escalate 'PR 7 needs you: run coord train approve 7'",
+                        "gh pr comment 7 -b 'waiting for coord train approve 7'", "grep -rn 'train approve' Docs/",
+                        "grep -n sudo Tools/coord/conductor/install.sh", "cat .claude/agents/conductor.md",
+                        "cat .claude/hooks/README.md 2>/dev/null", "git diff origin/main -- .claude/settings.json",
+                        "cat ~/.claude/settings.json", "cd ../conductor-fix && sed -i '' s/a/b/ .claude/hooks/conductor-guard.py",
+                        "python3 -m unittest discover -s Tools/coord/tests"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
-    def test_its_own_controls_cannot_be_edited_but_a_worktrees_can(self):
-        self.assertEqual(self.run_guard("Edit", {"file_path": "/tmp/home/.claude/settings.json"}), 2)
-        self.assertEqual(self.run_guard("Write", {"file_path": "/tmp/home/.claude/agents/conductor.md"}), 2)
-        self.assertEqual(self.run_guard("Edit", {"file_path": "/tmp/wt/.claude/hooks/conductor-guard.py"}), 0)
+    def test_its_own_controls_cannot_be_written_but_a_worktrees_can(self):
+        for path in ("/tmp/home/.claude/settings.json", "/tmp/home/.claude/agents/conductor.md",
+                     "/tmp/home/Tools/coord/coordlib/conductor.py", "/tmp/home/CLAUDE.md", "Tools/coord/coord",
+                     "~/.claude/settings.json", "~/.claude/hooks/x.sh"):
+            self.assertEqual(self.run_guard("Write", {"file_path": path}), 2, path)
+        for path in ("/tmp/wt/.claude/hooks/conductor-guard.py", "/tmp/wt/Tools/coord/coordlib/conductor.py",
+                     "/tmp/home/Docs/agent-coordination.md", "~/.claude/projects/x/memory/MEMORY.md"):
+            self.assertEqual(self.run_guard("Edit", {"file_path": path}), 0, path)
+        for command in ("sed -i '' s/a/b/ .claude/hooks/conductor-guard.py", "echo x > CLAUDE.md",
+                        "cp /tmp/x /tmp/home/Tools/coord/coordlib/conductor.py", "rm -rf Tools/coord",
+                        "echo {} > ~/.claude/settings.json"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_silent_outside_the_conductor_and_closed_inside_it(self):
         self.assertEqual(self.run_guard("Bash", {"command": "gh pr merge 5"}, agent=""), 0)
         self.assertEqual(self.run_guard("Bash", {}, raw="not json"), 2)
+        self.assertEqual(self.run_guard("Bash", {}, raw=json.dumps({"tool_name": "Bash", "tool_input": []})), 0,
+                         "no command is nothing to run")
+        self.assertEqual(self.run_guard("Write", {"file_path": "CLAUDE.md"}, project=None), 2,
+                         "without CLAUDE_PROJECT_DIR the call's cwd is the project")
+
+    def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
+        spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
+        guard = __import__("importlib.util").util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        self.assertEqual(guard.CONTROL_PATHS, train.ALEX_ONLY_PATHS)
 
 
 class TrainRecipientTests(unittest.TestCase):

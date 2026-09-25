@@ -56,8 +56,12 @@ PY="$(command -v python3)"
 JOB_PATH="$(dirname "$(command -v claude)"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Check the code that will run: bring a clean, detached checkout to origin/main first.
-if [ -z "$(git -C "$HOME_DIR" status --porcelain)" ] && ! git -C "$HOME_DIR" symbolic-ref -q HEAD >/dev/null; then
-  git -C "$HOME_DIR" fetch -q origin main && git -C "$HOME_DIR" checkout -q --detach FETCH_HEAD
+if [ -n "$(git -C "$HOME_DIR" status --porcelain)" ]; then
+  echo "install.sh: WARNING: $HOME_DIR has local changes; checking it as it is, not at origin/main" >&2
+elif git -C "$HOME_DIR" symbolic-ref -q HEAD >/dev/null; then
+  echo "install.sh: WARNING: $HOME_DIR is on a branch; the watcher expects it detached at origin/main" >&2
+elif ! { git -C "$HOME_DIR" fetch -q origin main && git -C "$HOME_DIR" checkout -q --detach FETCH_HEAD; }; then
+  echo "install.sh: WARNING: could not fetch origin/main; checking the checkout as it is" >&2
 fi
 echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --short HEAD) ..."
 CHECK="$(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \

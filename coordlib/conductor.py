@@ -713,7 +713,8 @@ class Watcher:
             if tampered and github_ok and self.state.get("tamperEscalated") != tampered:
                 self.escalate_text(f"The conductor stopped waking on {self.config.host}: files that govern it are "
                                    f"modified in its checkout {self.config.home} ({tampered}). Look at `git status` "
-                                   "there; restore them (`git checkout -- .`) to let it wake again.")
+                                   "there; restore them (`git checkout -- . && git clean -fd -- .claude Tools/coord`) "
+                                   "to let it wake again.")
                 self.state["tamperEscalated"] = tampered
             if wakes_today >= self.config.max_wakes_per_day and github_ok and not self.state.get("capEscalated"):
                 self.escalate_text(f"The conductor hit its cap of {self.config.max_wakes_per_day} wakes in 24 hours "
@@ -722,6 +723,7 @@ class Watcher:
                 self.state["capEscalated"] = iso(self.now)
         elif wakeable:
             self.state.pop("capEscalated", None)
+            self.state.pop("tamperEscalated", None)
             ended = self.previous_outage(windows)
             result = self.wake(todo if leader else wakeable, leader, hosts, extra, ended)
             extra["lastWake"] = self.state.get("lastWake")
