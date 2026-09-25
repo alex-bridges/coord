@@ -8,10 +8,10 @@ Budgets are kept per PRINCIPAL, the account whose counter a call spends, not per
   uses in app mode (apptoken.py). Its hourly tokens are one budget, not several.
 - Actions (the train's GITHUB_TOKEN) is a third, and is not recorded here.
 
-Every agent and Alex's own `gh` post as one login, so they share one user budget of
-5,000 REST calls an hour. On 2026-09-25 it ran out twice (5,229 and about 7,700 calls an
-hour), both times mostly from cloud workers polling `coord train status` after their
-PRs were queued, and the lockout stopped every agent and Alex's `gh` alike.
+Outside app mode every agent and Alex's own `gh` post as one login, so they share one
+user budget of 5,000 REST calls an hour. On 2026-09-25 it ran out twice (5,229 and about
+7,700 calls an hour), both times mostly from cloud workers polling `coord train status`
+after their PRs were queued, and the lockout stopped every agent and Alex's `gh` alike.
 
 The reading comes from real responses: every HTTPS response carries
 `X-RateLimit-Remaining`, `-Used`, `-Limit`, `-Reset` and `-Resource`, and
@@ -23,7 +23,7 @@ reading is older than PROBE_AFTER_SECONDS (`GitHub.probe_budget`).
 Never the `rate_limit` endpoint: that night it reported 5000/5000 while real calls
 were refused with 403. Only the headers on real responses told the truth.
 
-What is left is not `Remaining` alone. The Claude cloud proxy's token authenticates as
+For the user principal, what is left is not `Remaining` alone. The Claude cloud proxy's token authenticates as
 the same user but reports `X-RateLimit-Limit: 15000`, while Alex's gh token reports
 5000 for the same reset, and `X-RateLimit-Used` is ONE counter shared by both (probed
 2026-09-25 06:07Z: local Used 46, cloud 52 -> 106 over 50 calls, local 114). So when
