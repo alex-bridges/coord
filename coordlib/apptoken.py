@@ -7,7 +7,8 @@ budget Alex's `gh` and every agent share.
 
 **When app mode is on** (`detect`): the non-secret config exists
 (`~/.config/inisa-coord/github-app.json`, or COORD_APP_CONFIG), the command does not run
-in GitHub Actions (the train keeps GITHUB_TOKEN), COORD_APP is not `off`, and the
+in GitHub Actions (the train keeps GITHUB_TOKEN), COORD_APP is not `off`, GITHUB_API_URL
+is unset or https://api.github.com (app credentials go to GitHub only), and the
 repository is the one the app is installed on. Cloud sessions have no config, so they
 run exactly as before. COORD_APP=off is the deliberate override: Alex's gh/keyring
 identity for everything.
@@ -31,7 +32,10 @@ and never when its permissions differ from its kind's. The cached path never run
 `security`. An `fcntl.flock` per kind makes concurrent agents mint once.
 
 **No fallback**: any failure raises AppAuthError. Nothing here, and nothing that calls
-it, answers a failure with Alex's token; the caller serves a cache or refuses.
+it, answers a failure with Alex's token; the caller serves a cache or refuses. A failed
+mint is remembered for FAILURE_HOLD_SECONDS across processes (`<kind>.failed.json`,
+0600, the time and the redacted cause), and a token GitHub answers 401 to is dropped
+from the cache (`reject`).
 
 **Nothing here prints or returns a secret in a message.** Every error text passes
 through gh.redact; the token itself leaves only through `token()`, to a request header
