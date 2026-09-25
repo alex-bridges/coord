@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, List, Optional
 
-from . import review, train
+from . import outage, review, train
 
 
 def ago(value: Optional[str], now: dt.datetime) -> str:
@@ -97,6 +97,60 @@ def _run_line(run: Dict[str, Any], now: dt.datetime) -> str:
     )
 
 
+def active_outages(snapshot: Dict[str, Any], now: dt.datetime) -> List[Dict[str, Any]]:
+    """The snapshot's outages in force at `now` (a cached snapshot predates the key: none)."""
+    return outage.active([outage.deserialize(w) for w in snapshot.get("outages") or []], now)
+
+
+def outage_line(window: Dict[str, Any], now: dt.datetime) -> str:
+    until = window["end"]
+    return (f"OUTAGE  {window['harness']} agents are down until {until.strftime('%a %H:%MZ')} "
+            f"(in {ago(snapshot_iso(now), until)})" + (f": {_clip(window['reason'], 80)}" if window.get("reason") else "")
+            + ". Messages to them wait; their claims do not go stale; the train keeps running.")
+
+
+def snapshot_iso(moment: dt.datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def conductor_state(snapshot: Dict[str, Any], now: dt.datetime) -> str:
+    """One word for the brief: up, paused, down (an outage), stale (no live beat) or absent."""
+    info = snapshot.get("conductor") or {}
+    hosts = info.get("hosts") or []
+    if any(outage.affects(w["harness"], "conductor@") for w in active_outages(snapshot, now)):
+        return "down (outage)"
+    if info.get("pause"):
+        return "paused"
+    if any(h.get("leader") for h in hosts):
+        return "up"
+    return "stale" if hosts else "absent"
+
+
+def conductor_lines(snapshot: Dict[str, Any], now: dt.datetime) -> List[str]:
+    info = snapshot.get("conductor") or {}
+    lines = ["CONDUCTOR (message it with: coord send --to 'conductor@*' \"…\")"]
+    hosts = info.get("hosts") or []
+    if not hosts:
+        lines.append("  no watcher running: messages to conductor@* wait for one")
+    for host in hosts:
+        role = "leader" if host.get("leader") else ("standby" if host.get("alive") else "STALE")
+        wake = host.get("lastWake") or {}
+        words = f"  {host['agent']} ({role}) · beat {ago(host.get('beat'), now)} ago"
+        if host.get("disk") is not None:
+            words += f" · disk {host['disk']} GB free"
+        if host.get("pending"):
+            words += f" · {host['pending']} pending"
+        if wake.get("at"):
+            words += f" · last wake {ago(wake['at'], now)} ago" + (f": {_clip(wake.get('summary') or '', 60)}" if wake.get("summary") else "")
+        lines.append(words)
+    if info.get("pause"):
+        pause = info["pause"]
+        lines.append(f"  PAUSED until {pause['until']} by {pause['agent']}" + (f": {_clip(pause['note'], 80)}" if pause.get("note") else ""))
+    for escalation in info.get("escalations") or []:
+        lines.append(f"  needs Alex ({ago(escalation['at'], now)} ago): {_clip(escalation['text'], 90)} {escalation['url']}")
+    return lines
+
+
 def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budget: Optional[str] = None) -> str:
     """`budget`: the API budget line (budget.header_words), current rather than cached."""
     now = review.parse_time(snapshot["generatedAt"]) or dt.datetime.now(dt.timezone.utc)
@@ -108,6 +162,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
         + (f" · {budget}" if budget else "")
     )
     lines.append(f"you: {me}")
+    for window in active_outages(snapshot, now):
+        lines.append(outage_line(window, now))
     lines.append("")
 
     lines.append("IN FLIGHT")
@@ -167,6 +223,9 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
         lines.append(f"  {position}. PR #{entry['pr']} · added {ago(entry['addedAt'], now)} ago{by} · {state}")
     lines.append("")
 
+    lines.extend(conductor_lines(snapshot, now))
+    lines.append("")
+
     if unread is not None:
         lines.append(f"INBOX  {unread} new for you" + (" (coord inbox)" if unread else ""))
     return "\n".join(lines).rstrip() + "\n"
@@ -175,6 +234,7 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
 def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit: int = 6,
           budget: Optional[str] = None) -> str:
     """At most ~10 lines, for a session-start hook."""
+    now = review.parse_time(snapshot["generatedAt"]) or dt.datetime.now(dt.timezone.utc)
     runs = snapshot["runs"]
     open_claims = [c for c in snapshot["claims"] if c["pr"] is None]
     parts = [
@@ -185,11 +245,14 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     ]
     if snapshot["overlaps"]:
         parts.append(f"{len(snapshot['overlaps'])} file overlap" + ("s" if len(snapshot["overlaps"]) != 1 else ""))
+    if snapshot.get("conductor") is not None:
+        parts.append(f"conductor {conductor_state(snapshot, now)}")
     if unread:
         parts.append(f"{unread} new message" + ("s" if unread != 1 else "") + " for you")
     if budget:
         parts.append(budget)
     lines = [f"coord ({me}): " + ", ".join(parts)]
+    lines.extend(outage_line(window, now) for window in active_outages(snapshot, now))
     for pr in snapshot["prs"][:limit]:
         owner = claim_owner(snapshot, pr)
         who = f" [{owner['agent']}]" if owner else ""

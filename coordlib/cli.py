@@ -1,4 +1,4 @@
-"""Command line: coord board | whoami | claim | release | send | inbox | ci."""
+"""Command line: coord board | whoami | claim | release | send | inbox | ci | train | outage | conductor."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import budget, cache, identity, marker, render, review, snapshot, train, train_step
+from . import budget, cache, identity, lease, marker, outage, render, review, snapshot, train, train_step
 from .gh import GitHub, GitHubError, NotFound
 
 INBOX_DEFAULT_DAYS = 7
@@ -308,7 +308,27 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     posted = post_comment(gh, target, f"{heading}\n\n{args.text}", payload)
     cache.invalidate_snapshot(gh.repo)
     print(f"sent to {', '.join(recipients)} on #{target}: {posted.get('html_url')}")
+    for line in down_warnings(gh.repo, recipients):
+        print(line)
     return EXIT_OK
+
+
+def down_warnings(repo: str, recipients: List[str]) -> List[str]:
+    """Recipients whose harness is in an outage, from this machine's cached board (no call:
+    `send` must stay cheap and always run)."""
+    cached = cache.load_snapshot(repo, float("inf"))
+    if not cached:
+        return []
+    now = snapshot.now_utc()
+    windows = [outage.deserialize(w) for w in cached.get("outages") or []]
+    out = []
+    for address in recipients:
+        window = outage.down(windows, address, now)
+        if window is not None:
+            out.append(f"note: {window['harness']} agents are down until {window['end'].strftime('%a %H:%MZ')}; "
+                       f"{address} will read this after that")
+    return out
+
 
 
 def _number_from_url(url: str) -> Optional[int]:
@@ -570,6 +590,108 @@ def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def cmd_outage_start(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    now = snapshot.now_utc()
+    until = review.parse_time(args.until) if args.until else outage.next_weekly_reset(now)
+    if until <= now:
+        raise UsageError(f"--until {args.until} is not in the future")
+    me = identity.agent_id()
+    issue = conductor.conductor_issue(gh)
+    posted = conductor.post_record(gh, issue, (
+        f"**{args.harness} agents are down** until {snapshot.iso(until)} (declared by `{me}`)"
+        + (f": {args.note}" if args.note else "") + "."), {
+        "kind": "outage", "v": 1, "event": "start", "agent": me, "harness": args.harness,
+        "until": snapshot.iso(until), "reason": args.note or ""})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"declared a {args.harness} outage until {snapshot.iso(until)}: {posted.get('html_url')}")
+    return EXIT_OK
+
+
+def cmd_outage_end(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    me = identity.agent_id()
+    issue = conductor.conductor_issue(gh)
+    posted = conductor.post_record(gh, issue, f"**{args.harness} agents are back** (declared by `{me}`)."
+                                   + (f"\n\n{args.note}" if args.note else ""),
+                                   {"kind": "outage", "v": 1, "event": "end", "agent": me, "harness": args.harness})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"ended the {args.harness} outage: {posted.get('html_url')}")
+    return EXIT_OK
+
+
+def cmd_conductor_tick(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    config = conductor.Config.from_env()
+    os.environ["COORD_AGENT"] = config.agent  # every coord call in this process speaks as the conductor
+    lines = conductor.Watcher(config, gh).tick(dry_run=args.dry_run, wake=not args.no_wake)
+    stamp = snapshot.iso(snapshot.now_utc())
+    for line in lines:
+        print(f"{stamp} {line}")
+    return EXIT_OK
+
+
+def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    config = conductor.Config.from_env()
+    snap = get_snapshot(gh, args.max_age)
+    now = snapshot.now_utc()
+    lines = [line for window in render.active_outages(snap, now) for line in [render.outage_line(window, now)]]
+    lines += render.conductor_lines(snap, now)
+    wakes = conductor.read_wakes(config)
+    day = [w for w in wakes if (review.parse_time(w.get("at")) or now) > now - dt.timedelta(days=1)]
+    if wakes:
+        tokens = {k: sum((w.get("usage") or {}).get(k) or 0 for w in day)
+                  for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")}
+        lines += ["", f"THIS MACHINE ({config.agent}, state in {config.state_dir})",
+                  f"  last 24 h: {len(day)} wakes, {sum(1 for w in day if w.get('ok'))} ok; tokens "
+                  f"in {tokens['input_tokens']}, cache read {tokens['cache_read_input_tokens']}, "
+                  f"cache write {tokens['cache_creation_input_tokens']}, out {tokens['output_tokens']}"]
+        for wake in wakes[-args.last:]:
+            lines.append(f"  {wake.get('at')} {wake.get('model')} {'ok' if wake.get('ok') else 'FAILED'} "
+                         f"{wake.get('seconds')}s: {render._clip(wake.get('summary') or '', 90)}")
+    else:
+        lines += ["", f"THIS MACHINE ({config.agent}): no wakes recorded in {config.state_dir}"]
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+def cmd_conductor_pause(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    try:
+        until = snapshot.now_utc() + conductor.parse_duration(args.duration)
+    except ValueError as error:
+        raise UsageError(str(error))
+    me = identity.agent_id()
+    posted = conductor.post_record(gh, conductor.conductor_issue(gh),
+                                   f"**Conductor paused** until {snapshot.iso(until)} by `{me}`" + (f": {args.note}" if args.note else "."),
+                                   {"kind": "conductor", "v": 1, "event": "pause", "agent": me,
+                                    "until": snapshot.iso(until), "note": args.note or ""})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"paused the conductor until {snapshot.iso(until)}: {posted.get('html_url')}")
+    return EXIT_OK
+
+
+def cmd_conductor_resume(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    me = identity.agent_id()
+    posted = conductor.post_record(gh, conductor.conductor_issue(gh), f"**Conductor resumed** by `{me}`.",
+                                   {"kind": "conductor", "v": 1, "event": "resume", "agent": me})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"resumed the conductor: {posted.get('html_url')}")
+    return EXIT_OK
+
+
+def cmd_conductor_escalate(args: argparse.Namespace, gh: GitHub) -> int:
+    from . import conductor
+    me = identity.agent_id()
+    posted = conductor.post_record(gh, conductor.conductor_issue(gh), args.text,
+                                   {"kind": "conductor", "v": 1, "event": "escalate", "agent": me})
+    cache.invalidate_snapshot(gh.repo)
+    print(f"escalated to Alex (on the board for 24 h): {posted.get('html_url')}")
+    return EXIT_OK
+
+
 # MARK: - Entry
 
 
@@ -658,6 +780,38 @@ def parser() -> argparse.ArgumentParser:
     step.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
     step.add_argument("--repo-dir", default=".", help="a clone with push access (default: current directory)")
     step.set_defaults(func=cmd_train_step)
+
+    outage_parser = sub.add_parser("outage", help="declare or end a harness outage (a usage limit: every agent of a kind down)")
+    outage_sub = outage_parser.add_subparsers(dest="outage_command", required=True)
+    start = outage_sub.add_parser("start", help="declare that a harness's agents are down until a time")
+    start.add_argument("harness", help="claude (covers claude@, claude-cloud@ and conductor@) or codex")
+    start.add_argument("--until", help="ISO time (default: the next weekly reset, COORD_CLAUDE_WEEKLY_RESET)")
+    start.add_argument("--note", help="why, in a few words")
+    start.set_defaults(func=cmd_outage_start)
+    end = outage_sub.add_parser("end", help="declare that a harness's agents are back")
+    end.add_argument("harness")
+    end.add_argument("--note")
+    end.set_defaults(func=cmd_outage_end)
+
+    conductor_parser = sub.add_parser("conductor", help="the conductor: the watcher that wakes a model when there is work")
+    conductor_sub = conductor_parser.add_subparsers(dest="conductor_command", required=True)
+    tick = conductor_sub.add_parser("tick", help="one watcher pass (launchd runs this every few minutes)")
+    tick.add_argument("--dry-run", action="store_true", help="show what it would wake for; write nothing")
+    tick.add_argument("--no-wake", action="store_true", help="beat and record, but start no model run")
+    tick.set_defaults(func=cmd_conductor_tick)
+    cstatus = conductor_sub.add_parser("status", help="hosts, pause, outages, escalations, and this machine's wakes")
+    cstatus.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
+    cstatus.add_argument("--last", type=int, default=5, help="how many recent wakes to list")
+    cstatus.set_defaults(func=cmd_conductor_status)
+    pause = conductor_sub.add_parser("pause", help="stop every watcher from waking a model for a while")
+    pause.add_argument("--for", dest="duration", required=True, help="45m, 2h, 1d")
+    pause.add_argument("--note")
+    pause.set_defaults(func=cmd_conductor_pause)
+    resume = conductor_sub.add_parser("resume", help="end a pause")
+    resume.set_defaults(func=cmd_conductor_resume)
+    escalate = conductor_sub.add_parser("escalate", help="put something in front of Alex on the board (24 h)")
+    escalate.add_argument("text")
+    escalate.set_defaults(func=cmd_conductor_escalate)
     return top
 
 

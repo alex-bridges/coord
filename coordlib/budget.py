@@ -50,18 +50,20 @@ AT_SKEW_SECONDS = 300  # how far in the future a reading's `at` may be (clock sk
 # is a read whose one write (the dispatch) still needs the hard floor. `send` always
 # runs, so an agent can always report. `train step` runs in Actions on the Actions
 # token, a separate budget, and `whoami` makes no call.
-CACHE_READS = frozenset({"board", "inbox", "train status"})  # below the read floor: served from the cache, no call
+CACHE_READS = frozenset({"board", "inbox", "train status", "conductor status"})  # below the read floor: served from the cache, no call
 READS = CACHE_READS | {"ci"}
-UNGATED = frozenset({"send", "whoami", "train step"})
+# `conductor tick` keeps its own floors (conductor.Watcher): it must beat and check the
+# machine even when reads are refused.
+UNGATED = frozenset({"send", "whoami", "train step", "conductor tick"})
 
 OK, LOW, REFUSE = "ok", "low", "refuse"
 
 
 def command_name(args: Any) -> str:
-    """`train status`, `board`, …: the command and, for `train`, its subcommand."""
+    """`train status`, `board`, …: the command and its subcommand, if it has one."""
     command = getattr(args, "command", "") or ""
-    sub = getattr(args, "train_command", None)
-    return f"{command} {sub}" if command == "train" and sub else command
+    sub = getattr(args, f"{command}_command", None)
+    return f"{command} {sub}" if sub else command
 
 
 def floor(name: str, default: int) -> int:

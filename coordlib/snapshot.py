@@ -22,7 +22,7 @@ import re
 import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from . import marker, review
+from . import lease, marker, outage, review
 from .gh import GitHub, GitHubError, NotFound
 
 CLAIM_WINDOW_DAYS = 14
@@ -587,8 +587,12 @@ def resolve_claims(
     targets: Dict[str, Any],
     prs: List[Dict[str, Any]],
     now: dt.datetime,
+    outage_windows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Active claims, oldest first, with their PR, branch and staleness.
+
+    The stale clock stops while the claim's agent is down in an outage (outage.py): a
+    Claude claim does not go stale because the weekly usage limit fell in the middle of it.
 
     Per (issue, agent) the newest claim/release wins. Several agents with active
     claims on one issue are all shown; the earliest (lowest comment id) holds it
@@ -648,7 +652,8 @@ def resolve_claims(
             "pr": pr["number"] if pr else None,
             "branchPushed": branch_state is not None,
             "lastActivity": iso(last_activity),
-            "stale": pr is None and (now - last_activity) > dt.timedelta(hours=STALE_HOURS),
+            "stale": pr is None and (now - last_activity - outage.paused_time(outage_windows or [], agent, last_activity, now))
+            > dt.timedelta(hours=STALE_HOURS),
             "contested": False,
         })
     claims.sort(key=lambda c: c["commentId"] or 0)
@@ -770,7 +775,8 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p.get("branch") or "" for p in claim_payloads],
     )
     attach_substitute_reviews(prs, comments)
-    claims = resolve_claims(comments, targets, prs, now)
+    outage_windows = outage.windows(comments)
+    claims = resolve_claims(comments, targets, prs, now, outage_windows)
     # A `send` message, or any other record addressed to someone (the train's held notice).
     messages = [c for c in comments if c["payload"].get("kind") == "msg" or marker.recipients(c["payload"])]
     return {
@@ -784,6 +790,10 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         "train": train_queue(prs, comments),
         "runs": runs,
         "messages": messages,
+        # Outage windows of the last CLAIM_WINDOW_DAYS; `active` ones are what the board shows.
+        "outages": [outage.serialize(w) for w in outage_windows],
+        "conductor": {"hosts": lease.hosts(comments, now), "pause": lease.pause(comments, now),
+                      "escalations": lease.escalations(comments, now)},
         "claimComments": [c for c in comments if c["payload"].get("kind") in ("claim", "release")],
         "apiCalls": gh.calls,
     }

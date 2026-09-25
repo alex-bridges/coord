@@ -288,6 +288,11 @@ class Step:
             return True
         return self.agent != TRAIN_AGENT and payload.get("agent") == self.agent
 
+    def recipients(self, pr: Optional[Dict[str, Any]]) -> List[str]:
+        """Who hears when the train takes a PR out: the agent that added it (when this step
+        read it) and the conductor, which keeps the train moving (conductor.py)."""
+        return list(dict.fromkeys(a for a in ((pr or {}).get("trainAddedBy"), train.CONDUCTOR) if a))
+
     def notify_held(self, pr: Dict[str, Any], head: str, hold: str, reason: str) -> None:
         """Tell whoever is still responsible that a queued PR is held (#1034), once per
         (PR, head, hold class), ever.
@@ -527,7 +532,7 @@ class Step:
                     self.comment(number, (
                         f"**Removed from the merge train:** CI failed on this PR alone, twice "
                         f"({jobs}): {url}\n\nFix it and add it again with `Tools/coord/coord train add {number}`."
-                    ), "ejected", batch=name, run=run["id"], failed=failed[:10])
+                    ), "ejected", batch=name, run=run["id"], failed=failed[:10], to=self.recipients(prs.get(number)))
                 else:
                     self.add_label(number, train.SOLO_LABEL)
                     self.comment(number, (
@@ -616,7 +621,8 @@ class Step:
                             overtaken=[n for n in verdicts if prs[n].get("overtakenBy")])
         for number, reason in chosen["drops"]:
             self.remove_label(number, train.TRAIN_LABEL)
-            self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason)
+            self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason,
+                         to=self.recipients(prs.get(number)))
             self.note(f"#{number} removed: {reason}")
         for number, reason in chosen["holds"]:
             self.note(f"#{number} held: {reason}")
