@@ -63,8 +63,19 @@ def reaction(content: str, minutes_ago: float, login: str = BOT):
     return {"content": content, "createdAt": t(minutes_ago), "user": {"login": login}}
 
 
-def check(name: str, status: str = "COMPLETED", conclusion: str = "SUCCESS"):
-    return {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+def check(name: str, status: str = "COMPLETED", conclusion: str = "SUCCESS", annotations=None):
+    """A CheckRun rollup node. `annotations` (a list of messages) adds the
+    `annotations(first: 1)` connection PR_FIELDS asks for; None leaves it out."""
+    node = {"__typename": "CheckRun", "name": name, "status": status, "conclusion": conclusion}
+    if annotations is not None:
+        node["annotations"] = {"nodes": [{"message": message} for message in annotations]}
+    return node
+
+
+# The annotation GitHub puts on a job the Actions budget refused to start (#1026, check
+# run 10000099: conclusion failure, started 01:35:55Z, completed 01:35:57Z).
+BILLING_REFUSED = "The job was not started because an Actions budget is preventing further use."
+REAL_FAILURE = "Process completed with exit code 1."
 
 
 def with_checks(*contexts):
@@ -198,7 +209,7 @@ class FindingTests(unittest.TestCase):
 class CITests(unittest.TestCase):
     def test_verdict_success(self):
         state = review.ci_state(with_checks(check("CI verdict"), check("Select lanes")))
-        self.assertEqual(state, {"verdict": "success", "failing": [], "pending": [], "started": []})
+        self.assertEqual(state, {"verdict": "success", "failing": [], "pending": [], "started": [], "not_run": []})
 
     def test_failing_ignores_xcode_cloud_and_cancelled(self):
         state = review.ci_state(with_checks(
@@ -226,6 +237,72 @@ class CITests(unittest.TestCase):
 
     def test_cancelled_verdict(self):
         self.assertEqual(review.ci_state(with_checks(check("CI verdict", conclusion="CANCELLED")))["verdict"], "cancelled")
+
+
+class NotRunTests(unittest.TestCase):
+    """A job GitHub never started is NOT RUN: neither red nor green (#1026), GraphQL shape."""
+
+    def test_the_graphql_query_asks_for_the_first_annotation(self):
+        self.assertIn("... on CheckRun { name status conclusion annotations(first: 1) { nodes { message } } }",
+                      snapshot.PR_FIELDS)
+
+    def test_a_billing_refused_run_is_not_run_not_failing(self):
+        state = review.ci_state(with_checks(
+            check("CI verdict"),
+            check("Linux plugin probe (x86_64)", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+            check("Windows plugin probe (dynamic runtime)", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+        ))
+        self.assertEqual(state["failing"], [])
+        self.assertEqual(state["not_run"], ["Linux plugin probe (x86_64)", "Windows plugin probe (dynamic runtime)"])
+        self.assertEqual(state["verdict"], "success")
+        self.assertEqual(render.ci_words(state), "CI green, 2 not run (billing)")
+
+    def test_a_real_failure_with_another_annotation_stays_failing(self):
+        state = review.ci_state(with_checks(
+            check("Android", conclusion="FAILURE", annotations=[REAL_FAILURE]),
+            # The phrase anywhere but at the start is not the refusal.
+            check("Linux plugin probe (x86_64)", conclusion="FAILURE", annotations=["Error: " + BILLING_REFUSED]),
+            check("Timed out", conclusion="TIMED_OUT", annotations=["The job running on runner Tycho has exceeded the maximum execution time"]),
+        ))
+        self.assertEqual(state["failing"], ["Android", "Linux plugin probe (x86_64)", "Timed out"])
+        self.assertEqual(state["not_run"], [])
+        self.assertEqual(render.ci_words(state), "CI red: Android, Linux plugin probe (x86_64), Timed out")
+
+    def test_a_failure_without_an_annotation_stays_failing(self):
+        state = review.ci_state(with_checks(
+            check("Android", conclusion="FAILURE"),                     # no connection at all
+            check("AppGamma", conclusion="FAILURE", annotations=[]),     # an empty connection
+        ))
+        self.assertEqual(state["failing"], ["Android", "AppGamma"])
+        self.assertEqual(state["not_run"], [])
+
+    def test_only_the_first_annotation_counts(self):
+        state = review.ci_state(with_checks(
+            check("Android", conclusion="FAILURE", annotations=[REAL_FAILURE, BILLING_REFUSED])))
+        self.assertEqual((state["failing"], state["not_run"]), (["Android"], []))
+
+    def test_the_annotation_on_a_run_that_did_not_fail_changes_nothing(self):
+        state = review.ci_state(with_checks(
+            check("CI verdict", annotations=[BILLING_REFUSED]),
+            check("Docs", conclusion="CANCELLED", annotations=[BILLING_REFUSED]),
+        ))
+        self.assertEqual(state, {"verdict": "success", "failing": [], "pending": [], "started": [], "not_run": []})
+
+    def test_a_refused_verdict_job_is_no_verdict_and_ignored_checks_stay_ignored(self):
+        state = review.ci_state(with_checks(
+            check("CI verdict", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+            check("LegacyCI | AppBeta · Test (PR + main) | Test - iOS", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+        ))
+        self.assertEqual(state["verdict"], "none", "a verdict job that never ran is not a red verdict")
+        self.assertEqual((state["failing"], state["not_run"]), ([], ["CI verdict"]))
+        self.assertEqual(render.ci_words(state), "CI none, 1 not run (billing)")
+
+    def test_a_name_that_also_failed_for_real_is_red(self):
+        state = review.ci_state(with_checks(
+            check("Android", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+            check("Android", conclusion="FAILURE", annotations=[REAL_FAILURE]),
+        ))
+        self.assertEqual((state["failing"], state["not_run"]), (["Android"], []))
 
 
 class ClaimTests(unittest.TestCase):
@@ -587,7 +664,8 @@ class RestFallbackTests(unittest.TestCase):
         self.assertEqual(main["sha"], "m" * 40)
         self.assertTrue(pr["codex"]["approved"])
         self.assertEqual(pr["unansweredFindings"], 1, "thread 1 answered, thread 3 not")
-        self.assertEqual(pr["ci"], {"verdict": "success", "failing": [], "pending": [], "started": []}, "Xcode Cloud ignored")
+        self.assertEqual(pr["ci"], {"verdict": "success", "failing": [], "pending": [], "started": [], "not_run": []},
+                         "Xcode Cloud ignored")
         self.assertEqual((pr["mergeable"], pr["fromFork"], pr["labels"], pr["closes"]),
                          ("CONFLICTING", False, ["train"], [55, 56]))
 
@@ -685,6 +763,96 @@ class CodexRoundSevenTests(unittest.TestCase):
         since = review.parse_time(cursor) - cli.CURSOR_OVERLAP
         self.assertEqual(len(cli.inbox_items([comment], [], snap, me, since, "", [10])), 1)
         self.assertEqual(cli.inbox_items([comment], [], snap, me, since, "", [10, 11]), [])
+
+
+class NotRunRestTests(unittest.TestCase):
+    """The same NOT RUN rule on the REST fallback: annotations are read one call per run,
+    and only for runs where the answer can change."""
+
+    class Fake(RestFallbackTests.Fake):
+        def __init__(self, runs, annotations):
+            super().__init__(AssertionError("GraphQL must not be tried"))
+            self.runs = runs
+            self.annotations = annotations  # run id -> messages
+
+        def rest(self, path, method="GET", body=None):
+            if "/annotations" in path:
+                self.paths.append(path)
+                run_id = int(path.split("check-runs/")[1].split("/")[0])
+                return [{"message": m, "annotation_level": "failure"} for m in self.annotations[run_id]]
+            return super().rest(path, method, body)
+
+        def rest_paginated(self, path):
+            if "check-runs" in path:
+                self.paths.append(path)
+                return [{"check_runs": self.runs}]
+            return super().rest_paginated(path)
+
+    @staticmethod
+    def check_run(run_id, name, conclusion, annotations_count=1, status="completed"):
+        return {"id": run_id, "name": name, "status": status, "conclusion": conclusion,
+                "output": {"annotations_count": annotations_count}}
+
+    def ci(self, fake):
+        _, nodes = snapshot.fetch_prs_rest(fake)
+        return snapshot.summarize_pr(nodes[0])["ci"]
+
+    def annotation_reads(self, fake):
+        return [p for p in fake.paths if "/annotations" in p]
+
+    def test_the_three_cases_and_reads_only_failure_class_runs(self):
+        fake = self.Fake(
+            runs=[
+                self.check_run(1, "CI verdict", "success"),
+                self.check_run(2, "Linux plugin probe (x86_64)", "failure"),
+                self.check_run(3, "Android", "failure"),
+                self.check_run(4, "AppGamma", "failure", annotations_count=0),        # nothing to read
+                self.check_run(5, "Windows plugin probe (dynamic runtime)", "timed_out"),
+                self.check_run(6, "Docs", "cancelled"),
+                self.check_run(7, "Select lanes", "skipped"),
+                self.check_run(8, "LegacyCI | AppBeta · Test (PR + main) | Test - iOS", "action_required"),  # ignored
+                self.check_run(9, "CoreKit debug gate", None, status="in_progress"),
+            ],
+            annotations={1: [BILLING_REFUSED], 2: [BILLING_REFUSED], 3: [REAL_FAILURE], 4: [],
+                         5: [BILLING_REFUSED], 6: [BILLING_REFUSED], 7: [], 8: [BILLING_REFUSED], 9: []},
+        )
+        ci = self.ci(fake)
+        self.assertEqual(ci["not_run"], ["Linux plugin probe (x86_64)", "Windows plugin probe (dynamic runtime)"])
+        self.assertEqual(ci["failing"], ["Android", "AppGamma"], "another annotation, and none, stay red")
+        self.assertEqual(ci["pending"], ["CoreKit debug gate"])
+        self.assertEqual(self.annotation_reads(fake), [
+            "repos/{repo}/check-runs/2/annotations?per_page=1",
+            "repos/{repo}/check-runs/3/annotations?per_page=1",
+            "repos/{repo}/check-runs/5/annotations?per_page=1",
+        ], "only failure-class, non-ignored runs with an annotation are read")
+
+    def test_a_failure_whose_annotation_list_comes_back_empty_stays_failing(self):
+        fake = self.Fake(runs=[self.check_run(3, "Android", "failure")], annotations={3: []})
+        self.assertEqual((self.ci(fake)["failing"], self.ci(fake)["not_run"]), (["Android"], []))
+
+    def test_a_green_head_costs_no_annotation_reads(self):
+        fake = self.Fake(runs=[self.check_run(1, "CI verdict", "success")], annotations={1: [BILLING_REFUSED]})
+        self.assertEqual(self.ci(fake)["not_run"], [])
+        self.assertEqual(self.annotation_reads(fake), [])
+
+    def test_annotation_reads_are_capped_and_an_unread_failure_stays_red(self):
+        count = snapshot.MAX_ANNOTATION_READS + 2
+        runs = [self.check_run(n, f"job {n:02d}", "failure") for n in range(1, count + 1)]
+        fake = self.Fake(runs=runs, annotations={n: [BILLING_REFUSED] for n in range(1, count + 1)})
+        ci = self.ci(fake)
+        self.assertEqual(len(self.annotation_reads(fake)), snapshot.MAX_ANNOTATION_READS)
+        self.assertEqual(ci["failing"], [f"job {n:02d}" for n in range(snapshot.MAX_ANNOTATION_READS + 1, count + 1)],
+                         "a run the cap left unread is held as red, never waved through")
+        self.assertEqual(len(ci["not_run"]), snapshot.MAX_ANNOTATION_READS)
+
+    def test_the_graphql_path_completes_a_truncated_rollup_with_annotations_too(self):
+        fake = self.Fake(runs=[self.check_run(2, "Linux plugin probe (x86_64)", "failure"), self.check_run(3, "Android", "failure")],
+                         annotations={2: [BILLING_REFUSED], 3: [REAL_FAILURE]})
+        node = pr_node()
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = {"totalCount": 101, "nodes": []}
+        snapshot.complete_pr_node(fake, node)
+        ci = snapshot.summarize_pr(node)["ci"]
+        self.assertEqual((ci["failing"], ci["not_run"]), (["Android"], ["Linux plugin probe (x86_64)"]))
 
 
 class OverlapAndTrainTests(unittest.TestCase):
@@ -820,6 +988,19 @@ class RenderTests(unittest.TestCase):
         brief = render.brief(self.full_snapshot(), "me", unread=0)
         self.assertIn("1 claim without a PR", brief)
         self.assertIn("workflow runs 1 running / 1 queued", brief)
+
+    def test_never_started_checks_are_counted_on_the_board_and_do_not_hold_the_train(self):
+        snap = self.full_snapshot()
+        node = pr_node(labels={"nodes": [{"name": "train"}]}, reactions={"nodes": [reaction("THUMBS_UP", 30)]})
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = [
+            check("CI verdict"),
+            check("Linux plugin probe (x86_64)", conclusion="FAILURE", annotations=[BILLING_REFUSED]),
+            check("Windows plugin probe (dynamic runtime)", conclusion="FAILURE", annotations=[BILLING_REFUSED])]
+        snap["prs"] = [snapshot.summarize_pr(node)]
+        text = render.board(snap, "me")
+        self.assertIn("CI green, 2 not run (billing) · Codex approved", text)
+        self.assertIn("1. PR #101 · added 3m ago by a · ready", text)
+        self.assertIn("CI green, 2 not run (billing), Codex approved", render.brief(snap, "me"))
 
     def test_empty_board_renders(self):
         empty = {"schema": 1, "generatedAt": snapshot.iso(NOW), "repo": "o/r", "main": {}, "prs": [], "claims": [],

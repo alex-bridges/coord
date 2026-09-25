@@ -41,7 +41,7 @@ commits(last: 1) { nodes { commit {
   checkSuites(first: 20) { totalCount nodes { createdAt } }
   statusCheckRollup { state contexts(first: 100) { totalCount nodes {
     __typename
-    ... on CheckRun { name status conclusion }
+    ... on CheckRun { name status conclusion annotations(first: 1) { nodes { message } } }
     ... on StatusContext { context state }
   } } }
 } } }
@@ -95,13 +95,40 @@ def truncated(connection: Optional[Dict[str, Any]]) -> bool:
 REACTION_NAMES = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
 
 
+# The most annotation reads one commit's check runs may cost. Past it a failed run keeps
+# no annotation and so stays red: the cap can hold a PR, never let one through.
+MAX_ANNOTATION_READS = 10
+
+
+def rest_check_run_annotations(gh: GitHub, runs: List[Dict[str, Any]]) -> Dict[Any, List[Dict[str, Any]]]:
+    """The first annotation of each failed check run, by run id: all review.never_started reads.
+
+    One call per run, so only where it can change the answer: a failure-class conclusion,
+    not an ignored Xcode Cloud check (those fail on every PR), and `output.annotations_count`
+    not 0. Everything else, and every run past MAX_ANNOTATION_READS, is not read.
+    """
+    found: Dict[Any, List[Dict[str, Any]]] = {}
+    for run in runs:
+        if len(found) >= MAX_ANNOTATION_READS:
+            break
+        if (run.get("id") is None or not review.is_failed_conclusion(run.get("conclusion"))
+                or review.is_ignored_check(run.get("name"))
+                or (run.get("output") or {}).get("annotations_count") == 0):
+            continue
+        listed = gh.rest(f"repos/{{repo}}/check-runs/{run['id']}/annotations?per_page=1") or []
+        found[run["id"]] = [{"message": a.get("message")} for a in listed[:1]]
+    return found
+
+
 def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
     """Every check run and commit status at `sha`, in the GraphQL rollup's node shape."""
     runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
             for r in page.get("check_runs", [])]
     statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
+    annotations = rest_check_run_annotations(gh, runs)
     return ([{"__typename": "CheckRun", "name": r.get("name"), "status": _upper(r.get("status")),
-              "conclusion": _upper(r.get("conclusion"))} for r in runs]
+              "conclusion": _upper(r.get("conclusion")),
+              "annotations": {"nodes": annotations.get(r.get("id"), [])}} for r in runs]
             + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
                for c in statuses])
 
@@ -333,8 +360,13 @@ def fetch_targets_graphql(gh: GitHub, numbers: List[int], branches: List[str]) -
 # "GitHub GraphQL is not available from Claude Code sessions; use the REST API"),
 # while REST works, writes included (probed 2026-09-24). The REST path builds the SAME
 # node shape the GraphQL query returns, so review.py's rules stay the one
-# implementation. It costs about seven calls per open PR instead of one query for
-# all of them, so it is used only where GraphQL is unavailable.
+# implementation. It costs about seven calls per open PR (plus one per failed check
+# run, at most MAX_ANNOTATION_READS) instead of one query for all of them, so it is
+# used only where GraphQL is unavailable.
+#
+# The two need not see the same checks: on #1026's head (probed 2026-09-25) GraphQL's
+# statusCheckRollup listed 18 contexts and left out the CoreKit Plugins suite, a
+# `workflow_dispatch` run, whose check runs REST's commits/{sha}/check-runs does list.
 
 
 def rest_only(gh: GitHub) -> bool:
