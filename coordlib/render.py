@@ -89,13 +89,15 @@ def _run_line(run: Dict[str, Any], now: dt.datetime) -> str:
     )
 
 
-def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None) -> str:
+def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budget: Optional[str] = None) -> str:
+    """`budget`: the API budget line (budget.header_words), current rather than cached."""
     now = review.parse_time(snapshot["generatedAt"]) or dt.datetime.now(dt.timezone.utc)
     lines: List[str] = []
     cache = f" · cached {snapshot['cacheAgeSeconds']}s" if snapshot.get("cacheAgeSeconds") is not None else ""
     lines.append(
         f"{snapshot['repo']} board · main {snapshot['main'].get('sha', '')[:9]} · "
         f"{snapshot['generatedAt']} · {snapshot.get('apiCalls', '?')} API calls{cache}"
+        + (f" · {budget}" if budget else "")
     )
     lines.append(f"you: {me}")
     lines.append("")
@@ -162,7 +164,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None) -> st
     return "\n".join(lines).rstrip() + "\n"
 
 
-def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit: int = 6) -> str:
+def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit: int = 6,
+          budget: Optional[str] = None) -> str:
     """At most ~10 lines, for a session-start hook."""
     runs = snapshot["runs"]
     open_claims = [c for c in snapshot["claims"] if c["pr"] is None]
@@ -176,6 +179,8 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
         parts.append(f"{len(snapshot['overlaps'])} file overlap" + ("s" if len(snapshot["overlaps"]) != 1 else ""))
     if unread:
         parts.append(f"{unread} new message" + ("s" if unread != 1 else "") + " for you")
+    if budget:
+        parts.append(budget)
     lines = [f"coord ({me}): " + ", ".join(parts)]
     for pr in snapshot["prs"][:limit]:
         owner = claim_owner(snapshot, pr)

@@ -1,4 +1,5 @@
-"""Per-machine cache: the last board snapshot and each agent's inbox cursor.
+"""Per-machine cache: the last board snapshot, each agent's inbox cursor, and the last
+GitHub API budget reading.
 
 The snapshot is shared by every agent on one machine (same user), so ten
 sessions polling the board within a minute cost GitHub one snapshot, not ten.
@@ -67,10 +68,28 @@ def store_snapshot(repo: str, snapshot: Dict[str, Any]) -> None:
 
 
 def invalidate_snapshot(repo: str) -> None:
+    """Age the snapshot out of every `max_age` instead of deleting it. When the API budget
+    is low, reads fall back to it at any age (cli.snapshot_despite_budget), and a `send`,
+    which the guard always allows, must not take that fallback away."""
     try:
-        os.remove(snapshot_path(repo))
+        os.utime(snapshot_path(repo), (0, 0))
     except OSError:
         pass
+
+
+def budget_path(repo: str) -> str:
+    return os.path.join(cache_dir(repo), "budget.json")
+
+
+def load_budget(repo: str) -> Dict[str, Any]:
+    """The last GitHub API budget reading per resource (budget.py), shared by every agent
+    on the machine: {"core": {"remaining", "limit", "reset", "at"}, "graphql": {…}}."""
+    data = _read(budget_path(repo))
+    return data if isinstance(data, dict) else {}
+
+
+def store_budget(repo: str, readings: Dict[str, Any]) -> None:
+    _write(budget_path(repo), readings)
 
 
 def _cursor_path(repo: str, agent: str) -> str:
