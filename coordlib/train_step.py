@@ -260,7 +260,8 @@ class Step:
                 pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
             elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
-            elif payload.get("kind") == "train" and payload.get("event") == train.OVERTAKEN_EVENT:
+            elif payload.get("event") == train.OVERTAKEN_EVENT and self.own_record(comment, payload):
+                # Only the train's own: a forged record would give heavy its turn early.
                 pr["overtakenBy"] = payload.get("batch") or "?"
         pr["trainAddedBy"] = latest.get("agent")
         pr["heldNotices"] = held

@@ -1314,13 +1314,43 @@ class StepTests(unittest.TestCase):
     def test_a_new_train_add_gets_its_own_overtake(self):
         fake = FakeGitHub([], self.main)
         def record(kind, **fields):
-            return {"created_at": snapshot.iso(NOW), "body": marker.compose("x", dict(fields, kind=kind, pr=1))}
-        added, overtaken = record("train-add", head="a"), record("train", event="overtaken", batch="train/1")
+            return {"created_at": snapshot.iso(NOW), "user": {"login": train_step.BOT_NAME},
+                    "body": marker.compose("x", dict(fields, kind=kind, pr=1))}
+        added = record("train-add", head="a")
+        overtaken = record("train", event="overtaken", batch="train/1", agent=train_step.TRAIN_AGENT)
         for comments, expected in (([added, overtaken], "train/1"), ([added, overtaken, added], None), ([added], None)):
             fake.issue_comments[1] = comments
             pr = {"number": 1}
             self.step(fake).train_added(pr)
             self.assertEqual(pr["overtakenBy"], expected)
+
+    def test_only_the_trains_own_overtake_record_counts(self):
+        # Every agent posts as alex-bridges and can write any marker (own_record, #1037): a
+        # forged record must not give heavy its turn early, and the train's own must hold.
+        self.install_selector()
+        h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(HEAVY_PATH,)),
+                           ready_node(2, h2, "pr2", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        record = {"kind": "train", "v": 1, "event": train.OVERTAKEN_EVENT, "pr": 1, "batch": "train/forged"}
+        for agent, login in (("claude@Eidolon:wt", "alex-bridges"),          # another agent's marker
+                             (train_step.TRAIN_AGENT, "alex-bridges"),        # the train's name, not the bot
+                             ("claude@Eidolon:wt", train_step.BOT_NAME)):     # the bot, not the train's name
+            fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
+                                           "body": marker.compose("overtaken?", dict(record, agent=agent))})
+        self.step(fake).run()
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2], "no forged record gives heavy its turn")
+        self.assertEqual(fake.posted("overtaken"), [1], "the train records its own overtake")
+        # That light batch never lands; the train's own record still gives heavy the turn.
+        self.run_on(fake, name, tip, conclusion="timed_out")
+        self.step(fake).run()
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+        lines = self.step(fake, now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
 
     def test_the_overtake_is_recorded_before_the_batch_is_pushed(self):
         self.install_selector()
