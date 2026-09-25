@@ -1,4 +1,4 @@
-"""Command line: coord board | whoami | claim | release | send | inbox | ci | train | outage | conductor."""
+"""Command line: coord board | whoami | claim | release | send | inbox | ci | train | outage | conductor | token."""
 
 from __future__ import annotations
 
@@ -6,13 +6,28 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import budget, cache, identity, lease, marker, outage, render, review, snapshot, train, train_step
-from .gh import GitHub, GitHubError, NotFound
+from . import apptoken, budget, cache, identity, lease, marker, outage, render, review, snapshot, train, train_step
+from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
+
+# Commands that stay on Alex's identity (gh/keyring) in app mode:
+# - `train approve` and `train substitute-review` are attestations, not operations: they
+#   record that Alex approved, or that a named reviewer reviewed, a head.
+# - A hand-run `train step` moves and deletes branches, which needs Contents write, which
+#   the app deliberately lacks (in Actions app mode is off and the step uses GITHUB_TOKEN).
+# - The conductor (`conductor tick|status|pause|resume|escalate`): its tick lists the
+#   Actions runners (Administration read, which the app lacks), edits the lease and
+#   outage comments it posted as Alex, and gates its spending on Alex's budget.
+# coord has no command that creates a PR or replies in a review thread; if one is added
+# it belongs here, because review.is_bot counts an app reply as no answer to a Codex
+# finding.
+USER_IDENTITY = frozenset({"train approve", "train substitute-review", "train step", "conductor tick",
+                           "conductor status", "conductor pause", "conductor resume", "conductor escalate"})
 
 INBOX_DEFAULT_DAYS = 7
 DEFAULT_MAX_AGE = 60
@@ -28,6 +43,16 @@ class UsageError(Exception):
 
 class BudgetRefused(Exception):
     """The API budget guard refused; the message is the one line to print (exit EXIT_BUDGET)."""
+
+
+class AppRefused(Exception):
+    """App mode could not get a token and there is no cache to serve; the message is the
+    one line to print (exit EXIT_BACKEND). Nothing was sent as Alex."""
+
+
+def app_words(error: Exception) -> str:
+    """The cause of an app failure, and the deliberate override, in one line."""
+    return f"GitHub App token unavailable ({redact(str(error))}); nothing was sent as Alex ({apptoken.OVERRIDE})"
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -46,21 +71,33 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
     low = getattr(gh, "budget_low", None)
     if low:
         return snapshot_despite_budget(gh, low)
+    unavailable = getattr(gh, "app_unavailable", None)
+    if unavailable:
+        return snapshot_despite_budget(gh, unavailable, AppRefused)
     if max_age > 0:
         cached = cache.load_snapshot(gh.repo, max_age)
         if cached is not None and cached.get("schema") == 1:
             return cached
-    fresh = snapshot.build(gh)
+    try:
+        fresh = snapshot.build(gh)
+    except AppAuthError as error:
+        # A cache read (board, inbox, train status) serves the cached board; anything
+        # else (a claim's conflict check) must not act on a stale one, and refuses.
+        if not getattr(gh, "cache_read", False):
+            raise
+        gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+        return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
 
 
-def snapshot_despite_budget(gh: GitHub, low: str) -> Dict[str, Any]:
-    """The budget is below the read floor: the machine's cached snapshot at any age,
-    `--max-age` and `--fresh` notwithstanding, with a one-line warning; no API call."""
+def snapshot_despite_budget(gh: GitHub, low: str, refused: type = BudgetRefused) -> Dict[str, Any]:
+    """The budget is below the read floor, or the app has no token: the machine's cached
+    snapshot at any age, `--max-age` and `--fresh` notwithstanding, with a one-line
+    warning; no API call."""
     cached = cache.load_snapshot(gh.repo, float("inf"))
     if cached is None or cached.get("schema") != 1:
-        raise BudgetRefused(f"{low}; no cached snapshot on this machine to show")
+        raise refused(f"{low}; no cached snapshot on this machine to show")
     now = snapshot.now_utc()
     generated = review.parse_time(cached.get("generatedAt"))
     if generated is not None:
@@ -73,21 +110,25 @@ def snapshot_despite_budget(gh: GitHub, low: str) -> Dict[str, Any]:
 def gate(args: argparse.Namespace, gh: GitHub) -> Optional[int]:
     """The API budget guard, before a command spends anything (budget.py).
 
-    On the gh transport, which sees no headers, a reading older than
-    budget.PROBE_AFTER_SECONDS is refreshed with one probe call first. A LOW read runs
-    from the cache (`gh.budget_low`); a refusal returns EXIT_BUDGET. Ungated commands
-    (`send`, `whoami`, `train step`) are never checked and never probe.
+    The reading is the principal's this command spends: the app's in app mode (none yet
+    before the first token names the installation), else Alex's. On the gh transport,
+    which sees no headers, a reading older than budget.PROBE_AFTER_SECONDS is refreshed
+    with one probe call first; the app's calls are HTTPS and record their own. A LOW read
+    runs from the cache (`gh.budget_low`); a refusal returns EXIT_BUDGET. Ungated commands
+    (`send`, `whoami`, `train step`, `token status`) are never checked and never probe.
     """
     command = budget.command_name(args)
-    if command in budget.UNGATED:
-        return None
+    if command in budget.UNGATED or (command.startswith("token ") and gh.app is None):
+        return None  # a `token` command with app mode off refuses by itself, without a probe
     try:
         transport = gh.transport()
     except GitHubError:
         transport = None
-    if transport == "gh" and budget.needs_probe(cache.load_budget(gh.repo).get("core")):
+    principal = gh.principal()
+    if transport == "gh" and principal == budget.USER and budget.needs_probe(cache.load_budget(gh.repo).get("core")):
         gh.probe_budget()
-    verdict, message = budget.decision(command, budget.current(gh.repo))
+    reading = budget.current(gh.repo, principal=principal) if principal else None
+    verdict, message = budget.decision(command, reading)
     if verdict == budget.REFUSE:
         print(f"coord: {message}", file=sys.stderr)
         return EXIT_BUDGET
@@ -138,6 +179,8 @@ def find_or_create_mailbox(gh: GitHub) -> int:
             "name": snapshot.MAILBOX_LABEL, "color": "5319e7",
             "description": "coord: the shared mailbox issue for agent broadcasts",
         })
+    except AppAuthError:
+        raise  # no app token is not "the label exists"
     except GitHubError:
         pass  # already exists
     issue = gh.rest("repos/{repo}/issues", method="POST", body={
@@ -156,11 +199,30 @@ def find_or_create_mailbox(gh: GitHub) -> int:
 # MARK: - Commands
 
 
+def identity_words(gh: GitHub) -> str:
+    """Whose identity coord's calls use, and why. Reads the config and token cache only."""
+    mode = getattr(gh, "app_mode", None)
+    app = getattr(gh, "app", None)
+    if app is None:
+        why = f" ({mode.reason})" if mode is not None else ""
+        return f"Alex's gh/keyring login, or GH_TOKEN{why}"
+    login = ((getattr(app, "config", None) or {}).get("app_login")) or "the GitHub App"
+    installation = app.installation_id()
+    where = f"installation {installation}" if installation else "installation not yet known"
+    return (f"{login} ({where}) for reads and operational writes; Alex for "
+            + ", ".join(f"`{c}`" for c in sorted(USER_IDENTITY)))
+
+
+def budget_words(gh: GitHub) -> str:
+    """The budget line: the principal coord spends, and in app mode Alex's as well."""
+    return budget.header_words(gh.repo, principal=gh.principal() if getattr(gh, "app", None) is not None else budget.USER)
+
+
 def cmd_whoami(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     info = {"agent": me, "repo": gh.repo, "branch": identity.git_branch() or identity.detached_description(),
             "graphql": "no (REST only)" if snapshot.rest_only(gh) else "yes", "cacheDir": cache.cache_dir(gh.repo),
-            "apiBudget": budget.header_words(gh.repo)}
+            "githubIdentity": identity_words(gh), "apiBudget": budget_words(gh)}
     print(json.dumps(info, indent=2) if args.json else "\n".join(f"{k}: {v}" for k, v in info.items()))
     return EXIT_OK
 
@@ -171,12 +233,17 @@ def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
     unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
                            cache.load_seen_ids(gh.repo, me))
     # The budget as last read, not as stamped on a cached snapshot; it costs no call.
-    words = budget.header_words(gh.repo)
+    words = budget_words(gh)
     if args.json:
         out = {k: v for k, v in snap.items() if k != "claimComments"}
         out["me"] = me
         out["unreadDirectMessages"] = unread
-        out["apiBudget"] = {resource: budget.summary(gh.repo, resource) for resource in ("core", "graphql")}
+        principal = gh.principal() if getattr(gh, "app", None) is not None else budget.USER
+        out["apiBudget"] = {resource: budget.summary(gh.repo, resource, principal=principal) if principal else None
+                            for resource in ("core", "graphql")}
+        out["apiBudget"]["principal"] = principal
+        if principal != budget.USER:
+            out["apiBudget"]["user"] = {resource: budget.summary(gh.repo, resource) for resource in ("core", "graphql")}
         print(json.dumps(out, indent=2))
     elif args.brief:
         sys.stdout.write(render.brief(snap, me, unread, budget=words))
@@ -397,14 +464,25 @@ def inbox_items(
 
 def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
-    if getattr(gh, "budget_low", None):
-        # Reading comments costs calls; the snapshot already counts what is addressed to me.
-        snap = get_snapshot(gh, args.max_age)
-        unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
-                               cache.load_seen_ids(gh.repo, me))
-        print(f"inbox for {me}: {unread} new in that snapshot; run `coord inbox` after the reset to read them "
-              "(nothing was marked read)")
-        return EXIT_OK
+    if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
+        return inbox_from_snapshot(args, gh, me)
+    return inbox_read(args, gh, me)
+
+
+def inbox_from_snapshot(args: argparse.Namespace, gh: GitHub, me: str,
+                        snap: Optional[Dict[str, Any]] = None) -> int:
+    """Budget low, or no app token: count what the cached snapshot holds for `me`; reading
+    comments would cost calls. Nothing is marked read."""
+    snap = snap if snap is not None else get_snapshot(gh, args.max_age)
+    unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
+                           cache.load_seen_ids(gh.repo, me))
+    after = "after the reset" if getattr(gh, "budget_low", None) else "once the app token is back"
+    print(f"inbox for {me}: {unread} new in that snapshot; run `coord inbox` {after} to read them "
+          "(nothing was marked read)")
+    return EXIT_OK
+
+
+def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
     stored = None if (args.all or args.since) else cache.load_cursor(gh.repo, me)
     seen_ids = cache.load_seen_ids(gh.repo, me) if stored else []
     if args.since:
@@ -415,8 +493,14 @@ def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
         since = snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
     started = snapshot.now_utc()
     snap = get_snapshot(gh, args.max_age)
-    issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
-    review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
+    try:
+        issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
+        review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
+    except AppAuthError as error:
+        if not getattr(gh, "app_unavailable", None):  # get_snapshot served a fresh cache and said nothing
+            gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+            print(f"coord: {gh.app_unavailable}; counting from the cached snapshot", file=sys.stderr)
+        return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
     if args.json:
         print(json.dumps({"me": me, "since": snapshot.iso(since), "items": items}, indent=2))
@@ -454,7 +538,11 @@ def cmd_ci(args: argparse.Namespace, gh: GitHub) -> int:
         print(f"requested ci.yml lanes={args.lanes} on {ref}. Not reading the Tycho queue back: {low}.")
         return EXIT_OK
     cache.invalidate_snapshot(gh.repo)
-    runs = snapshot.fetch_runs(gh)
+    try:
+        runs = snapshot.fetch_runs(gh)
+    except AppAuthError as error:
+        print(f"requested ci.yml lanes={args.lanes} on {ref}. Not reading the Tycho queue back: {app_words(error)}.")
+        return EXIT_OK
     print(f"requested ci.yml lanes={args.lanes} on {ref}. Tycho now: "
           f"{len(runs['running'])} running, {len(runs['queued'])} queued (yours is among the queued once GitHub registers it).")
     return EXIT_OK
@@ -486,6 +574,8 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     cache.invalidate_snapshot(gh.repo)
     try:
         gh.dispatch_workflow("merge-train.yml", "main")
+    except AppAuthError:
+        raise
     except GitHubError:
         pass  # the workflow runs on its own schedule too; before it reaches main it cannot be dispatched
     state = "ready now" if verdict == train.READY else f"held until: {reason}"
@@ -539,11 +629,16 @@ def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, args.max_age)
     prs = {p["number"]: p for p in snap["prs"]}
-    low = getattr(gh, "budget_low", None)
+    low = getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None)
     # No trailing slash: the cloud proxy rejects `…/heads/train/` ("Request path could not
     # be canonicalized", probe 4). Without it GitHub also matches `training…`, so keep
     # only refs under refs/heads/train/. With the budget low the batch is not read at all.
-    refs = [] if low else gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
+    try:
+        refs = [] if low else gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
+    except AppAuthError as error:
+        low = gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        refs = []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
     for ref in refs:
@@ -564,7 +659,8 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     if args.json:
         print(json.dumps({"batches": None if low else batches, "queue": queue}, indent=2))
         return EXIT_OK
-    print("batch: " + ("not read (API budget low)" if low else "none" if not batches else ""))
+    why = "API budget low" if getattr(gh, "budget_low", None) else "GitHub App token unavailable"
+    print("batch: " + (f"not read ({why})" if low else "none" if not batches else ""))
     for batch in batches:
         run = batch["run"]
         state = "CI not started" if run is None else f"CI {run['status']}" + (
@@ -574,6 +670,66 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     for position, entry in enumerate(queue, start=1):
         print(f"  {position}. #{entry['pr']} {entry['verdict']}" + ("" if entry["verdict"] == train.READY else f": {entry['reason']}"))
     return EXIT_OK
+
+
+def cmd_token_status(args: argparse.Namespace, gh: GitHub) -> int:
+    """App mode and the cached tokens, from the config and the cache files. No call, no
+    Keychain read, and never a token."""
+    mode = getattr(gh, "app_mode", None) or apptoken.detect(gh.repo)
+    print(f"app mode: {'on' if mode.on else 'off'} ({mode.reason})")
+    if mode.error:
+        print(f"  every app call refuses: {redact(mode.error)}")
+    if mode.config:
+        print(f"app: {mode.config.get('app_login') or '?'} (client id {mode.config['client_id']}, "
+              f"installed on {mode.config['repo']})")
+    app = getattr(gh, "app", None)
+    if app is None and mode.config is not None:
+        app = apptoken.AppTokens(mode.config, apptoken.token_cache_dir(), gh.api)  # to read the cache only
+    if app is None:
+        return EXIT_OK
+    installation = app.installation_id()
+    print(f"installation: {installation or 'not yet known (no token minted)'}")
+    if getattr(app, "cache_dir", None):
+        print(f"token cache: {app.cache_dir}")
+    for kind in apptoken.KINDS:
+        info = app.describe(kind)
+        line = f"{kind} token: {info['state']}"
+        if info.get("expires_at"):
+            line += f"; expires {info['expires_at']}"
+            if info.get("minutes_left") is not None:
+                line += f" ({info['minutes_left']} min left)"
+        if info.get("permissions"):
+            line += "; permissions " + ", ".join(f"{k}:{v}" for k, v in sorted(info["permissions"].items()))
+        print(line)
+    if installation:
+        print(budget.header_words(gh.repo, principal=budget.app_principal(installation)))
+    return EXIT_OK
+
+
+def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
+    """Run a command with the app's token in ITS environment (GH_TOKEN) and nowhere else;
+    exit with its exit code. `read` unless the caller asks for `--kind ops` by name."""
+    command = list(args.cmd or [])
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        raise UsageError("name the command to run after --, e.g. `coord token exec -- gh pr list`")
+    if getattr(gh, "app", None) is None:
+        mode = getattr(gh, "app_mode", None) or apptoken.detect(gh.repo)
+        print(f"coord: app mode is off ({mode.reason}); `token exec` runs only on the app", file=sys.stderr)
+        return EXIT_USAGE
+    low = getattr(gh, "budget_low", None)
+    if low:
+        print(f"coord: {low}", file=sys.stderr)
+    token = gh.app.token(args.kind)  # AppAuthError: refused in run(), the command never starts
+    env = dict(os.environ)
+    env["GH_TOKEN"] = token
+    try:
+        result = subprocess.run(command, env=env)
+    except OSError as error:
+        print(f"coord: {command[0]}: {error.strerror}", file=sys.stderr)
+        return 127
+    return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
 def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
@@ -816,6 +972,18 @@ def parser() -> argparse.ArgumentParser:
     escalate = conductor_sub.add_parser("escalate", help="put something in front of Alex on the board (24 h)")
     escalate.add_argument("text")
     escalate.set_defaults(func=cmd_conductor_escalate)
+
+    token = sub.add_parser("token", help="the GitHub App's tokens: status, or run a command with one (never printed)")
+    token_sub = token.add_subparsers(dest="token_command", required=True)
+    token_status = token_sub.add_parser("status", help="app mode and why, the installation, each cached token's "
+                                                       "expiry and permissions (no call, no secret)")
+    token_status.set_defaults(func=cmd_token_status)
+    token_exec = token_sub.add_parser("exec", help="run a command with GH_TOKEN set to an app token in its "
+                                                   "environment only; exits with its exit code")
+    token_exec.add_argument("--kind", choices=apptoken.KINDS, default="read",
+                            help="read (default): every permission read-only; ops: coord's write token, only by name")
+    token_exec.add_argument("cmd", nargs=argparse.REMAINDER, help="-- then the command and its arguments")
+    token_exec.set_defaults(func=cmd_token_exec)
     return top
 
 
@@ -824,13 +992,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         gh = GitHub(args.repo)
     except GitHubError as error:
-        print(f"coord: GitHub error: {error}", file=sys.stderr)
+        print(f"coord: GitHub error: {redact(str(error))}", file=sys.stderr)
         return EXIT_BACKEND
+    attach_app(gh)
     return run(args, gh)
 
 
+def attach_app(gh: GitHub) -> None:
+    """App mode for this command (apptoken.detect): the token source goes on `gh`, so its
+    calls use the app. Nothing is minted here; the first call that needs a token does."""
+    mode = apptoken.detect(gh.repo)
+    gh.app_mode = mode
+    gh.app = apptoken.for_mode(mode, gh.api) if mode.on else None
+
+
 def run(args: argparse.Namespace, gh: GitHub) -> int:
-    """The budget guard, then the command, with every error mapped to its exit code."""
+    """The budget guard, then the command, with every error mapped to its exit code.
+
+    In app mode the USER_IDENTITY commands run on Alex's identity, by choice of command.
+    An app failure is never retried as Alex: reads that have a cache serve it
+    (`get_snapshot`), everything else refuses here, naming the cause and COORD_APP=off.
+    """
+    command = budget.command_name(args)
+    if getattr(gh, "app", None) is not None and command in USER_IDENTITY:
+        gh = gh.as_user()
+    gh.cache_read = command in budget.CACHE_READS  # type: ignore[attr-defined]
     try:
         refused = gate(args, gh)
         if refused is not None:
@@ -839,12 +1025,18 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
     except BudgetRefused as error:
         print(f"coord: {error}", file=sys.stderr)
         return EXIT_BUDGET
+    except AppRefused as error:
+        print(f"coord: {redact(str(error))}", file=sys.stderr)
+        return EXIT_BACKEND
     except UsageError as error:
         print(f"coord: {error}", file=sys.stderr)
         return EXIT_USAGE
+    except AppAuthError as error:
+        print(f"coord: {app_words(error)}; not running `coord {command}`", file=sys.stderr)
+        return EXIT_BACKEND
     except NotFound as error:
-        print(f"coord: not found: {error}", file=sys.stderr)
+        print(f"coord: not found: {redact(str(error))}", file=sys.stderr)
         return EXIT_NOT_FOUND
     except GitHubError as error:
-        print(f"coord: GitHub error: {error}", file=sys.stderr)
+        print(f"coord: GitHub error: {redact(str(error))}", file=sys.stderr)
         return EXIT_BACKEND

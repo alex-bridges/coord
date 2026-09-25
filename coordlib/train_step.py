@@ -34,7 +34,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 from . import marker, snapshot, train
-from .gh import GitHub, GitHubError, NotFound
+from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
 # The Actions train's agent id (COORD_AGENT in merge-train.yml). A step run by hand
@@ -693,5 +693,7 @@ def ensure_labels(gh: GitHub) -> None:
     for name, (color, description) in train.LABELS.items():
         try:
             gh.rest("repos/{repo}/labels", method="POST", body={"name": name, "color": color, "description": description})
+        except AppAuthError:
+            raise  # no app token is not "the label exists"
         except GitHubError:
             pass  # exists

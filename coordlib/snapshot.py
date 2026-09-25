@@ -23,7 +23,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from . import lease, marker, outage, review
-from .gh import GitHub, GitHubError, NotFound
+from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 CLAIM_WINDOW_DAYS = 14
 STALE_HOURS = 48
@@ -440,6 +440,8 @@ def with_rest_fallback(gh: GitHub, graphql_call: Callable[[], Any], rest_call: C
         return rest_call()
     try:
         return graphql_call()
+    except AppAuthError:
+        raise  # no app token: not a proxy's GraphQL refusal
     except GitHubError as error:
         message = str(error)
         if "403" in message and "graphql" in message.lower():
