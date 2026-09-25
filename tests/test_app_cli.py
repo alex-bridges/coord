@@ -123,6 +123,18 @@ class RoutingTests(AppCliTestCase):
         self.assertEqual(self.server.requests, [])
         self.assertEqual(self.security_calls(), [])
 
+    def test_a_missing_permission_is_named_in_the_error(self):
+        # The live check's first question: does issues:write cover a PR number? If GitHub
+        # says no, its X-Accepted-GitHub-Permissions header names what it wants.
+        self.keychain("key")
+        self.server.forbid_writes = "issues=write; pull_requests=write"
+        code, _, err = self.main(["send", "app check", "--on", "101"])
+        self.assertEqual(code, EXIT_BACKEND)
+        self.assertIn("HTTP 403", err)
+        self.assertIn("(accepted permissions: issues=write; pull_requests=write)", err)
+        self.assertEqual(self.runner.calls, [], "a refused app write is not retried as Alex")
+        self.assert_no_secret(err)
+
     def test_graphql_is_a_read_and_every_other_post_is_a_write(self):
         from coordlib.gh import token_kind
         self.assertEqual(token_kind("POST", "graphql"), "read")

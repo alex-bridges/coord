@@ -145,6 +145,7 @@ class FakeGitHub:
         self.reset = int(time.time()) + 1800
         self.used = 10
         self.prs: List[Dict[str, Any]] = [pr_node()]
+        self.forbid_writes = ""  # answer every write 403 with this X-Accepted-GitHub-Permissions
         self.lock = threading.Lock()
 
     # MARK: urlopen
@@ -164,6 +165,10 @@ class FakeGitHub:
             return self._app_call(method, path, bearer, body)
         if bearer not in self.tokens:
             raise self._error(url, 401, {"message": "Bad credentials"})
+        if self.forbid_writes and method != "GET" and path != "graphql":
+            # What GitHub answers a token that lacks the endpoint's permission.
+            raise self._error(url, 403, {"message": "Resource not accessible by integration"},
+                              {"X-Accepted-GitHub-Permissions": self.forbid_writes})
         return self._api_call(method, path, body)
 
     def _error(self, url: str, code: int, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None):
