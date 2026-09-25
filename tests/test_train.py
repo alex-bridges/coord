@@ -643,10 +643,32 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertEqual(fake.posted("ejected"), [1], "main red in Android does not excuse a red release gate")
 
-    def test_a_closed_batch_starts_the_next_step_and_a_build_does_not(self):
+    def test_a_build_never_self_wakes(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
-        fake, name, tip = self.build_batch([(1, h1)])  # build_batch clears `dispatched`
-        self.assertNotIn("merge-train.yml", [d[0] for d in fake.dispatched], "building never self-wakes")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.queue(fake, 1, h1, 20)
+        self.step(fake).run()
+        self.assertEqual([d[0] for d in fake.dispatched], ["ci.yml"], "only the batch's CI, never the next step")
+
+    def test_no_wake_when_the_batch_branch_cannot_be_deleted(self):
+        # The self-wake is bounded only because it needs a REAL close; a delete that keeps
+        # failing must not wake a step per wake.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="cancelled")
+        original = fake.rest
+        def rest(path, method="GET", body=None):
+            if method == "DELETE" and "/git/refs/heads/" in path:
+                from coordlib.gh import GitHubError
+                raise GitHubError("HTTP 502")
+            return original(path, method, body)
+        fake.rest = rest
+        self.step(fake).run()
+        self.assertNotIn("merge-train.yml", [d[0] for d in fake.dispatched])
+
+    def test_a_closed_batch_starts_the_next_step(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
         fake.jobs[77] = [{"name": "App-owned SwiftPM packages", "conclusion": "failure"},
                          {"name": "CI verdict", "conclusion": "failure"}]

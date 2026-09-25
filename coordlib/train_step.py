@@ -4,7 +4,8 @@ Each step reads the state from GitHub and git, does ONE thing, and exits; the
 workflow's concurrency group guarantees one step at a time. A step never waits on a
 gate: ci.yml's `wake-train` job dispatches the next step when a batch's CI has its
 verdict (GitHub's `workflow_run` does not fire for runs the Actions token dispatched),
-and a cron tick is the backstop. The one wait is `settle`: up to two minutes for a
+a step that closes a batch dispatches the next one (`wake_next`), and a cron tick is
+the backstop. The one wait is `settle`: up to two minutes for a
 batch run whose jobs have all finished to be marked completed. Holding a runner slot
 while a gate runs is exactly the waste #915 removed.
 
