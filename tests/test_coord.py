@@ -1216,6 +1216,34 @@ class InboxTests(unittest.TestCase):
         )
         self.assertEqual([i["on"] for i in got], [40, 50, 41])
 
+    def test_a_held_notice_reaches_the_prs_agent_and_any_conductor(self):
+        # #1034: the train's `held` record is not a `msg`, but it is addressed.
+        payload = {"kind": "train", "v": 1, "agent": "train@actions", "event": "held", "pr": 77,
+                   "head": "a" * 40, "hold": "ci-red", "to": [self.ME, "conductor@*"]}
+        held = self.comment(1, 77, 5, marker.compose("**Held in the merge train** …", payload))
+        since = NOW - dt.timedelta(minutes=100)
+        nobody = {"claims": [], "prs": []}
+        self.assertEqual([i["reason"] for i in self.items([held])], ["to you"])
+        conductor = cli.inbox_items([held], [], nobody, "conductor@Eidolon:main", since, "")
+        self.assertEqual([i["reason"] for i in conductor], ["to conductor@*"])
+        self.assertEqual(cli.inbox_items([held], [], nobody, "codex@Eidolon:other", since, ""), [])
+
+        # The board's unread count (what the session-start hook shows) counts it too.
+        class Fake:
+            owner, name, repo, calls = "o", "r", "o/r", 0
+
+            def graphql(self, query, variables=None):
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m"}},
+                                       "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                        "nodes": []}}}
+
+            def rest_paginated(self, path):
+                return [held] if path.startswith("repos/{repo}/issues/comments") else []
+
+        snap = snapshot.build(Fake(), NOW)
+        self.assertEqual(cli.unread_direct(snap, "conductor@Eidolon:main", None), 1)
+        self.assertEqual(cli.unread_direct(snap, "codex@Eidolon:other", None), 0)
+
 
 class TransportTests(unittest.TestCase):
     def test_paginated_pages_are_flattened_and_calls_counted(self):

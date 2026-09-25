@@ -8,6 +8,7 @@ machine is exercised end to end without the network.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import os
 import re
@@ -174,6 +175,9 @@ class FakeGitHub:
         self.reread_error = ""
         self.reread_main = ""
         self.calls = 0
+        self.fail_held = ""       # every POST of a `held` notice raises GitHubError(this)
+        self.fail_comment_reads = ""  # every read of a PR's comments raises GitHubError(this)
+        self.login = train_step.BOT_NAME  # who GitHub says posted what the step posts
 
     def graphql(self, query, variables=None):
         return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": self.main}},
@@ -193,11 +197,16 @@ class FakeGitHub:
             self.fail_writes -= 1
             from coordlib.gh import GitHubError
             raise GitHubError("HTTP 502 (injected)")
-        self.writes.append((method, path, body))
         match = re.search(r"issues/(\d+)/comments$", path)
+        if self.fail_held and method == "POST" and match \
+                and (marker.decode(body["body"]) or {}).get("event") == "held":
+            raise GitHubError(self.fail_held)
+        self.writes.append((method, path, body))
         if method == "POST" and match:
+            # GitHub names the token's user as the author: the bot for the Actions train,
+            # alex-bridges for a step run by hand (set `login`).
             self.issue_comments.setdefault(int(match.group(1)), []).append(
-                {"created_at": snapshot.iso(NOW), "body": body["body"]})
+                {"created_at": snapshot.iso(NOW), "body": body["body"], "user": {"login": self.login}})
         return {"html_url": "h"} if method == "POST" else None
 
     def rest_paginated(self, path):
@@ -216,6 +225,9 @@ class FakeGitHub:
             return [{"workflow_runs": self.branch_runs.get(branch, [])}]
         match = re.search(r"issues/(\d+)/comments", path)
         if match:
+            if self.fail_comment_reads:
+                from coordlib.gh import GitHubError
+                raise GitHubError(self.fail_comment_reads)
             return self.issue_comments.get(int(match.group(1)), [])
         raise AssertionError(f"unexpected paginated call {path}")
 
@@ -282,8 +294,8 @@ class StepTests(unittest.TestCase):
         log = sh(self.origin, "log", "--first-parent", "--max-count=10", f"--format={train.LOG_FORMAT}", name)
         return train.parse_batch(log, name)[1]
 
-    def step(self, fake, mode="live", now=None, sleep=None):
-        return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(),
+    def step(self, fake, mode="live", now=None, sleep=None, agent=train_step.TRAIN_AGENT):
+        return train_step.Step(fake, train_step.Git(self.clone), mode, now=now or snapshot.now_utc(), agent=agent,
                                log=lambda line: None, sleep=sleep or (lambda seconds: None))
 
     def queue(self, fake, number, head, minutes_ago):
@@ -724,6 +736,338 @@ class StepTests(unittest.TestCase):
         self.assertEqual(fake.dispatched, [], "just built: the dispatched run has not registered yet")
         self.step(fake, now=snapshot.now_utc() + dt.timedelta(minutes=30)).run()
         self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})])
+
+    # MARK: - Held notices (#1034)
+
+    AGENT = "claude-cloud@abc12345:INISA"
+    H1, H2 = "1" * 40, "2" * 40
+
+    def add(self, fake, number, head, minutes_ago, agent=AGENT):
+        """Append a train-add record, as `coord train add` does; earlier comments stay."""
+        payload = {"kind": "train-add", "pr": number, "head": head}
+        if agent:
+            payload["agent"] = agent
+        fake.issue_comments.setdefault(number, []).append(
+            {"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
+             "body": marker.compose("added", payload)})
+
+    def held(self, fake, number):
+        """The held notices on PR `number` as GitHub keeps them: [(payload, text)]."""
+        out = []
+        for comment in fake.issue_comments.get(number, []):
+            payload = marker.decode(comment["body"])
+            if payload and payload.get("kind") == "train" and payload.get("event") == "held":
+                out.append((payload, marker.strip(comment["body"])))
+        return out
+
+    def held_node(self, number, head, hold, *failing):
+        """A queued PR node held for `hold` (one of train.HOLD_CLASSES, from eligibility)."""
+        labels = ("train", "needs-alex") if hold == train.HOLD_NEEDS_ALEX else ("train",)
+        node = ready_node(number, head, f"pr{number}", labels=labels)
+        if hold == train.HOLD_NO_REVIEW:
+            node["reactions"] = {"nodes": []}
+        elif hold == train.HOLD_DRAFT:
+            node["isDraft"] = True
+        elif hold == train.HOLD_CI_RED:
+            node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = (
+                [check("CI verdict")] + [check(name, conclusion="FAILURE") for name in failing or ("Android",)])
+        elif hold == train.HOLD_UNANSWERED_FINDINGS:
+            node["reviewThreads"] = {"totalCount": 1, "nodes": [{"isResolved": False, "comments": {
+                "totalCount": 1, "nodes": [{"author": {"login": BOT}, "body": "P1: a finding"}]}}]}
+        elif hold == train.HOLD_PARTIAL_DATA:
+            node["reviewThreads"] = {"totalCount": 1, "nodes": [{"isResolved": True, "comments": {
+                "totalCount": 60, "nodes": [{"author": {"login": "alex-bridges"}, "body": "a long thread"}]}}]}
+        return node
+
+    def test_a_held_pr_is_told_once_addressed_to_its_agent_and_the_conductor(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX),
+                           self.held_node(2, self.H2, train.HOLD_CI_RED)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.add(fake, 2, self.H2, 20, agent=None)  # a record from before train-add named its agent
+        self.step(fake).run()
+        self.assertEqual(sorted(fake.posted("held")), [1, 2], "one comment per held PR, no more")
+        [(payload, text)] = self.held(fake, 1)
+        self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
+        self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
+        self.assertIn("waits for Alex", text, "the reason")
+        self.assertIn("coord train approve 1", text, "the action that clears it")
+        [(payload, _)] = self.held(fake, 2)
+        self.assertEqual(payload["to"], ["conductor@*"], "no agent on record: the conductor still hears")
+
+    def test_the_same_hold_is_never_told_twice_not_even_after_a_restart(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [], "the next step, same state")
+        # A new runner: new objects, nothing carried over but what GitHub keeps.
+        restarted = FakeGitHub(copy.deepcopy(fake.nodes), self.main)
+        restarted.issue_comments = copy.deepcopy(fake.issue_comments)
+        self.step(restarted, now=snapshot.now_utc() + dt.timedelta(days=1)).run()
+        self.assertEqual(restarted.posted("held"), [], "read back from the PR's comments")
+        self.assertEqual(len(self.held(restarted, 1)), 1)
+
+    def test_a_new_head_is_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        # The worker pushes and adds the new head: still needs-alex, at a head Alex has not seen.
+        fake.nodes = [self.held_node(1, self.H2, train.HOLD_NEEDS_ALEX)]
+        self.add(fake, 1, self.H2, 10)
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)],
+                         [(self.H1, "needs-alex"), (self.H2, "needs-alex")])
+
+    def test_a_different_hold_at_the_same_head_is_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NO_REVIEW)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        fake.nodes = [self.held_node(1, self.H1, train.HOLD_CI_RED)]  # Codex 👍 arrives; CI is red
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)],
+                         [(self.H1, "no-review"), (self.H1, "ci-red")])
+
+    def test_only_holds_alex_must_clear_mention_him(self):
+        holds = [train.HOLD_NEEDS_ALEX, train.HOLD_PARTIAL_DATA, train.HOLD_CI_RED, train.HOLD_NO_REVIEW,
+                 train.HOLD_DRAFT, train.HOLD_UNANSWERED_FINDINGS]
+        fake = FakeGitHub([self.held_node(n, str(n) * 40, hold) for n, hold in enumerate(holds, start=1)], self.main)
+        for number in range(1, len(holds) + 1):
+            self.add(fake, number, str(number) * 40, 30 - number)
+        self.step(fake).run()
+        for number, hold in enumerate(holds, start=1):
+            [(payload, text)] = self.held(fake, number)
+            self.assertEqual(payload["hold"], hold)
+            self.assertEqual("@alex-bridges" in text, hold in train.OWNER_HOLDS, hold)
+        self.assertEqual(train.OWNER_HOLDS, {"needs-alex", "partial-data"})
+
+    def test_new_wording_or_a_later_step_is_not_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_CI_RED, "Android")], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        # A second check fails at the same head: the reason's text changes, its class does not.
+        fake.nodes = [self.held_node(1, self.H1, train.HOLD_CI_RED, "Android", "Linux plugin probe (x86_64)")]
+        lines = self.step(fake, now=snapshot.now_utc() + dt.timedelta(hours=3)).run()
+        self.assertTrue(any("Android, Linux plugin probe" in line for line in lines), lines)
+        self.assertEqual([p["hold"] for p, _ in self.held(fake, 1)], ["ci-red"])
+        # needs-alex in its other wording (an approval of an older head) is the same hold.
+        stale = self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)
+        fake.nodes = [stale]
+        self.add(fake, 2, self.H2, 20)
+        self.step(fake).run()
+        stale["labels"]["nodes"].append({"name": "alex-approved"})
+        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "body": marker.compose(
+            "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
+        lines = self.step(fake).run()
+        self.assertTrue(any("does not name the current head" in line for line in lines), lines)
+        self.assertEqual([p["hold"] for p, _ in self.held(fake, 2)], ["needs-alex"])
+
+    def test_every_eligibility_hold_has_a_class_and_an_action(self):
+        for hold in train.HOLD_CLASSES:
+            self.assertIn(hold, train.HOLD_ACTIONS)
+        base = snapshot.summarize_pr(ready_node(1, "a" * 40, "b"))
+        cases = [(dict(base, isDraft=True), "draft"), (dict(base, incomplete=["x"]), "partial-data"),
+                 (dict(base, labels=["train", "needs-alex"]), "needs-alex"),
+                 (dict(base, codex={"reviewing": True}), "no-review"),
+                 (dict(base, codex={}), "no-review"),
+                 (dict(base, codex={}, labels=["train", "codex-unavailable"]), "no-review"),
+                 (dict(base, unansweredFindings=1), "unanswered-findings"),
+                 (dict(base, ci={"failing": ["Android"]}), "ci-red")]
+        for pr, hold in cases:
+            verdict, got, reason = train.assess(pr)
+            self.assertEqual((verdict, got), (train.HOLD, hold), reason)
+            self.assertEqual(train.eligibility(pr), (verdict, reason))
+        self.assertEqual(train.assess(base), (train.READY, "", "ready"))
+
+    def test_a_conflict_found_while_building_is_told(self):
+        h1 = self.pr_branch(1, "a.txt", "line 1\nONE\nline 3\n")
+        h2 = self.pr_branch(2, "a.txt", "line 1\nTWO\nline 3\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1"), ready_node(2, h2, "pr2")], self.main)
+        self.add(fake, 1, h1, 20)
+        self.add(fake, 2, h2, 10)
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"], p["to"]) for p, _ in self.held(fake, 2)],
+                         [(h2, "conflict", [self.AGENT, "conductor@*"])])
+        self.assertEqual(self.held(fake, 1), [])
+
+    def test_a_head_that_moves_while_building_is_told_once(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.add(fake, 1, h1, 20)
+        sh(self.work, "checkout", "-q", "pr1")
+        self.write("c.txt", "c, pushed again\n")
+        moved = self.commit("pr 1, a later push")
+        sh(self.work, "push", "-q", "-f", "origin", f"HEAD:refs/pull/1/head")
+        sh(self.work, "checkout", "-q", "main")
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)], [(moved, "head-moved")])
+
+    def test_only_the_trains_own_held_record_counts_as_told(self):
+        # Every agent posts as alex-bridges and can write any marker (review of #1037).
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        record = {"kind": "train", "v": 1, "event": "held", "pr": 1, "head": self.H1, "hold": "needs-alex"}
+        forged = [(dict(record, agent="claude@Eidolon:wt"), "alex-bridges"),  # another agent's marker
+                  (dict(record, agent="train@actions"), "alex-bridges"),      # the train's name, not the bot
+                  (dict(record, agent="claude@Eidolon:wt"), train_step.BOT_NAME)]
+        for payload, login in forged:
+            fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
+                                           "body": marker.compose("held?", payload)})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1], "none of those is the train's own notice")
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [], "the train's own one is")
+
+    def test_only_the_trains_own_receipt_stops_a_second_receipt(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+                                       "body": marker.compose("merged?", {"kind": "train", "agent": "train@actions",
+                                                                         "event": "merged", "pr": 1, "batch": name})})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("merged"), [1])
+
+    HAND = "claude@Eidolon:INISA"  # `coord train step` run by hand: posts as alex-bridges under its own id
+
+    def test_hand_runs_never_repeat_what_the_actions_train_said(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1])
+        fake.writes.clear()
+        fake.login = "alex-bridges"
+        self.step(fake, agent=self.HAND).run()
+        self.step(fake, agent=self.HAND).run()
+        self.assertEqual(fake.posted("held"), [], "two hand runs after the Actions train")
+
+    def test_the_actions_train_repeats_a_hand_runs_notice_at_most_once(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        fake.login = "alex-bridges"
+        self.step(fake, agent=self.HAND).run()
+        self.step(fake, agent=self.HAND).run()
+        self.assertEqual(fake.posted("held"), [1], "a hand run counts its own notice")
+        fake.writes.clear()
+        fake.login = train_step.BOT_NAME
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1], "the Actions train: once, then its own counts")
+        self.assertEqual([p["agent"] for p, _ in self.held(fake, 1)], [self.HAND, "train@actions"])
+
+    def test_hand_runs_never_repeat_their_own_receipt(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.login = "alex-bridges"
+        self.step(fake, mode="dry-run", agent=self.HAND).run()
+        self.step(fake, mode="dry-run", agent=self.HAND).run()  # the batch branch is still there
+        self.assertEqual(fake.posted("green-dry-run"), [1])
+
+    def test_a_train_marker_from_another_login_never_silences_the_actions_train(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+                                       "body": marker.compose("held?", {
+                                           "kind": "train", "agent": "train@actions", "event": "held", "pr": 1,
+                                           "head": self.H1, "hold": "needs-alex"})})
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [1])
+
+    # Errors the Actions token's REST calls raise (gh.py turns each into GitHubError).
+    NOTICE_FAILURES = [
+        "HTTP 403 POST https://api.github.com/repos/o/r/issues/2/comments: You have exceeded a secondary rate limit. "
+        "Please wait a few minutes before you try again.",
+        "HTTP 403 POST https://api.github.com/repos/o/r/issues/2/comments: API rate limit exceeded for installation ID 1.",
+        "HTTP 502 POST https://api.github.com/repos/o/r/issues/2/comments: Bad Gateway",
+        "POST https://api.github.com/repos/o/r/issues/2/comments: The read operation timed out",
+    ]
+
+    def drop_batches(self):
+        for ref in sh(self.origin, "for-each-ref", "--format=%(refname)", "refs/heads/train/").splitlines():
+            sh(self.origin, "update-ref", "-d", ref)
+
+    def test_a_failed_notice_never_changes_what_build_decides(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in self.NOTICE_FAILURES:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake = FakeGitHub([ready_node(1, h1, "pr1"), self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)],
+                                  self.main)
+                self.add(fake, 1, h1, 30)
+                self.add(fake, 2, self.H2, 20)
+                fake.fail_held = error
+                lines = self.step(fake).run()
+                name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+                self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
+                self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})], "dispatched once")
+                self.assertEqual(fake.posted("testing"), [1])
+                self.assertEqual(self.held(fake, 2), [])
+                self.assertTrue(any("could not post the held notice" in line for line in lines), lines)
+
+    def test_a_failed_notice_never_changes_what_advance_decides(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in self.NOTICE_FAILURES:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake, name, tip = self.build_batch([(1, h1)])
+                self.run_on(fake, name, tip, conclusion="success")
+                fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+                fake.fail_held = error
+                lines = self.step(fake).run()
+                self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+                self.assertEqual(self.held(fake, 1), [])
+
+    def test_a_failed_read_for_the_notice_never_stops_the_rebuild(self):
+        # The head-moved member arrives fresh from open_prs(), so notify_held reads its
+        # comments itself; that read failing must not skip deleting the batch.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        for error in [failure.replace("POST", "GET") for failure in self.NOTICE_FAILURES]:
+            with self.subTest(error=error):
+                self.drop_batches()
+                fake, name, tip = self.build_batch([(1, h1)])
+                self.run_on(fake, name, tip, conclusion="success")
+                fake.nodes[0]["headRefOid"] = "f" * 40
+                fake.fail_comment_reads = error
+                lines = self.step(fake).run()
+                self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+                self.assertTrue(any("could not post the held notice" in line for line in lines), lines)
+
+    def test_advance_deletes_the_batch_before_it_notifies(self):
+        # Whatever a notice does, even fail in a way nobody catches, the rebuild is done.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+        original = fake.rest
+
+        def rest(path, method="GET", body=None):
+            if method == "POST" and (marker.decode((body or {}).get("body")) or {}).get("event") == "held":
+                raise KeyError("an unexpected failure")
+            return original(path, method, body)
+
+        fake.rest = rest
+        with self.assertRaises(KeyError):
+            self.step(fake).run()
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_a_green_batch_member_that_is_no_longer_ready_is_told(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]  # labelled during the batch's CI
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+        [(payload, text)] = self.held(fake, 1)
+        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["conductor@*"]))
+        self.assertIn("@alex-bridges", text)
 
 
 if __name__ == "__main__":

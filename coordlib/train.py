@@ -51,6 +51,46 @@ DAILY_RUNS_DEFAULT = 12
 
 READY, HOLD, DROP = "ready", "hold", "drop"
 
+# Why a queued PR is held: a fixed set. The train's `held` notice (#1034) is keyed on
+# (PR, head, class), never on the reason's wording, which changes from step to step
+# (the failing checks it lists, the number of findings).
+HOLD_DRAFT = "draft"
+HOLD_PARTIAL_DATA = "partial-data"
+HOLD_NEEDS_ALEX = "needs-alex"
+HOLD_NO_REVIEW = "no-review"  # no Codex 👍 at the head, Codex re-reviewing, no substitute review of the head
+HOLD_UNANSWERED_FINDINGS = "unanswered-findings"
+HOLD_CI_RED = "ci-red"
+HOLD_HEAD_MOVED = "head-moved"  # the step's own checks, not eligibility: the head moved under a batch
+HOLD_CONFLICT = "conflict"      # the step's own checks: `git merge-tree` found a conflict
+HOLD_CLASSES = (HOLD_DRAFT, HOLD_PARTIAL_DATA, HOLD_NEEDS_ALEX, HOLD_NO_REVIEW, HOLD_UNANSWERED_FINDINGS,
+                HOLD_CI_RED, HOLD_HEAD_MOVED, HOLD_CONFLICT)
+# Holds only Alex can clear: an approval of the head, or (the train never merges a PR it
+# cannot read whole) a hand merge. Their notice @-mentions him, so it reaches his GitHub
+# notifications even when no agent is running.
+OWNER_HOLDS = frozenset({HOLD_NEEDS_ALEX, HOLD_PARTIAL_DATA})
+OWNER_MENTION = "@alex-bridges"
+# Every held notice also goes to the conductor, whichever session that is.
+CONDUCTOR = "conductor@*"
+# What clears each hold; `{pr}` is the PR number.
+HOLD_ACTIONS = {
+    HOLD_DRAFT: "Mark it ready for review, or take it out with `Tools/coord/coord train remove {pr}`.",
+    HOLD_PARTIAL_DATA: ("The train never merges a PR it cannot read whole, so this one stays held at this head. "
+                        "Alex decides: merge it by hand, or take it out of the train."),
+    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} --note \"…\"`, or tell an "
+                      "agent to), or take it out of the train. A new push needs a new approval."),
+    HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head. If Codex is out of quota, a substitute review of this "
+                     "head, recorded with `Tools/coord/coord train substitute-review {pr} --note \"…\"`, stands in."),
+    HOLD_UNANSWERED_FINDINGS: ("Answer every finding on the PR. If answering means a push, add the new head "
+                               "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
+    HOLD_CI_RED: ("Fix the failing checks, or re-run them if they flaked. A fix is a new push: add the new head "
+                  "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
+    HOLD_HEAD_MOVED: ("The train takes it out at its next step. Add the new head again with "
+                      "`Tools/coord/coord train add {pr}` once it is reviewed."),
+    HOLD_CONFLICT: ("If it conflicts with main, merge main into it (or rebase) and add it again with "
+                    "`Tools/coord/coord train add {pr}`. If it conflicts only with a PR ahead of it in the batch, "
+                    "it waits for the next batch."),
+}
+
 LABELS = {
     TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
     SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
@@ -66,53 +106,61 @@ def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
 
     `all_files` is the complete file list when the summary's list was truncated.
     """
+    verdict, _, reason = assess(pr, head_at_add, all_files)
+    return verdict, reason
+
+
+def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
+           all_files: Optional[Sequence[str]] = None) -> Tuple[str, str, str]:
+    """(verdict, hold class, reason): `eligibility` plus, for a HOLD, which of
+    HOLD_CLASSES it is ("" for READY and DROP)."""
     files = list(all_files) if all_files is not None else pr.get("files", [])
     labels = set(pr.get("labels", []))
     if pr.get("base") != "main":
-        return DROP, f"its base is {pr.get('base')}, not main"
+        return DROP, "", f"its base is {pr.get('base')}, not main"
     if pr.get("fromFork"):
-        return DROP, "it comes from a fork; the train only builds same-repository branches on Tycho"
+        return DROP, "", "it comes from a fork; the train only builds same-repository branches on Tycho"
     if head_at_add and head_at_add != pr.get("head"):
-        return DROP, (f"its head moved from {head_at_add[:9]} to {str(pr.get('head'))[:9]} after it was added; "
-                      "add it again once the new head is reviewed")
+        return DROP, "", (f"its head moved from {head_at_add[:9]} to {str(pr.get('head'))[:9]} after it was added; "
+                          "add it again once the new head is reviewed")
     touched = [f for f in files if f.startswith(WORKFLOW_DIR)]
     if touched:
-        return DROP, (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
-                      "so this PR is merged by hand")
+        return DROP, "", (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
+                          "so this PR is merged by hand")
     if pr.get("mergeable") == "CONFLICTING":
-        return DROP, "it conflicts with main; merge main into it (or rebase) and add it again"
+        return DROP, "", "it conflicts with main; merge main into it (or rebase) and add it again"
     if pr.get("isDraft"):
-        return HOLD, "it is a draft"
+        return HOLD, HOLD_DRAFT, "it is a draft"
     if pr.get("incomplete"):
-        return HOLD, ("GitHub returned only part of its " + ", ".join(pr["incomplete"])
-                      + "; the train does not decide on partial data")
+        return HOLD, HOLD_PARTIAL_DATA, ("GitHub returned only part of its " + ", ".join(pr["incomplete"])
+                                         + "; the train does not decide on partial data")
     if NEEDS_ALEX_LABEL in labels:
         # Alex's approval covers the head he approved, not later pushes: labels persist
         # across pushes (substitute review of #989, P1). `coord train approve` records it.
         if ALEX_APPROVED_LABEL not in labels:
-            return HOLD, "it is labelled needs-alex and waits for Alex (`coord train approve`)"
+            return HOLD, HOLD_NEEDS_ALEX, "it is labelled needs-alex and waits for Alex (`coord train approve`)"
         if pr.get("alexApprovedHead") != pr.get("head"):
-            return HOLD, (f"alex-approved does not name the current head {str(pr.get('head'))[:9]}; "
-                          "Alex's approval covers only the head he approved")
+            return HOLD, HOLD_NEEDS_ALEX, (f"alex-approved does not name the current head {str(pr.get('head'))[:9]}; "
+                                           "Alex's approval covers only the head he approved")
     codex = pr.get("codex") or {}
     if codex.get("reviewing"):
-        return HOLD, "Codex is re-reviewing it"
+        return HOLD, HOLD_NO_REVIEW, "Codex is re-reviewing it"
     if not codex.get("approved"):
         if CODEX_UNAVAILABLE_LABEL not in labels:
-            return HOLD, "no Codex 👍 on its current head"
+            return HOLD, HOLD_NO_REVIEW, "no Codex 👍 on its current head"
         # The label persists across pushes; the substitute review covers one head only,
         # the one its `review-substitute` comment names (Codex P1 on #989).
         reviewed = pr.get("substituteReviewHead")
         if reviewed != pr.get("head"):
-            return HOLD, ("codex-unavailable is set, but no substitute review names the current head "
-                          f"{str(pr.get('head'))[:9]} (`coord train substitute-review {pr.get('number')}`)")
+            return HOLD, HOLD_NO_REVIEW, ("codex-unavailable is set, but no substitute review names the current head "
+                                          f"{str(pr.get('head'))[:9]} (`coord train substitute-review {pr.get('number')}`)")
     if pr.get("unansweredFindings"):
         count = pr["unansweredFindings"]
-        return HOLD, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")
+        return HOLD, HOLD_UNANSWERED_FINDINGS, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")
     failing = (pr.get("ci") or {}).get("failing") or []
     if failing:
-        return HOLD, "CI is red at its head: " + ", ".join(failing[:3])
-    return READY, "ready"
+        return HOLD, HOLD_CI_RED, "CI is red at its head: " + ", ".join(failing[:3])
+    return READY, "", "ready"
 
 
 def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],

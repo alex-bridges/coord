@@ -12,7 +12,8 @@ while a gate runs is exactly the waste #915 removed.
 State lives only in GitHub:
 - the queue: open PRs labelled `train`, ordered by their `train-add` comment;
 - the batch: the branch train/<stamp> (main + one --no-ff merge per PR);
-- the gate: the newest ci.yml run on that branch at its tip.
+- the gate: the newest ci.yml run on that branch at its tip;
+- who was told a queued PR is held: the train's own `held` comments on it (#1034).
 
 Modes: `dry-run` does everything except moving main (a green batch is reported
 and the PRs leave the queue); `live` fast-forwards main to the tested commit.
@@ -36,6 +37,9 @@ from . import marker, snapshot, train
 from .gh import GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
+# The Actions train's agent id (COORD_AGENT in merge-train.yml). A step run by hand
+# posts as alex-bridges under its own id.
+TRAIN_AGENT = "train@actions"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 DISPATCH_GRACE_MINUTES = 10
 # ci.yml's verdict job wakes the train as its last step, so the step can start before
@@ -72,7 +76,7 @@ class Git:
 
 class Step:
     def __init__(self, gh: GitHub, git: Git, mode: str, now: Optional[dt.datetime] = None,
-                 agent: str = "train@actions", log: Callable[[str], None] = print,
+                 agent: str = TRAIN_AGENT, log: Callable[[str], None] = print,
                  sleep: Callable[[float], None] = time.sleep):
         if mode not in ("dry-run", "live"):
             raise ValueError(f"mode must be dry-run or live, not {mode!r}")
@@ -236,10 +240,13 @@ class Step:
         return {node["number"]: snapshot.summarize_pr(node) for node in nodes}
 
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
-        """The newest train-add marker on the PR (when it joined, at which head). Also sets
-        on `pr` the heads its newest review-substitute and alex-approve comments name."""
+        """The newest train-add marker on the PR (when it joined, at which head, by whom).
+        Also sets on `pr` the heads its newest review-substitute and alex-approve comments
+        name, who added it (`trainAddedBy`), and the (head, hold class) of every `held`
+        notice the train has posted on it (`heldNotices`)."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
+        held = set()
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
             if not payload or payload.get("pr") != number:
@@ -248,7 +255,72 @@ class Step:
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
                 pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
+            elif payload.get("event") == "held" and self.own_record(comment, payload):
+                held.add((payload.get("head"), payload.get("hold")))
+        pr["trainAddedBy"] = latest.get("agent")
+        pr["heldNotices"] = held
         return latest
+
+    def own_record(self, comment: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        """Whether a `kind: train` record counts as already said (a held notice, a receipt).
+
+        (a) The Actions train's record: the marker names TRAIN_AGENT AND GitHub lists
+            github-actions[bot] as its author. Every agent posts as alex-bridges and can
+            write any marker, so neither half alone proves anything (review of #1037).
+        (b) On a hand run only (this step's agent is not TRAIN_AGENT): the run's own
+            earlier records, by marker agent, so hand runs repeat nothing either.
+            Never on the Actions train, where it would let a `train@actions` marker from
+            any login silence it again.
+
+        So a thing is said at most once by the Actions train and once per hand-run agent
+        id: the Actions train may repeat, once, what a hand run said first; a hand run
+        never repeats what the Actions train said.
+        """
+        if payload.get("kind") != "train":
+            return False
+        if payload.get("agent") == TRAIN_AGENT and (comment.get("user") or {}).get("login") == BOT_NAME:
+            return True
+        return self.agent != TRAIN_AGENT and payload.get("agent") == self.agent
+
+    def notify_held(self, pr: Dict[str, Any], head: str, hold: str, reason: str) -> None:
+        """Tell whoever is still responsible that a queued PR is held (#1034), once per
+        (PR, head, hold class), ever.
+
+        A worker stops at `train add`, so a hold nobody hears about sits in the queue
+        until someone happens to look. The notice goes to the agent that added the PR
+        and to the conductor (both see it in `coord inbox`); a hold only Alex can clear
+        (train.OWNER_HOLDS) also @-mentions him, which reaches his GitHub notifications
+        when no agent is running.
+
+        "Already told" is read from the train's own earlier `held` comments on the PR
+        (`own_record`; `train_added` collects them in the read it already makes, and
+        reads them here only for a PR it has not read yet), which live on GitHub: no
+        runner state, so a restart never repeats one. The key is the hold's CLASS, never
+        its wording (which names the failing checks, the count of findings) or the time.
+        A new head or a different class is a new notice.
+
+        Best effort: a notice never changes what the step decides. Any GitHub error,
+        reading or posting, is noted and the next step tries again; callers act on the
+        hold first and notify last.
+        """
+        number = pr["number"]
+        try:
+            if "heldNotices" not in pr:
+                self.train_added(pr)
+            if (head, hold) in pr["heldNotices"]:
+                return
+            to = list(dict.fromkeys(agent for agent in (pr.get("trainAddedBy"), train.CONDUCTOR) if agent))
+            text = (f"**Held in the merge train** at head `{head[:9]}`: {reason}.\n\n"
+                    + train.HOLD_ACTIONS[hold].format(pr=number) + "\n\n"
+                    + "To " + ", ".join(f"`{agent}`" for agent in to)
+                    + ". The train says this once per head and reason.")
+            if hold in train.OWNER_HOLDS:
+                text = f"{train.OWNER_MENTION}: this hold is yours to clear.\n\n" + text
+            self.comment(number, text, "held", head=head, hold=hold, reason=reason, to=to)
+        except GitHubError as error:
+            self.note(f"#{number}: could not post the held notice ({error}); the next step tries again")
+            return
+        pr["heldNotices"].add((head, hold))
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
         if not pr.get("filesTruncated"):
@@ -300,7 +372,7 @@ class Step:
     def already_posted(self, number: int, event: str, batch: str) -> bool:
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
-            if payload and payload.get("kind") == "train" and payload.get("event") == event \
+            if payload and self.own_record(comment, payload) and payload.get("event") == event \
                     and payload.get("batch") == batch:
                 return True
         return False
@@ -447,20 +519,25 @@ class Step:
             number = member["pr"]
             pr = prs.get(number)
             problem = None
+            hold, reason = "", ""
             if pr is None:
                 problem = "is no longer open"
             elif pr["head"] != member["sha"]:
                 problem = f"moved from {member['sha'][:9]} to {pr['head'][:9]}"
+                if train.TRAIN_LABEL in pr["labels"]:
+                    hold, reason = train.HOLD_HEAD_MOVED, f"its head moved from {member['sha'][:9]} to {pr['head'][:9]}"
             elif train.TRAIN_LABEL not in pr["labels"]:
                 problem = "was taken out of the train"
             else:
                 self.train_added(pr)  # refresh the substitute-review head for the final check
-                verdict, reason = train.eligibility(pr, all_files=self.all_files(pr))
+                verdict, hold, reason = train.assess(pr, all_files=self.all_files(pr))
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"
             if problem:
                 self.note(f"{name} ({numbers}): green, but #{number} {problem}; rebuilding without it")
-                self.delete_branch(name)
+                self.delete_branch(name)  # the decision first; the notice can never stop it
+                if hold:  # still queued and now held (a DROP is commented on by the next build)
+                    self.notify_held(pr, pr["head"], hold, reason)
                 return
         if self.mode == "live":
             try:
@@ -491,10 +568,12 @@ class Step:
             return
         entries = []
         verdicts = {}
+        holds = {}
         for pr in queued:
             added = self.train_added(pr)
             entries.append({"pr": pr["number"], "at": added.get("at") or "9999"})
-            verdicts[pr["number"]] = train.eligibility(pr, added.get("head"), self.all_files(pr))
+            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.all_files(pr))
+            verdicts[pr["number"]] = (verdict, reason)
         entries.sort(key=lambda e: (e["at"], e["pr"]))
         chosen = train.plan(entries, verdicts, {n: prs[n]["labels"] for n in verdicts})
         for number, reason in chosen["drops"]:
@@ -503,6 +582,7 @@ class Step:
             self.note(f"#{number} removed: {reason}")
         for number, reason in chosen["holds"]:
             self.note(f"#{number} held: {reason}")
+            self.notify_held(prs[number], prs[number]["head"], holds[number], reason)
         if not chosen["batch"]:
             self.note("nothing ready")
             return
@@ -526,11 +606,14 @@ class Step:
             head = self.git.out("rev-parse", f"refs/coord/pr/{number}")
             if head != pr["head"]:
                 self.note(f"#{number} held: its head changed while the batch was built")
+                self.notify_held(pr, head, train.HOLD_HEAD_MOVED,
+                                 f"its head moved from {pr['head'][:9]} to {head[:9]} while a batch was being built")
                 continue
             result = self.git.run("merge-tree", "--write-tree", "--no-messages", tip, head, check=False)
             if result.returncode == 1:
-                self.note(f"#{number} held: it does not merge cleanly on top of "
-                          f"{', '.join('#%d' % m for m in merged) or 'main'}")
+                reason = f"it does not merge cleanly on top of {', '.join('#%d' % m for m in merged) or 'main'}"
+                self.note(f"#{number} held: {reason}")
+                self.notify_held(pr, head, train.HOLD_CONFLICT, reason)
                 continue
             if result.returncode != 0:
                 raise GitError(f"git merge-tree: {result.stderr.strip()}")

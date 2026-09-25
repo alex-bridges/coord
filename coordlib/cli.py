@@ -115,7 +115,7 @@ def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_
         if payload.get("agent") == me:
             continue
         # `send --on N` addresses "#N": whoever works on N.
-        if not any(identity.matches(str(to), me) or str(to) in mine for to in payload.get("to") or []):
+        if not any(identity.matches(to, me) or to in mine for to in marker.recipients(payload)):
             continue
         if message.get("id") in seen:
             continue
@@ -352,8 +352,8 @@ def inbox_items(
         if payload is not None and payload.get("agent") == me:
             continue
         reason = None
-        if payload is not None and payload.get("kind") == "msg":
-            hits = [str(to) for to in payload.get("to") or [] if identity.matches(str(to), me)]
+        if payload is not None:
+            hits = [to for to in marker.recipients(payload) if identity.matches(to, me)]
             if hits:
                 reason = "to you" if any(h == me for h in hits) else f"to {hits[0]}"
         if reason is None and number in mine:
