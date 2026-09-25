@@ -24,13 +24,20 @@ AND again just before main moves — the `train` label is intent, not approval:
   migration and public API breaks carry `needs-alex` until Alex approves THE
   CURRENT HEAD (`coord train approve`, which records the head and adds
   `alex-approved`). Adding a PR to the train asserts it is not a carve-out.
+
+Order (Alex, 2026-09-25: bounded light priority): each ready PR is light or heavy by
+main's own CI lane selector (LaneClassifier). A batch never mixes the two, and while
+both are ready at most one light batch goes ahead of ready heavy work (plan).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import tempfile
+import types
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
@@ -163,22 +170,107 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     return READY, "", "ready"
 
 
+LIGHT, HEAVY = "light", "heavy"
+# The train comment (event) recording that a light batch went ahead of a heavy PR.
+OVERTAKEN_EVENT = "overtaken"
+LANE_SELECTOR = ".github/scripts/select-ci-lanes.py"
+LANE_RULES = ".github/ci-lanes.json"
+
+
+class _EveryApp:
+    """The app scope the classifier hands the selector. Which apps an `apps` hit builds
+    does not matter here: any app build is heavy. The real scope module needs a working
+    tree the train's clone does not have."""
+
+    @staticmethod
+    def scope_for_paths(root: Any, paths: Sequence[str]) -> Tuple[List[str], str]:
+        return ["(any app)"], "the train does not scope apps"
+
+
+class LaneClassifier:
+    """Light or heavy for a PR, by the CI lane selector itself: a PR is heavy when its
+    changed paths select any lane outside the selector's LIGHT_LANES, which includes a
+    change to CI infrastructure (the selector's `everything` rule). No second path map.
+
+    `show(path)` returns a file's text AT MAIN'S COMMIT (the step passes `git show
+    <main>:<path>`; the blob-less clone fetches the blob on demand), so a PR's own
+    selector is never executed. Any doubt is heavy, the selector's own rule: a selector
+    or rules file that will not load (`error`), an unknown or empty diff, or a failure
+    while selecting.
+    """
+
+    def __init__(self, show: Callable[[str], str]):
+        self.error: Optional[str] = None
+        try:
+            module = types.ModuleType("select_ci_lanes")
+            # Read at import (its REPO constant), used by nothing called here; absolute,
+            # so the process's working directory never matters.
+            module.__file__ = "/" + LANE_SELECTOR
+            exec(compile(show(LANE_SELECTOR), "main:" + LANE_SELECTOR, "exec"), module.__dict__)
+            with tempfile.TemporaryDirectory(prefix="coord-lanes-") as scratch:
+                rules_file = os.path.join(scratch, "ci-lanes.json")
+                with open(rules_file, "w") as handle:
+                    handle.write(show(LANE_RULES))
+                self.rules = module.load_rules(rules_file)
+            self.selector = module
+            self.light_lanes = tuple(module.LIGHT_LANES)
+        except Exception as error:  # noqa: BLE001 - any failure classifies everything heavy
+            self.error = f"main's lane selector did not load ({type(error).__name__}: {error})"
+
+    def classify(self, paths: Optional[Sequence[str]]) -> Tuple[str, str]:
+        """(LIGHT | HEAVY, reason) for a PR whose diff from main's merge base is `paths`
+        (None when it could not be established)."""
+        if self.error:
+            return HEAVY, self.error
+        if not paths:
+            return HEAVY, "its diff is unknown or empty"
+        try:
+            selection = self.selector.Selection([])
+            self.selector.select_for_paths(selection, list(paths), self.rules, None, _EveryApp)
+            lanes = [lane for lane, on in selection.lanes.items() if on]
+            heavy = [lane for lane in lanes if lane not in self.light_lanes]
+            if heavy:
+                return HEAVY, f"it selects {', '.join(heavy)} ({selection.why[heavy[0]]})"
+        except Exception as error:  # noqa: BLE001
+            return HEAVY, f"lane selection failed ({type(error).__name__}: {error})"
+        return LIGHT, "it selects " + (", ".join(lanes) if lanes else "no lane")
+
+
 def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],
-         labels: Dict[int, Sequence[str]], cap: int = BATCH_CAP) -> Dict[str, Any]:
+         labels: Dict[int, Sequence[str]], cap: int = BATCH_CAP,
+         classes: Optional[Dict[int, str]] = None, overtaken: Sequence[int] = ()) -> Dict[str, Any]:
     """Pick the next batch from the queue (already in train order).
 
     A PR labelled train:solo was in a red batch and is tested alone when it reaches
     the front; others are batched up to `cap`, skipping solo ones behind the front.
+
+    Bounded light priority (Alex, 2026-09-25). `classes` maps a ready PR to LIGHT or
+    HEAVY (LaneClassifier; a PR missing from it is heavy). A batch never mixes them.
+    With only one class ready the queue order decides, as it always has. With both
+    ready, a light batch goes first unless a ready heavy PR is in `overtaken` (a light
+    batch already went ahead of it: the step reads that from the PR's comments); then
+    heavy goes. `overtakes` names the oldest ready heavy PR a light batch goes ahead
+    of, for the step to record before it pushes the batch.
     """
     ready = [q["pr"] for q in queue if verdicts[q["pr"]][0] == READY]
+    candidates, overtakes = ready, None
+    if classes is not None:
+        light = [n for n in ready if classes.get(n) == LIGHT]
+        heavy = [n for n in ready if classes.get(n) != LIGHT]
+        if light and heavy:
+            if any(n in overtaken for n in heavy):
+                candidates = heavy
+            else:
+                candidates, overtakes = light, heavy[0]
     batch: List[int] = []
-    if ready:
-        if SOLO_LABEL in labels.get(ready[0], ()):
-            batch = [ready[0]]
+    if candidates:
+        if SOLO_LABEL in labels.get(candidates[0], ()):
+            batch = [candidates[0]]
         else:
-            batch = [n for n in ready if SOLO_LABEL not in labels.get(n, ())][:cap]
+            batch = [n for n in candidates if SOLO_LABEL not in labels.get(n, ())][:cap]
     return {
         "batch": batch,
+        "overtakes": overtakes,
         "drops": [(q["pr"], verdicts[q["pr"]][1]) for q in queue if verdicts[q["pr"]][0] == DROP],
         "holds": [(q["pr"], verdicts[q["pr"]][1]) for q in queue if verdicts[q["pr"]][0] == HOLD],
     }

@@ -242,21 +242,26 @@ class Step:
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
         """The newest train-add marker on the PR (when it joined, at which head, by whom).
         Also sets on `pr` the heads its newest review-substitute and alex-approve comments
-        name, who added it (`trainAddedBy`), and the (head, hold class) of every `held`
-        notice the train has posted on it (`heldNotices`)."""
+        name, who added it (`trainAddedBy`), the (head, hold class) of every `held`
+        notice the train has posted on it (`heldNotices`), and `overtakenBy`: the light
+        batch that went ahead of it since it joined, if any."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
         held = set()
+        pr["overtakenBy"] = None
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
             if not payload or payload.get("pr") != number:
                 continue
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
+                pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
                 pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
             elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
+            elif payload.get("kind") == "train" and payload.get("event") == train.OVERTAKEN_EVENT:
+                pr["overtakenBy"] = payload.get("batch") or "?"
         pr["trainAddedBy"] = latest.get("agent")
         pr["heldNotices"] = held
         return latest
@@ -326,6 +331,36 @@ class Step:
         if not pr.get("filesTruncated"):
             return None
         return [f["filename"] for f in self.gh.rest_paginated(f"repos/{{repo}}/pulls/{pr['number']}/files?per_page=100")]
+
+    def lane_classes(self, main: str, ready: List[Dict[str, Any]]) -> Dict[int, str]:
+        """LIGHT or HEAVY for each ready PR (train.LaneClassifier), judged by the lane
+        selector at `main`. Empty for fewer than two: one ready PR is the batch whatever
+        its class, and an empty map is the old order."""
+        if len(ready) < 2:
+            return {}
+        classifier = train.LaneClassifier(lambda path: self.git.run("show", f"{main}:{path}").stdout)
+        if classifier.error:
+            self.note(f"every ready PR counts as heavy: {classifier.error}")
+            return {}
+        classes = {}
+        for pr in ready:
+            kind, reason = classifier.classify(self.changed_paths(main, pr["number"], pr["head"]))
+            classes[pr["number"]] = kind
+            self.note(f"#{pr['number']} is {kind}: {reason}")
+        return classes
+
+    def changed_paths(self, main: str, number: int, head: str) -> Optional[List[str]]:
+        """The PR's changed paths as ci.yml's selector computes them (merge base with main
+        to head, both sides of a rename), or None when they cannot be established."""
+        try:
+            self.git.out("fetch", "--quiet", "origin", f"+refs/pull/{number}/head:refs/coord/pr/{number}")
+            if self.git.out("rev-parse", f"refs/coord/pr/{number}") != head:
+                return None
+            base = self.git.out("merge-base", main, head)
+            diff = self.git.run("diff", "--name-only", "--no-renames", "-z", base, head, "--").stdout
+        except (GitError, OSError, ValueError):
+            return None
+        return [path for path in diff.split("\0") if path]
 
     # MARK: - Step
 
@@ -575,7 +610,9 @@ class Step:
             verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.all_files(pr))
             verdicts[pr["number"]] = (verdict, reason)
         entries.sort(key=lambda e: (e["at"], e["pr"]))
-        chosen = train.plan(entries, verdicts, {n: prs[n]["labels"] for n in verdicts})
+        classes = self.lane_classes(main, [prs[n] for n in verdicts if verdicts[n][0] == train.READY])
+        chosen = train.plan(entries, verdicts, {n: prs[n]["labels"] for n in verdicts}, classes=classes,
+                            overtaken=[n for n in verdicts if prs[n].get("overtakenBy")])
         for number, reason in chosen["drops"]:
             self.remove_label(number, train.TRAIN_LABEL)
             self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason)
@@ -624,6 +661,16 @@ class Step:
         if not merged:
             self.note("nothing merged cleanly; no batch")
             return
+        if chosen["overtakes"]:
+            # Recorded BEFORE the push: a failure between the two can only give heavy work
+            # its turn early, never let a second light batch ahead. A comment, not a merge
+            # trailer: it holds whether or not this batch ever reaches main.
+            numbers = ", ".join(f"#{n}" for n in merged)
+            self.comment(chosen["overtakes"], (
+                f"Merge train: light batch `{name}` ({numbers}) goes ahead of this PR, whose changes select "
+                f"heavy CI lanes. At most one light batch goes ahead of ready heavy work; heavy goes next."
+            ), train.OVERTAKEN_EVENT, batch=name, members=merged)
+            self.note(f"{name}: light, ahead of heavy #{chosen['overtakes']} (its one overtake)")
         self.git.out("push", "--quiet", "origin", f"{tip}:refs/heads/{name}")
         self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
         numbers = ", ".join(f"#{n}" for n in merged)
