@@ -188,7 +188,7 @@ class NoFallbackTests(AppCliTestCase):
 
     FAILURES = ("keychain", "mint 401", "mint 403", "broken config")
 
-    def fail(self, how):
+    def break_app(self, how):
         os.environ["GH_TOKEN"] = USER_TOKEN  # a fallback would find it right here
         os.environ["GITHUB_TOKEN"] = USER_TOKEN
         self.server.tokens[USER_TOKEN] = "user"
@@ -211,7 +211,7 @@ class NoFallbackTests(AppCliTestCase):
                          ["send", "hi", "--on", "101"], ["train", "add", "101"], ["train", "remove", "101"],
                          ["ci", "mk4", "--ref", "feature/x"]):
                 with self.subTest(failure=how, argv=argv):
-                    self.fail(how)
+                    self.break_app(how)
                     code, out, err = self.main(argv)
                     self.assertEqual(code, EXIT_BACKEND, err)
                     self.assertIn("GitHub App token unavailable", err)
@@ -224,7 +224,7 @@ class NoFallbackTests(AppCliTestCase):
         for how in self.FAILURES:
             for argv in (["board"], ["board", "--fresh"], ["board", "--brief"], ["board", "--json"]):
                 with self.subTest(failure=how, argv=argv):
-                    self.fail(how)
+                    self.break_app(how)
                     code, out, err = self.main(argv)
                     self.assertEqual(code, EXIT_OK, err)
                     self.assertIn("GitHub App token unavailable", err)
@@ -237,7 +237,7 @@ class NoFallbackTests(AppCliTestCase):
         for how in self.FAILURES:
             for argv in (["board"], ["train", "status"], ["inbox"]):
                 with self.subTest(failure=how, argv=argv):
-                    self.fail(how)
+                    self.break_app(how)
                     code, out, err = self.main(argv)
                     self.assertEqual(code, EXIT_BACKEND)
                     self.assertIn("no cached snapshot on this machine to show", err)
@@ -246,7 +246,7 @@ class NoFallbackTests(AppCliTestCase):
 
     def test_inbox_and_train_status_read_the_cache(self):
         self.seed_snapshot()
-        self.fail("keychain")
+        self.break_app("keychain")
         code, out, err = self.main(["inbox"])
         self.assertEqual(code, EXIT_OK, err)
         self.assertIn("0 new in that snapshot; run `coord inbox` once the app token is back", out)
@@ -258,7 +258,7 @@ class NoFallbackTests(AppCliTestCase):
 
     def test_a_claim_never_acts_on_a_stale_board(self):
         self.seed_snapshot()
-        self.fail("keychain")
+        self.break_app("keychain")
         code, _, err = self.main(["claim", "55", "--branch", "feature/x"])
         self.assertEqual(code, EXIT_BACKEND)
         self.assertNotIn("showing the snapshot", err)
@@ -266,7 +266,7 @@ class NoFallbackTests(AppCliTestCase):
 
     def test_a_failure_between_the_two_tokens_posts_nothing(self):
         self.seed_token("read")  # reads work; the ops mint fails
-        self.fail("keychain")
+        self.break_app("keychain")
         code, _, err = self.main(["send", "hi"])
         self.assertEqual(code, EXIT_BACKEND, err)
         self.assertEqual(self.writes(), [], "not even the mailbox label")
@@ -275,7 +275,7 @@ class NoFallbackTests(AppCliTestCase):
 
     def test_token_exec_never_runs_its_command(self):
         marker = os.path.join(self.root, "ran")
-        self.fail("keychain")
+        self.break_app("keychain")
         code, _, err = self.main(["token", "exec", "--", "touch", marker])
         self.assertEqual(code, EXIT_BACKEND)
         self.assertFalse(os.path.exists(marker))
@@ -284,7 +284,7 @@ class NoFallbackTests(AppCliTestCase):
 
     def test_one_keychain_attempt_per_command(self):
         self.seed_snapshot()
-        self.fail("keychain")
+        self.break_app("keychain")
         self.main(["train", "status"])
         self.assertEqual(len(self.security_calls()), 1, "the failure is not retried within the command")
 
