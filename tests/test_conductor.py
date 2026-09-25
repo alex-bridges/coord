@@ -258,6 +258,8 @@ class FakeGitHub:
         self.runners = [{"name": "Tycho", "status": "online"}]
         self.next_id = 1000
         self.calls = []
+        self.dispatches = []
+        self.dispatch_error = None
 
     def transport(self):
         return "fake"
@@ -297,6 +299,11 @@ class FakeGitHub:
         if path.endswith("actions/runners?per_page=100"):
             return {"runners": self.runners}
         raise AssertionError(f"unexpected call {method} {path}")
+
+    def dispatch_workflow(self, workflow, ref, inputs=None):
+        if self.dispatch_error:
+            raise self.dispatch_error
+        self.dispatches.append((workflow, ref, inputs))
 
     def rest_paginated(self, path):
         self.calls.append(("GET", path))
@@ -462,6 +469,18 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(len(self.runs), 3)
         escalations = self.gh.records("conductor", "escalate")
         self.assertEqual(len(escalations), 1)
+        self.assertEqual([(w, ref, inputs["issue"]) for w, ref, inputs in self.gh.dispatches],
+                         [("notify-alex.yml", "main", "900")], "the escalation reaches Alex's phone")
+
+    def test_an_escalation_stands_when_notify_alex_cannot_be_dispatched(self):
+        self.gh.dispatch_error = conductor.GitHubError("HTTP 404 (not on main yet)")
+        self.tick(0)
+        self.message(1)
+        self.replies = [claude_result("boom", code=1, is_error=True)] * 3
+        for minutes in (5, 10, 15, 20):
+            lines = self.tick(minutes)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.assertTrue(any("board only" in line for line in lines))
 
     def test_1_a_standby_run_is_told_to_leave_the_inbox_and_its_cursor_is_not_adopted(self):
         leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",

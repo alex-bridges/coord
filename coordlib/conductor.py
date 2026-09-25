@@ -461,6 +461,20 @@ def post_record(gh: GitHub, issue: int, text: str, payload: Dict[str, Any]) -> D
     return gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(text, payload)})
 
 
+NOTIFY_WORKFLOW = "notify-alex.yml"
+
+
+def notify_alex(gh: GitHub, issue: int, text: str) -> bool:
+    """Put `text` on Alex's phone: the Notify Alex workflow @-mentions him as
+    github-actions[bot] (agents post as Alex, and GitHub does not notify you of your own
+    comments). Best effort: the board has the escalation either way."""
+    try:
+        gh.dispatch_workflow(NOTIFY_WORKFLOW, "main", {"issue": str(issue), "text": _clip(text, 1000)})
+        return True
+    except GitHubError:
+        return False
+
+
 def outage_text(until: dt.datetime, reason_text: str, agent: str) -> str:
     return (f"**Claude is out of usage** until {iso(until)} (reported by `{agent}`): {reason_text}\n\n"
             "Claude agents and the conductor are down. Codex and the merge train keep running. Claims do not go "
@@ -823,7 +837,11 @@ class Watcher:
 
     def escalate_text(self, text: str) -> None:
         self.say(f"escalating to Alex: {_clip(text, 120)}")
-        post_record(self.gh, self.issue, text, {"kind": "conductor", "v": 1, "event": "escalate", "agent": self.config.agent})
+        posted = post_record(self.gh, self.issue, text,
+                             {"kind": "conductor", "v": 1, "event": "escalate", "agent": self.config.agent})
+        link = (posted or {}).get("html_url") or ""
+        if not notify_alex(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
+            self.say("could not dispatch Notify Alex; the escalation is on the board only")
 
     # MARK: Self-update
 

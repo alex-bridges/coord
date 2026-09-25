@@ -687,10 +687,12 @@ def cmd_conductor_resume(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_conductor_escalate(args: argparse.Namespace, gh: GitHub) -> int:
     from . import conductor
     me = identity.agent_id()
-    posted = conductor.post_record(gh, conductor.conductor_issue(gh), args.text,
-                                   {"kind": "conductor", "v": 1, "event": "escalate", "agent": me})
+    issue = conductor.conductor_issue(gh)
+    posted = conductor.post_record(gh, issue, args.text, {"kind": "conductor", "v": 1, "event": "escalate", "agent": me})
     cache.invalidate_snapshot(gh.repo)
-    print(f"escalated to Alex (on the board for 24 h): {posted.get('html_url')}")
+    notified = conductor.notify_alex(gh, issue, f"{args.text} {posted.get('html_url')}")
+    print(f"escalated to Alex (on the board for 24 h" + (", and to his phone" if notified else
+          "; Notify Alex could not be dispatched") + f"): {posted.get('html_url')}")
     return EXIT_OK
 
 
