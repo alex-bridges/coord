@@ -771,7 +771,8 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
     )
     attach_substitute_reviews(prs, comments)
     claims = resolve_claims(comments, targets, prs, now)
-    messages = [c for c in comments if c["payload"].get("kind") == "msg"]
+    # A `send` message, or any other record addressed to someone (the train's held notice).
+    messages = [c for c in comments if c["payload"].get("kind") == "msg" or marker.recipients(c["payload"])]
     return {
         "schema": 1,
         "generatedAt": iso(now),

@@ -80,6 +80,14 @@ def decode(body: Optional[str]) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def recipients(payload: Dict[str, Any]) -> List[str]:
+    """The addresses a record is sent to (see identity.matches): a `send` message's `to`,
+    and the same field on any other record that notifies someone, such as the train's
+    `held` notice (#1034). `inbox` delivers a record by this, whatever its kind."""
+    to = payload.get("to")
+    return [str(address) for address in to] if isinstance(to, list) else []
+
+
 def compose(text: str, payload: Dict[str, Any]) -> str:
     """A comment body: the human-readable text, a blank line, then the marker."""
     return f"{text.rstrip()}\n\n{encode(payload)}\n"

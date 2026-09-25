@@ -8,6 +8,7 @@ machine is exercised end to end without the network.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import os
 import re
@@ -724,6 +725,186 @@ class StepTests(unittest.TestCase):
         self.assertEqual(fake.dispatched, [], "just built: the dispatched run has not registered yet")
         self.step(fake, now=snapshot.now_utc() + dt.timedelta(minutes=30)).run()
         self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})])
+
+    # MARK: - Held notices (#1034)
+
+    AGENT = "claude-cloud@abc12345:INISA"
+    H1, H2 = "1" * 40, "2" * 40
+
+    def add(self, fake, number, head, minutes_ago, agent=AGENT):
+        """Append a train-add record, as `coord train add` does; earlier comments stay."""
+        payload = {"kind": "train-add", "pr": number, "head": head}
+        if agent:
+            payload["agent"] = agent
+        fake.issue_comments.setdefault(number, []).append(
+            {"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
+             "body": marker.compose("added", payload)})
+
+    def held(self, fake, number):
+        """The held notices on PR `number` as GitHub keeps them: [(payload, text)]."""
+        out = []
+        for comment in fake.issue_comments.get(number, []):
+            payload = marker.decode(comment["body"])
+            if payload and payload.get("kind") == "train" and payload.get("event") == "held":
+                out.append((payload, marker.strip(comment["body"])))
+        return out
+
+    def held_node(self, number, head, hold, *failing):
+        """A queued PR node held for `hold` (one of train.HOLD_CLASSES, from eligibility)."""
+        labels = ("train", "needs-alex") if hold == train.HOLD_NEEDS_ALEX else ("train",)
+        node = ready_node(number, head, f"pr{number}", labels=labels)
+        if hold == train.HOLD_NO_REVIEW:
+            node["reactions"] = {"nodes": []}
+        elif hold == train.HOLD_DRAFT:
+            node["isDraft"] = True
+        elif hold == train.HOLD_CI_RED:
+            node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = (
+                [check("CI verdict")] + [check(name, conclusion="FAILURE") for name in failing or ("Android",)])
+        elif hold == train.HOLD_UNANSWERED_FINDINGS:
+            node["reviewThreads"] = {"totalCount": 1, "nodes": [{"isResolved": False, "comments": {
+                "totalCount": 1, "nodes": [{"author": {"login": BOT}, "body": "P1: a finding"}]}}]}
+        elif hold == train.HOLD_PARTIAL_DATA:
+            node["reviewThreads"] = {"totalCount": 1, "nodes": [{"isResolved": True, "comments": {
+                "totalCount": 60, "nodes": [{"author": {"login": "alex-bridges"}, "body": "a long thread"}]}}]}
+        return node
+
+    def test_a_held_pr_is_told_once_addressed_to_its_agent_and_the_conductor(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX),
+                           self.held_node(2, self.H2, train.HOLD_CI_RED)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.add(fake, 2, self.H2, 20, agent=None)  # a record from before train-add named its agent
+        self.step(fake).run()
+        self.assertEqual(sorted(fake.posted("held")), [1, 2], "one comment per held PR, no more")
+        [(payload, text)] = self.held(fake, 1)
+        self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
+        self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
+        self.assertIn("waits for Alex", text, "the reason")
+        self.assertIn("coord train approve 1", text, "the action that clears it")
+        [(payload, _)] = self.held(fake, 2)
+        self.assertEqual(payload["to"], ["conductor@*"], "no agent on record: the conductor still hears")
+
+    def test_the_same_hold_is_never_told_twice_not_even_after_a_restart(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("held"), [], "the next step, same state")
+        # A new runner: new objects, nothing carried over but what GitHub keeps.
+        restarted = FakeGitHub(copy.deepcopy(fake.nodes), self.main)
+        restarted.issue_comments = copy.deepcopy(fake.issue_comments)
+        self.step(restarted, now=snapshot.now_utc() + dt.timedelta(days=1)).run()
+        self.assertEqual(restarted.posted("held"), [], "read back from the PR's comments")
+        self.assertEqual(len(self.held(restarted, 1)), 1)
+
+    def test_a_new_head_is_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        # The worker pushes and adds the new head: still needs-alex, at a head Alex has not seen.
+        fake.nodes = [self.held_node(1, self.H2, train.HOLD_NEEDS_ALEX)]
+        self.add(fake, 1, self.H2, 10)
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)],
+                         [(self.H1, "needs-alex"), (self.H2, "needs-alex")])
+
+    def test_a_different_hold_at_the_same_head_is_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NO_REVIEW)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        fake.nodes = [self.held_node(1, self.H1, train.HOLD_CI_RED)]  # Codex 👍 arrives; CI is red
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)],
+                         [(self.H1, "no-review"), (self.H1, "ci-red")])
+
+    def test_only_holds_alex_must_clear_mention_him(self):
+        holds = [train.HOLD_NEEDS_ALEX, train.HOLD_PARTIAL_DATA, train.HOLD_CI_RED, train.HOLD_NO_REVIEW,
+                 train.HOLD_DRAFT, train.HOLD_UNANSWERED_FINDINGS]
+        fake = FakeGitHub([self.held_node(n, str(n) * 40, hold) for n, hold in enumerate(holds, start=1)], self.main)
+        for number in range(1, len(holds) + 1):
+            self.add(fake, number, str(number) * 40, 30 - number)
+        self.step(fake).run()
+        for number, hold in enumerate(holds, start=1):
+            [(payload, text)] = self.held(fake, number)
+            self.assertEqual(payload["hold"], hold)
+            self.assertEqual("@alex-bridges" in text, hold in train.OWNER_HOLDS, hold)
+        self.assertEqual(train.OWNER_HOLDS, {"needs-alex", "partial-data"})
+
+    def test_new_wording_or_a_later_step_is_not_a_new_notice(self):
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_CI_RED, "Android")], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.step(fake).run()
+        # A second check fails at the same head: the reason's text changes, its class does not.
+        fake.nodes = [self.held_node(1, self.H1, train.HOLD_CI_RED, "Android", "Linux plugin probe (x86_64)")]
+        lines = self.step(fake, now=snapshot.now_utc() + dt.timedelta(hours=3)).run()
+        self.assertTrue(any("Android, Linux plugin probe" in line for line in lines), lines)
+        self.assertEqual([p["hold"] for p, _ in self.held(fake, 1)], ["ci-red"])
+        # needs-alex in its other wording (an approval of an older head) is the same hold.
+        stale = self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)
+        fake.nodes = [stale]
+        self.add(fake, 2, self.H2, 20)
+        self.step(fake).run()
+        stale["labels"]["nodes"].append({"name": "alex-approved"})
+        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "body": marker.compose(
+            "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
+        lines = self.step(fake).run()
+        self.assertTrue(any("does not name the current head" in line for line in lines), lines)
+        self.assertEqual([p["hold"] for p, _ in self.held(fake, 2)], ["needs-alex"])
+
+    def test_every_eligibility_hold_has_a_class_and_an_action(self):
+        for hold in train.HOLD_CLASSES:
+            self.assertIn(hold, train.HOLD_ACTIONS)
+        base = snapshot.summarize_pr(ready_node(1, "a" * 40, "b"))
+        cases = [(dict(base, isDraft=True), "draft"), (dict(base, incomplete=["x"]), "partial-data"),
+                 (dict(base, labels=["train", "needs-alex"]), "needs-alex"),
+                 (dict(base, codex={"reviewing": True}), "no-review"),
+                 (dict(base, codex={}), "no-review"),
+                 (dict(base, codex={}, labels=["train", "codex-unavailable"]), "no-review"),
+                 (dict(base, unansweredFindings=1), "unanswered-findings"),
+                 (dict(base, ci={"failing": ["Android"]}), "ci-red")]
+        for pr, hold in cases:
+            verdict, got, reason = train.assess(pr)
+            self.assertEqual((verdict, got), (train.HOLD, hold), reason)
+            self.assertEqual(train.eligibility(pr), (verdict, reason))
+        self.assertEqual(train.assess(base), (train.READY, "", "ready"))
+
+    def test_a_conflict_found_while_building_is_told(self):
+        h1 = self.pr_branch(1, "a.txt", "line 1\nONE\nline 3\n")
+        h2 = self.pr_branch(2, "a.txt", "line 1\nTWO\nline 3\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1"), ready_node(2, h2, "pr2")], self.main)
+        self.add(fake, 1, h1, 20)
+        self.add(fake, 2, h2, 10)
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"], p["to"]) for p, _ in self.held(fake, 2)],
+                         [(h2, "conflict", [self.AGENT, "conductor@*"])])
+        self.assertEqual(self.held(fake, 1), [])
+
+    def test_a_head_that_moves_while_building_is_told_once(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.add(fake, 1, h1, 20)
+        sh(self.work, "checkout", "-q", "pr1")
+        self.write("c.txt", "c, pushed again\n")
+        moved = self.commit("pr 1, a later push")
+        sh(self.work, "push", "-q", "-f", "origin", f"HEAD:refs/pull/1/head")
+        sh(self.work, "checkout", "-q", "main")
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)], [(moved, "head-moved")])
+
+    def test_a_green_batch_member_that_is_no_longer_ready_is_told(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]  # labelled during the batch's CI
+        self.step(fake).run()
+        self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+        [(payload, text)] = self.held(fake, 1)
+        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["conductor@*"]))
+        self.assertIn("@alex-bridges", text)
 
 
 if __name__ == "__main__":
