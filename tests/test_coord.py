@@ -946,6 +946,29 @@ class NotRunGraphQLTests(unittest.TestCase):
         self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS] + [annotation_path(n) for n in range(100, 108)])
         self.assertEqual(len(fake.paths), snapshot.MAX_CHECK_RUN_READS)
 
+    def test_a_listing_without_the_refused_run_itself_is_broken_and_red(self):
+        # Empty (a mangled check_name), or only another check's runs: not evidence.
+        for listing in ([], [rest_run(30, "Android", "failure")]):
+            fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")],
+                             annotations={22: [BILLING_REFUSED], 30: [BILLING_REFUSED]},
+                             attempts={LINUX: listing})
+            ci = self.ci(fake)
+            self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []), listing)
+            self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS])
+
+    def test_a_cap_spent_before_the_listing_leaves_the_refusal_red(self):
+        # 9 real reds and 1 refusal: the refusal's own read is the 10th, so its listing
+        # finds the cap spent and the run must stay red.
+        reds = [self.run_node(n, f"real {n}", "FAILURE") for n in range(1, 10)]
+        fake = self.Fake(contexts=reds + [self.run_node(22, LINUX, "FAILURE")],
+                         annotations={**{n: [REAL_FAILURE] for n in range(1, 10)}, 22: [BILLING_REFUSED]})
+        ci = self.ci(fake)
+        self.assertEqual(ci["not_run"], [])
+        self.assertIn(LINUX, ci["failing"])
+        self.assertEqual(len(ci["failing"]), 10)
+        self.assertEqual(fake.paths, [annotation_path(n) for n in range(1, 10)] + [annotation_path(22)],
+                         "no listing: the cap was spent")
+
     def test_the_cap_and_a_run_without_an_id_leave_runs_red(self):
         count = 12
         fake = self.Fake(contexts=[check("no id", conclusion="FAILURE")]

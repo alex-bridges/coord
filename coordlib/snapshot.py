@@ -155,6 +155,10 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
         attempts = [rest_run_node(r) for page in gh.rest_paginated(
                         f"repos/{{repo}}/commits/{sha}/check-runs?check_name={name}&filter=all&per_page=100")
                     for r in page.get("check_runs", [])]
+        # This run's own annotation was just read, so a listing without it (empty, another
+        # name, a body `gh` or the proxy mangled) is broken, not evidence (#1032 review).
+        if not any(a["databaseId"] == context.get("databaseId") for a in attempts):
+            return True
         for attempt in attempts:
             if attempt["databaseId"] == context.get("databaseId") or not review.needs_first_annotation(attempt):
                 continue  # this run itself, or an attempt that passed, was cancelled or is running
