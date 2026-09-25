@@ -433,21 +433,28 @@ class NoLeakTests(AppCliTestCase):
 
     def test_no_subcommand_prints_a_secret(self):
         commands = {tuple(argv[:2]) if argv[0] in ("train", "token") else (argv[0],) for argv in self.argvs()}
-        for scenario in ("working", "keychain fails", "mint fails", "cached"):
+        for scenario in ("minting", "cached", "mint refused", "keychain fails"):
             self.server.mint_status = None
-            self.keychain("missing" if scenario == "keychain fails" else "key")
-            if scenario == "mint fails":
-                for name in os.listdir(self.token_dir) if os.path.isdir(self.token_dir) else []:
-                    os.remove(os.path.join(self.token_dir, name))
+            if scenario in ("mint refused", "keychain fails"):
+                for name in os.listdir(self.token_dir):
+                    os.remove(os.path.join(self.token_dir, name))  # nothing cached: each command must mint
+            # minting and mint refused: the key is there; cached: the tripwire proves no
+            # command reached the Keychain; keychain fails: `security` finds no item.
+            self.keychain({"minting": "key", "cached": "tripwire", "mint refused": "key",
+                           "keychain fails": "missing"}[scenario])
+            if scenario == "mint refused":
                 self.server.mint_status = 401
-            if scenario == "cached":
-                self.keychain("tripwire")
+            calls_before = len(self.security_calls())
             for argv in self.argvs():
                 with self.subTest(scenario=scenario, argv=argv):
                     code, out, err = self.main(argv)
                     self.assert_no_secret(out, err)
-            if scenario == "working":
+            if scenario == "minting":
                 self.assertEqual(self.server.mints, 2, "both kinds were really minted")
+            if scenario == "cached":
+                self.assertEqual(len(self.security_calls()), calls_before, "the cached pass never ran security")
+            if scenario in ("mint refused", "keychain fails"):
+                self.assertGreater(len(self.security_calls()), calls_before, "the failing passes really tried")
         # Every subcommand the parser knows is in the sweep (15 today).
         parser = cli.parser()
         names = set()
