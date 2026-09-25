@@ -154,11 +154,29 @@ def needs_first_annotation(context: Dict[str, Any]) -> bool:
             and context.get("conclusion") in _FAILED and not is_ignored_check(context.get("name")))
 
 
-def never_started(context: Dict[str, Any]) -> bool:
-    """A check run whose FIRST annotation says GitHub did not start the job."""
+def first_annotation_is_refusal(context: Dict[str, Any]) -> bool:
+    """Whether a check run's FIRST annotation says GitHub did not start the job."""
     nodes = ((context.get("annotations") or {}).get("nodes")) or []
     message = (nodes[0] or {}).get("message") if nodes else None
     return isinstance(message, str) and message.startswith(NOT_RUN_PREFIX)
+
+
+# Set on a refused run by snapshot.attach_first_annotations, and only there, once it
+# has read every other attempt of the same check name at the commit and found none
+# that failed for real.
+NO_OTHER_ATTEMPT_FAILED = "noOtherAttemptFailed"
+
+
+def never_started(context: Dict[str, Any]) -> bool:
+    """A check run GitHub did not start, with no real failure hiding behind it.
+
+    The rollup and REST's default `filter=latest` show only the newest attempt of a
+    check. A real failure on attempt 1 followed by a re-run the budget refused would
+    otherwise read as not run, and the red would vanish (review of #1032). So a refusal
+    counts only when the snapshot has also cleared the other attempts
+    (NO_OTHER_ATTEMPT_FAILED is True). Fails closed: without that, the run stays red.
+    """
+    return first_annotation_is_refusal(context) and context.get(NO_OTHER_ATTEMPT_FAILED) is True
 
 
 def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:

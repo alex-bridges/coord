@@ -8,8 +8,9 @@ Sources, and why each is trustworthy without anyone maintaining it:
 - claimed issues and branches (GraphQL, one aliased query): whether a claim's
   issue is still open and whether its branch exists
 
-A board costs about 5 + (running workflow runs) + (failed check runs at PR heads, at
-most MAX_ANNOTATION_READS a head) calls; `calls` records it.
+A board costs about 5 + (running workflow runs) + (failed check runs at PR heads, and
+one more for each refused one, at most MAX_CHECK_RUN_READS a head) calls; `calls`
+records it.
 """
 
 from __future__ import annotations
@@ -96,43 +97,93 @@ def truncated(connection: Optional[Dict[str, Any]]) -> bool:
 REACTION_NAMES = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
 
 
-# The most annotation reads one commit's check runs may cost. Past it a failed run keeps
-# no annotation and so stays red: the cap can hold a PR, never let one through.
-MAX_ANNOTATION_READS = 10
+# The most REST reads attach_first_annotations may spend on one commit: annotation
+# reads and attempt listings together. Past it a failed run is left as it is and stays
+# red: the cap can hold a PR, never let one through.
+MAX_CHECK_RUN_READS = 10
 
 
-def attach_first_annotations(gh: GitHub, contexts: List[Dict[str, Any]]) -> None:
-    """Give each failed check run in a rollup its first annotation (review.never_started).
+def rest_run_node(run: Dict[str, Any]) -> Dict[str, Any]:
+    """A REST check run in the GraphQL rollup's node shape, plus `annotationsCount`
+    (which GraphQL lacks) so attach_first_annotations can skip a run that has none."""
+    return {"__typename": "CheckRun", "databaseId": run.get("id"), "name": run.get("name"),
+            "status": _upper(run.get("status")), "conclusion": _upper(run.get("conclusion")),
+            "annotationsCount": (run.get("output") or {}).get("annotations_count")}
 
-    The one place both transports read annotations, over REST, one call per run. The
-    GraphQL query does not ask for them: the nested connection is priced per PR per
-    context, and it took the board query from 15 to 40 points a page for a case the
-    rollup rarely shows. Only runs whose answer can change are read
-    (review.needs_first_annotation), and not a REST run reporting no annotations
-    (`annotationsCount`, which GraphQL lacks), so a green head costs no call. At most
-    MAX_ANNOTATION_READS per commit.
+
+def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]]) -> None:
+    """Give each failed check run in a rollup at `sha` what review.never_started reads.
+
+    The one place both transports read annotations, over REST. The GraphQL query does
+    not ask for them: the nested connection is priced per PR per context, and it took
+    the board query from 15 to 40 points a page for a case the rollup rarely shows.
+
+    1. The first annotation of each run whose answer can change
+       (review.needs_first_annotation), unless REST says it has none. A green head costs
+       no call, and a red head one call per failed run.
+    2. Only for a run whose first annotation is the refusal: ONE listing of every attempt
+       of that check name at the commit (`filter=all`; the rollup and `filter=latest`
+       show only the newest), and the first annotation of each other failed attempt. A
+       refused re-run must not hide an earlier real failure (review of #1032). The run
+       is marked review.NO_OTHER_ATTEMPT_FAILED only if every such attempt was read and
+       was itself a refusal.
+
+    At most MAX_CHECK_RUN_READS reads per commit. Whatever the cap or a missing
+    `databaseId` leaves unread stays red.
     """
-    reads = 0
+    budget = [MAX_CHECK_RUN_READS]
+
+    def spend() -> bool:
+        if budget[0] <= 0:
+            return False
+        budget[0] -= 1
+        return True
+
+    def first_annotation(run_id: Any) -> Optional[Dict[str, Any]]:
+        """The run's `annotations` connection, or None when the cap is spent."""
+        if not spend():
+            return None
+        listed = gh.rest(f"repos/{{repo}}/check-runs/{run_id}/annotations?per_page=1") or []
+        return {"nodes": [{"message": a.get("message")} for a in listed[:1]]}
+
+    def other_attempt_failed(context: Dict[str, Any]) -> bool:
+        """False only when every other failed attempt of this check name was read and was a
+        refusal too. Anything unread counts as a real failure."""
+        if not spend():
+            return True
+        name = urllib.parse.quote(context.get("name") or "", safe="")
+        attempts = [rest_run_node(r) for page in gh.rest_paginated(
+                        f"repos/{{repo}}/commits/{sha}/check-runs?check_name={name}&filter=all&per_page=100")
+                    for r in page.get("check_runs", [])]
+        for attempt in attempts:
+            if attempt["databaseId"] == context.get("databaseId") or not review.needs_first_annotation(attempt):
+                continue  # this run itself, or an attempt that passed, was cancelled or is running
+            if attempt["databaseId"] is None or attempt.get("annotationsCount") == 0:
+                return True  # failed with no refusal to read: red
+            attempt["annotations"] = first_annotation(attempt["databaseId"])
+            if attempt["annotations"] is None or not review.first_annotation_is_refusal(attempt):
+                return True
+        return False
+
     for context in contexts:
-        if reads >= MAX_ANNOTATION_READS:
-            break
         run_id = context.get("databaseId")
         if run_id is None or not review.needs_first_annotation(context) or context.get("annotationsCount") == 0:
             continue
-        listed = gh.rest(f"repos/{{repo}}/check-runs/{run_id}/annotations?per_page=1") or []
-        reads += 1
-        context["annotations"] = {"nodes": [{"message": a.get("message")} for a in listed[:1]]}
+        annotations = first_annotation(run_id)
+        if annotations is None:
+            break  # the cap is spent: this run and every later one stay red
+        context["annotations"] = annotations
+        if review.first_annotation_is_refusal(context):
+            context[review.NO_OTHER_ATTEMPT_FAILED] = not other_attempt_failed(context)
 
 
 def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
-    """Every check run and commit status at `sha`, in the GraphQL rollup's node shape, plus
-    each run's `annotationsCount` so attach_first_annotations can skip runs that have none."""
+    """Every check run (newest attempt of each) and commit status at `sha`, in the GraphQL
+    rollup's node shape."""
     runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
             for r in page.get("check_runs", [])]
     statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
-    return ([{"__typename": "CheckRun", "databaseId": r.get("id"), "name": r.get("name"),
-              "status": _upper(r.get("status")), "conclusion": _upper(r.get("conclusion")),
-              "annotationsCount": (r.get("output") or {}).get("annotations_count")} for r in runs]
+    return ([rest_run_node(r) for r in runs]
             + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
                for c in statuses])
 
@@ -197,7 +248,7 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
             contexts = rest_contexts(gh, sha)
             rollup["contexts"] = {"totalCount": len(contexts), "nodes": contexts}
             commit["statusCheckRollup"] = rollup
-        attach_first_annotations(gh, ((rollup.get("contexts") or {}).get("nodes")) or [])
+        attach_first_annotations(gh, sha, ((rollup.get("contexts") or {}).get("nodes")) or [])
         if truncated(commit.get("checkSuites")):
             suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
                       for c in page.get("check_suites", [])]
@@ -365,8 +416,8 @@ def fetch_targets_graphql(gh: GitHub, numbers: List[int], branches: List[str]) -
 # "GitHub GraphQL is not available from Claude Code sessions; use the REST API"),
 # while REST works, writes included (probed 2026-09-24). The REST path builds the SAME
 # node shape the GraphQL query returns, so review.py's rules stay the one
-# implementation. It costs about seven calls per open PR (plus one per failed check
-# run, at most MAX_ANNOTATION_READS) instead of one query for all of them, so it is
+# implementation. It costs about seven calls per open PR (plus attach_first_annotations'
+# reads for failed check runs, at most MAX_CHECK_RUN_READS) instead of one query for all of them, so it is
 # used only where GraphQL is unavailable.
 #
 # The two need not see the same checks: on #1026's head (probed 2026-09-25) GraphQL's
@@ -421,7 +472,7 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
     files = rest_files(gh, number)
     reactions = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
     contexts = rest_contexts(gh, sha)
-    attach_first_annotations(gh, contexts)
+    attach_first_annotations(gh, sha, contexts)
     suites =[c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
               for c in page.get("check_suites", [])]
     committed = None
