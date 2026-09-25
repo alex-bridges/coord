@@ -49,6 +49,12 @@ BATCH_CAP = 3
 CI_WORKFLOW = "ci.yml"
 CI_LANES = "changed"
 WORKFLOW_DIR = ".github/workflows/"
+# What governs the unattended conductor: its standing orders, the settings, hooks and
+# deny list its runs load, and the watcher that starts them. The conductor must not be
+# able to widen its own powers through the train, so these wait for Alex's approval of
+# the head like a needs-alex PR, whoever queued them.
+ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/",
+                   "Tools/coord/coordlib/conductor.py", "Tools/coord/conductor/")
 MAX_ATTEMPTS = 2
 # The most batch CI runs the train will start in 24 hours, whatever goes wrong: a
 # loop, a red main, a lost dispatch. At ~1 h of heavy runner time each, 12 is the
@@ -134,6 +140,10 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     if touched:
         return DROP, "", (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
                           "so this PR is merged by hand")
+    guarded = [f for f in files if any(f == p or f.startswith(p) for p in ALEX_ONLY_PATHS)]
+    if guarded and not (ALEX_APPROVED_LABEL in labels and pr.get("alexApprovedHead") == pr.get("head")):
+        return HOLD, HOLD_NEEDS_ALEX, (f"it changes {guarded[0]}, which governs the unattended conductor; "
+                                       "Alex approves its head (`coord train approve`)")
     if pr.get("mergeable") == "CONFLICTING":
         return DROP, "", "it conflicts with main; merge main into it (or rebase) and add it again"
     if pr.get("isDraft"):

@@ -596,6 +596,8 @@ def cmd_outage_start(args: argparse.Namespace, gh: GitHub) -> int:
     until = review.parse_time(args.until) if args.until else outage.next_weekly_reset(now)
     if until <= now:
         raise UsageError(f"--until {args.until} is not in the future")
+    if until > now + dt.timedelta(days=8):
+        raise UsageError(f"--until {args.until} is more than 8 days out; no usage limit lasts past a weekly reset")
     me = identity.agent_id()
     issue = conductor.conductor_issue(gh)
     posted = conductor.post_record(gh, issue, (

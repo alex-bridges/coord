@@ -15,7 +15,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from coordlib import cli, conductor, lease, marker, outage, render, snapshot, train_step  # noqa: E402
+from coordlib import cli, conductor, lease, marker, outage, render, snapshot, train, train_step  # noqa: E402
 
 # Friday 2026-09-25 21:00Z = 17:00 in New York (EDT, UTC-4).
 NOW = dt.datetime(2026, 9, 25, 21, 0, tzinfo=dt.timezone.utc)
@@ -173,7 +173,7 @@ class ReasonTests(unittest.TestCase):
         red = {"id": 2, "status": "completed", "conclusion": "failure", "name": "CI", "event": "push", "head_sha": "abc"}
         green = {"id": 3, "status": "completed", "conclusion": "success"}
         running = {"id": 4, "status": "in_progress", "conclusion": None}
-        self.assertEqual([r["key"] for r in conductor.run_reasons([red, running], "main-red", "CI")], ["main-red:2"])
+        self.assertEqual([r["key"] for r in conductor.run_reasons([red, running], "main-red", "CI")], ["main-red:2:1"])
         self.assertEqual(conductor.run_reasons([red, green], "main-red", "CI"), [])
 
     def test_a_runner_counts_after_ten_minutes_offline(self):
@@ -427,7 +427,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_a_standby_takes_over_when_the_leader_goes_quiet(self):
         leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",
-                                                     "beat": snapshot.iso(at(-30)),
+                                                     "leader": True, "beat": snapshot.iso(at(-30)),
                                                      "seenThrough": snapshot.iso(at(-40))}), -600, comment_id=1)
         self.gh.issue_comments.append(leader)
         self.message(-35, text="already handled by the old leader")
@@ -463,6 +463,44 @@ class WatcherTests(unittest.TestCase):
         escalations = self.gh.records("conductor", "escalate")
         self.assertEqual(len(escalations), 1)
 
+    def test_1_a_standby_run_is_told_to_leave_the_inbox_and_its_cursor_is_not_adopted(self):
+        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",
+                                                     "leader": True, "beat": snapshot.iso(at(-1))}), -600, comment_id=1)
+        self.gh.issue_comments.append(leader)
+        watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner, disk=lambda path: 5.0)
+        self.gh.clock_minutes = 0
+        watcher.tick()
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("STANDBY", self.runs[0]["prompt"])
+        self.assertIn('"leader":false', self.gh.issue_comments[-1]["body"].replace(" ", ""))
+
+    def test_1_a_leader_ignores_a_standbys_newer_cursor(self):
+        self.tick(0)
+        mine = cli.cache.load_cursor("o/r", self.config.agent)
+        standby = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@B:c",
+                                                      "leader": False, "beat": snapshot.iso(at(4)),
+                                                      "seenThrough": snapshot.iso(at(4))}), 1)
+        self.gh.issue_comments.append(standby)
+        self.tick(5)
+        self.assertEqual(cli.cache.load_cursor("o/r", self.config.agent), mine)
+
+    def test_6_the_inbox_is_read_back_at_most_48_hours(self):
+        self.tick(0)
+        cli.cache.store_cursor("o/r", self.config.agent, snapshot.iso(at(-5 * 24 * 60)), [])
+        self.tick(5)
+        since = [p for _, p in self.gh.calls if p.startswith("repos/{repo}/issues/comments?since=")][-1]
+        self.assertGreaterEqual(since.split("since=")[1].split("&")[0], snapshot.iso(at(5 - 48 * 60)))
+
+    def test_7_repeated_unknown_limits_edit_one_outage_record(self):
+        self.tick(0)
+        self.message(1)
+        self.replies = [claude_result("5-hour usage limit reached", code=1, is_error=True)] * 2
+        self.tick(5)
+        self.tick(70)
+        starts = self.gh.records("outage", "start")
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(starts[0]["until"], snapshot.iso(at(130)))
+
     def test_dry_run_writes_nothing(self):
         self.message(-1)
         self.tick(0, dry_run=True)
@@ -494,6 +532,62 @@ class BoardTests(unittest.TestCase):
                 "runs": {"running": [], "queued": []}, "train": []}
         self.assertIn("no watcher running", render.board(snap, "me", 0))
         self.assertNotIn("conductor", render.brief(snap, "me").split("\n")[0])
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    """The adversarial review of 7635f365 (Fable 5.1), one test per finding."""
+
+    def test_2_a_far_future_time_in_the_output_is_not_the_reset(self):
+        weekly = dt.datetime(2026, 10, 1, 16, 0, tzinfo=UTC)
+        table = outage.parse_limit("usage limit reached\n| run | 9999999999 |", NOW)
+        self.assertLessEqual(table["until"], weekly, "the epoch is on another line")
+        same_line = outage.parse_limit("usage limit reached; resets 2099-01-01T00:00Z", NOW)
+        self.assertEqual(same_line["until"], weekly, "clamped to the weekly reset")
+
+    def test_3_malformed_records_do_not_crash_the_board(self):
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@T:c", "beat": snapshot.iso(at(-1)),
+                                "lastWake": "oops", "disk": "full", "pending": [1]})
+        odd_wake = record(3, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@U:c",
+                                    "beat": snapshot.iso(at(-1)), "lastWake": {"at": 123}})
+        pause = record(4, -5, {"kind": "conductor", "event": "pause", "until": snapshot.iso(at(60)), "note": 5})
+        down = record(5, -5, {"kind": "outage", "event": "start", "harness": "claude", "until": snapshot.iso(at(60)),
+                              "reason": ["x"]})
+        comments = [beat, odd_wake, pause, down]
+        snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
+                "runs": {"running": [], "queued": []}, "train": [],
+                "outages": [outage.serialize(w) for w in outage.windows(comments)],
+                "conductor": {"hosts": lease.hosts(comments, NOW), "pause": lease.pause(comments, NOW),
+                              "escalations": lease.escalations(comments, NOW)}}
+        text = render.board(json.loads(json.dumps(snap)), "me", 0)
+        self.assertIn("PAUSED", text)
+        self.assertIn("OUTAGE", text)
+
+    def test_4_a_rerun_that_fails_again_is_a_new_reason(self):
+        first = {"id": 9, "run_attempt": 1, "status": "completed", "conclusion": "failure"}
+        second = dict(first, run_attempt=2)
+        self.assertNotEqual(conductor.run_reasons([first], "main-red", "CI")[0]["key"],
+                            conductor.run_reasons([second], "main-red", "CI")[0]["key"])
+
+    def test_5_the_conductors_own_controls_wait_for_alex(self):
+        pr = {"number": 7, "base": "main", "head": "h" * 40, "labels": [], "files": [".claude/agents/conductor.md"],
+              "codex": {"approved": True}, "ci": {}}
+        verdict, hold, reason = train.assess(pr)
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NEEDS_ALEX))
+        approved = dict(pr, labels=[train.ALEX_APPROVED_LABEL], alexApprovedHead="h" * 40)
+        self.assertEqual(train.assess(approved)[0], train.READY)
+        self.assertEqual(train.assess(dict(pr, files=["Tools/coord/coordlib/cli.py"]))[0], train.READY)
+
+    def test_5_the_run_is_denied_the_dangerous_commands(self):
+        command = conductor.model_command(make_config("/tmp"), "p", "sonnet")
+        settings = json.loads(command[command.index("--settings") + 1])
+        for rule in ("Bash(gh pr merge:*)", "Bash(git push --force:*)", "Bash(Tools/coord/coord train approve:*)"):
+            self.assertIn(rule, settings["permissions"]["deny"])
+
+    def test_10_a_timeout_stops_the_whole_process_group(self):
+        started = dt.datetime.now()
+        done = conductor.default_runner(["/bin/sh", "-c", "sleep 30 & sleep 30"], "/tmp", dict(os.environ), 1)
+        self.assertEqual(done.returncode, 124)
+        self.assertLess((dt.datetime.now() - started).total_seconds(), 10)
 
 
 class TrainRecipientTests(unittest.TestCase):

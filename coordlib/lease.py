@@ -40,6 +40,22 @@ def _time(value: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _wake(value: Any) -> Optional[Dict[str, Any]]:
+    """A beat's lastWake with typed fields, or None: the board renders it for every agent."""
+    if not isinstance(value, dict) or _time(value.get("at")) is None:
+        return None
+    return {"at": value["at"], "model": _text(value.get("model")), "ok": value.get("ok") is True,
+            "summary": _text(value.get("summary"))}
+
+
+def _number(value: Any) -> Optional[int]:
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def _records(comments: Iterable[Dict[str, Any]], event: str) -> List[Dict[str, Any]]:
     return sorted((c for c in comments if (c.get("payload") or {}).get("kind") == "conductor"
                    and c["payload"].get("event") == event), key=lambda c: c.get("id") or 0)
@@ -67,8 +83,9 @@ def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelt
         out.append({
             "agent": agent, "host": payload.get("host") or "", "beat": payload.get("beat") if beat else None,
             "alive": alive, "leader": leader, "commentId": comment.get("id"), "url": comment.get("url") or "",
-            "seenThrough": payload.get("seenThrough"), "lastWake": payload.get("lastWake"),
-            "pending": payload.get("pending"), "disk": payload.get("disk"),
+            "seenThrough": payload.get("seenThrough") if _time(payload.get("seenThrough")) else None,
+            "lastWake": _wake(payload.get("lastWake")), "pending": _number(payload.get("pending")),
+            "disk": _number(payload.get("disk")), "wasLeader": payload.get("leader") is True,
         })
     return out
 
@@ -84,8 +101,8 @@ def pause(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> Optional[Dict
     until = _time(latest["payload"].get("until"))
     if until is None or until <= now:
         return None
-    return {"until": latest["payload"].get("until"), "agent": latest["payload"].get("agent") or "",
-            "note": latest["payload"].get("note") or "", "url": latest.get("url") or ""}
+    return {"until": latest["payload"]["until"], "agent": _text(latest["payload"].get("agent")),
+            "note": _text(latest["payload"].get("note")), "url": _text(latest.get("url"))}
 
 
 def escalations(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> List[Dict[str, Any]]:
@@ -93,6 +110,6 @@ def escalations(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> List[Di
     for comment in _records(comments, "escalate"):
         posted = _time(comment.get("createdAt"))
         if posted is not None and now - posted <= ESCALATION_WINDOW:
-            out.append({"at": comment.get("createdAt"), "agent": comment["payload"].get("agent") or "",
-                        "text": comment.get("text") or "", "url": comment.get("url") or ""})
+            out.append({"at": comment.get("createdAt"), "agent": _text(comment["payload"].get("agent")),
+                        "text": _text(comment.get("text")), "url": _text(comment.get("url"))})
     return out

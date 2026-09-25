@@ -56,6 +56,11 @@ def _time(value: Any) -> Optional[dt.datetime]:
         return None
 
 
+def _text(value: Any) -> str:
+    """A payload field as display text: records are hand-writable, the board must not crash."""
+    return value if isinstance(value, str) else ""
+
+
 def prefixes(harness: str) -> Tuple[str, ...]:
     return HARNESS_PREFIXES.get(harness, (f"{harness}@",))
 
@@ -130,27 +135,33 @@ def parse_limit(text: str, now: dt.datetime) -> Optional[Dict[str, Any]]:
     """
     if not is_limit(text):
         return None
-    line = next((line.strip() for line in text.splitlines() if _LIMIT.search(line)), text.strip())
-    reason = line[:200]
+    lines = [line.strip() for line in text.splitlines() if _LIMIT.search(line)] or [text.strip()]
+    reason = lines[0][:200]
+    # Times are read only from the lines that name the limit: a failed run's output can
+    # hold any timestamp or table, and a far-future one would silence the watcher.
+    near = "\n".join(lines)
+    weekly = next_weekly_reset(now)
     until: Optional[dt.datetime] = None
-    match = _EPOCH.search(text)
+    match = _EPOCH.search(near)
     if match:
         until = dt.datetime.fromtimestamp(int(match.group(1)), dt.timezone.utc)
     if until is None:
-        match = _STAMP.search(text)
+        match = _STAMP.search(near)
         if match:
             zone = match.group(3) or "UTC"
             offset = "+00:00" if zone in ("Z", "UTC") else (zone if ":" in zone else f"{zone[:3]}:{zone[3:]}")
             until = _time(f"{match.group(1)}T{match.group(2)}:00{offset}")
     if until is None:
-        match = _RELATIVE.search(text)
+        match = _RELATIVE.search(near)
         if match and any(match.groups()):
             days, hours, minutes = (int(value or 0) for value in match.groups())
             until = now + dt.timedelta(days=days, hours=hours, minutes=minutes)
-    if until is not None and until > now:
+    if until is not None and now < until <= weekly:
         return {"until": until, "reason": reason, "exact": True}
-    weekly = next_weekly_reset(now)
-    if re.search(r"weekly", text, re.IGNORECASE):
+    if until is not None and until > weekly:
+        # No Claude limit outlives the weekly reset; a later time is a misread.
+        return {"until": weekly, "reason": reason, "exact": False}
+    if re.search(r"weekly", near, re.IGNORECASE):
         return {"until": weekly, "reason": reason, "exact": False}
     return {"until": min(now + PROBE_AFTER, weekly), "reason": reason, "exact": False}
 
@@ -186,10 +197,10 @@ def windows(comments: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if until is None or until <= posted:
                 continue
             if current is not None:
-                current.update(until=until, end=until, reason=payload.get("reason") or current["reason"])
+                current.update(until=until, end=until, reason=_text(payload.get("reason")) or current["reason"])
                 continue
             window = {"harness": harness, "start": posted, "until": until, "end": until,
-                      "reason": payload.get("reason") or "", "agent": payload.get("agent") or "",
+                      "reason": _text(payload.get("reason")), "agent": _text(payload.get("agent")),
                       "url": comment.get("url") or "", "closed": False}
             out.append(window)
             open_by_harness[harness] = window

@@ -29,8 +29,8 @@ while [ $# -gt 0 ]; do
 done
 
 DOMAIN="gui/$(id -u)"
-launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 if [ "$UNINSTALL" = 1 ]; then
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
   echo "removed $LABEL (the checkout at $HOME_DIR and the state in ~/.local/state/inisa-conductor are kept)"
   exit 0
@@ -55,6 +55,12 @@ PY="$(command -v python3)"
 # launchd starts jobs with a bare PATH; give the watcher the one gh and claude run with here.
 JOB_PATH="$(dirname "$(command -v claude)"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
+echo "checking a dry-run tick as $AGENT ..."
+(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \
+  "$PY" Tools/coord/coord conductor tick --dry-run)
+
+# Only now replace a running installation: a failed check above leaves it as it was.
+launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -84,10 +90,6 @@ cat > "$PLIST" <<EOF
 </dict>
 </plist>
 EOF
-
-echo "checking a dry-run tick as $AGENT ..."
-(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \
-  "$PY" Tools/coord/coord conductor tick --dry-run)
 
 launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "installed $LABEL: every ${INTERVAL}s, log $LOG"
