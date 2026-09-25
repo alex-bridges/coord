@@ -10,8 +10,8 @@ import sys
 import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
-from . import EXIT_BACKEND, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import cache, identity, marker, render, review, snapshot, train, train_step
+from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
+from . import budget, cache, identity, marker, render, review, snapshot, train, train_step
 from .gh import GitHub, GitHubError, NotFound
 
 INBOX_DEFAULT_DAYS = 7
@@ -24,6 +24,10 @@ CURSOR_OVERLAP = dt.timedelta(seconds=120)
 
 class UsageError(Exception):
     pass
+
+
+class BudgetRefused(Exception):
+    """The API budget guard refused; the message is the one line to print (exit EXIT_BUDGET)."""
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -39,6 +43,9 @@ class ArgumentParser(argparse.ArgumentParser):
 
 
 def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
+    low = getattr(gh, "budget_low", None)
+    if low:
+        return snapshot_despite_budget(gh, low)
     if max_age > 0:
         cached = cache.load_snapshot(gh.repo, max_age)
         if cached is not None and cached.get("schema") == 1:
@@ -46,6 +53,47 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
     fresh = snapshot.build(gh)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
+
+
+def snapshot_despite_budget(gh: GitHub, low: str) -> Dict[str, Any]:
+    """The budget is below the read floor: the machine's cached snapshot at any age,
+    `--max-age` and `--fresh` notwithstanding, with a one-line warning; no API call."""
+    cached = cache.load_snapshot(gh.repo, float("inf"))
+    if cached is None or cached.get("schema") != 1:
+        raise BudgetRefused(f"{low}; no cached snapshot on this machine to show")
+    now = snapshot.now_utc()
+    generated = review.parse_time(cached.get("generatedAt"))
+    if generated is not None:
+        # An invalidated snapshot's file time is the epoch; its own timestamp is the truth.
+        cached["cacheAgeSeconds"] = max(0, int((now - generated).total_seconds()))
+    print(f"coord: {low}; showing the snapshot from {render.ago(cached.get('generatedAt'), now)} ago", file=sys.stderr)
+    return cached
+
+
+def gate(args: argparse.Namespace, gh: GitHub) -> Optional[int]:
+    """The API budget guard, before a command spends anything (budget.py).
+
+    On the gh transport, which sees no headers, a reading older than
+    budget.PROBE_AFTER_SECONDS is refreshed with one probe call first. A LOW read runs
+    from the cache (`gh.budget_low`); a refusal returns EXIT_BUDGET. Ungated commands
+    (`send`, `whoami`, `train step`) are never checked and never probe.
+    """
+    command = budget.command_name(args)
+    if command in budget.UNGATED:
+        return None
+    try:
+        transport = gh.transport()
+    except GitHubError:
+        transport = None
+    if transport == "gh" and budget.needs_probe(cache.load_budget(gh.repo).get("core")):
+        gh.probe_budget()
+    verdict, message = budget.decision(command, budget.current(gh.repo))
+    if verdict == budget.REFUSE:
+        print(f"coord: {message}", file=sys.stderr)
+        return EXIT_BUDGET
+    if verdict == budget.LOW:
+        gh.budget_low = message  # type: ignore[attr-defined]
+    return None
 
 
 def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "",
@@ -111,7 +159,8 @@ def find_or_create_mailbox(gh: GitHub) -> int:
 def cmd_whoami(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     info = {"agent": me, "repo": gh.repo, "branch": identity.git_branch() or identity.detached_description(),
-            "graphql": "no (REST only)" if snapshot.rest_only(gh) else "yes", "cacheDir": cache.cache_dir(gh.repo)}
+            "graphql": "no (REST only)" if snapshot.rest_only(gh) else "yes", "cacheDir": cache.cache_dir(gh.repo),
+            "apiBudget": budget.header_words(gh.repo)}
     print(json.dumps(info, indent=2) if args.json else "\n".join(f"{k}: {v}" for k, v in info.items()))
     return EXIT_OK
 
@@ -121,15 +170,18 @@ def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, 0 if args.fresh else args.max_age)
     unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
                            cache.load_seen_ids(gh.repo, me))
+    # The budget as last read, not as stamped on a cached snapshot; it costs no call.
+    words = budget.header_words(gh.repo)
     if args.json:
         out = {k: v for k, v in snap.items() if k != "claimComments"}
         out["me"] = me
         out["unreadDirectMessages"] = unread
+        out["apiBudget"] = {resource: budget.summary(gh.repo, resource) for resource in ("core", "graphql")}
         print(json.dumps(out, indent=2))
     elif args.brief:
-        sys.stdout.write(render.brief(snap, me, unread))
+        sys.stdout.write(render.brief(snap, me, unread, budget=words))
     else:
-        sys.stdout.write(render.board(snap, me, unread))
+        sys.stdout.write(render.board(snap, me, unread, budget=words))
     return EXIT_OK
 
 
@@ -325,6 +377,14 @@ def inbox_items(
 
 def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
+    if getattr(gh, "budget_low", None):
+        # Reading comments costs calls; the snapshot already counts what is addressed to me.
+        snap = get_snapshot(gh, args.max_age)
+        unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
+                               cache.load_seen_ids(gh.repo, me))
+        print(f"inbox for {me}: {unread} new in that snapshot; run `coord inbox` after the reset to read them "
+              "(nothing was marked read)")
+        return EXIT_OK
     stored = None if (args.all or args.since) else cache.load_cursor(gh.repo, me)
     seen_ids = cache.load_seen_ids(gh.repo, me) if stored else []
     if args.since:
@@ -368,6 +428,11 @@ def cmd_ci(args: argparse.Namespace, gh: GitHub) -> int:
     if ref.startswith(train.BATCH_PREFIX):
         raise UsageError(f"{ref} is a merge-train batch; only the train dispatches its gate")
     gh.dispatch_workflow("ci.yml", ref, {"lanes": args.lanes})
+    low = getattr(gh, "budget_low", None)
+    if low:
+        # The dispatch is the point and one call; reading the queue back would be several.
+        print(f"requested ci.yml lanes={args.lanes} on {ref}. Not reading the Tycho queue back: {low}.")
+        return EXIT_OK
     cache.invalidate_snapshot(gh.repo)
     runs = snapshot.fetch_runs(gh)
     print(f"requested ci.yml lanes={args.lanes} on {ref}. Tycho now: "
@@ -454,10 +519,11 @@ def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     snap = get_snapshot(gh, args.max_age)
     prs = {p["number"]: p for p in snap["prs"]}
+    low = getattr(gh, "budget_low", None)
     # No trailing slash: the cloud proxy rejects `…/heads/train/` ("Request path could not
     # be canonicalized", probe 4). Without it GitHub also matches `training…`, so keep
-    # only refs under refs/heads/train/.
-    refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
+    # only refs under refs/heads/train/. With the budget low the batch is not read at all.
+    refs = [] if low else gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
     for ref in refs:
@@ -476,9 +542,9 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
         queue.append(dict(entry, verdict=verdict, reason=reason))
     if args.json:
-        print(json.dumps({"batches": batches, "queue": queue}, indent=2))
+        print(json.dumps({"batches": None if low else batches, "queue": queue}, indent=2))
         return EXIT_OK
-    print("batch: " + ("none" if not batches else ""))
+    print("batch: " + ("not read (API budget low)" if low else "none" if not batches else ""))
     for batch in batches:
         run = batch["run"]
         state = "CI not started" if run is None else f"CI {run['status']}" + (
@@ -599,7 +665,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser().parse_args(argv)
     try:
         gh = GitHub(args.repo)
+    except GitHubError as error:
+        print(f"coord: GitHub error: {error}", file=sys.stderr)
+        return EXIT_BACKEND
+    return run(args, gh)
+
+
+def run(args: argparse.Namespace, gh: GitHub) -> int:
+    """The budget guard, then the command, with every error mapped to its exit code."""
+    try:
+        refused = gate(args, gh)
+        if refused is not None:
+            return refused
         return args.func(args, gh)
+    except BudgetRefused as error:
+        print(f"coord: {error}", file=sys.stderr)
+        return EXIT_BUDGET
     except UsageError as error:
         print(f"coord: {error}", file=sys.stderr)
         return EXIT_USAGE

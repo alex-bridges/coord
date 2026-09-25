@@ -20,6 +20,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import budget
+
 DEFAULT_REPO = "example-owner/example-repo"
 CALL_TIMEOUT_SECONDS = 30
 
@@ -158,11 +160,16 @@ class GitHub:
         request.add_header("User-Agent", "inisa-coord")
         if data is not None:
             request.add_header("Content-Type", "application/json")
+        resource = "graphql" if url.rstrip("/").endswith("/graphql") else "core"
         try:
             with urllib.request.urlopen(request, timeout=CALL_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
                 headers = {k.lower(): v for k, v in response.headers.items()}
+            budget.record(self.repo, headers, resource)
         except urllib.error.HTTPError as error:
+            # The 403 of an exhausted budget carries `X-RateLimit-Remaining: 0`: the
+            # reading that matters most.
+            budget.record(self.repo, dict(error.headers.items()) if error.headers else {}, resource)
             # Whole, or nearly: a proxy's 403 can carry the list of routes to use instead.
             detail = error.read().decode(errors="replace")[:4000]
             if error.code == 404:
@@ -225,6 +232,22 @@ class GitHub:
             messages = "; ".join(str(e.get("message", e)) for e in data["errors"])
             raise GitHubError(f"GraphQL: {messages}")
         return data["data"]
+
+    def probe_budget(self) -> Optional[Dict[str, Any]]:
+        """One `gh api -i repos/<repo>` call, to read the core budget from its headers.
+
+        The gh transport otherwise sees no headers. Never the `rate_limit` endpoint: on
+        2026-09-25 it reported 5000/5000 while real calls got 403; only the headers of a
+        real response told the truth. Runs the runner directly, not `_run`: a refused
+        call exits non-zero yet still prints the headers, and that is the reading that
+        matters. None when gh printed no budget headers.
+        """
+        self.calls += 1
+        try:
+            result = (self._runner or _default_runner)(["gh", "api", "-i", f"repos/{self.repo}"], None)
+        except GitHubError:
+            return None
+        return budget.record(self.repo, budget.parse_header_block(result.stdout or ""), "core")
 
     def dispatch_workflow(self, workflow: str, ref: str, inputs: Optional[Dict[str, str]] = None) -> None:
         self.rest(f"repos/{{repo}}/actions/workflows/{workflow}/dispatches", method="POST",

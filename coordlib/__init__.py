@@ -11,3 +11,4 @@ EXIT_USAGE = 1
 EXIT_CONFLICT = 2
 EXIT_BACKEND = 3
 EXIT_NOT_FOUND = 4
+EXIT_BUDGET = 5  # the GitHub API budget guard refused (budget.py)
