@@ -45,7 +45,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import budget, cache, identity, lease, marker, outage, review, snapshot, train
-from .gh import GitHub, GitHubError
+from .gh import AppAuthError, GitHub, GitHubError
 
 TRIAGE_MODEL = "sonnet"
 REPAIR_MODEL = "opus"
@@ -453,6 +453,8 @@ def conductor_issue(gh: GitHub, create: bool = True) -> Optional[int]:
     try:
         gh.rest("repos/{repo}/labels", method="POST", body={
             "name": lease.CONDUCTOR_LABEL, "color": "0e8a16", "description": "coord: the conductor's records"})
+    except AppAuthError:
+        raise  # `coord outage` runs on the app: no token is not "the label exists"
     except GitHubError:
         pass  # already exists
     issue = gh.rest("repos/{repo}/issues", method="POST",

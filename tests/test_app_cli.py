@@ -29,6 +29,16 @@ def is_write(request):
     return request["method"] != "GET" and request["path"] != "graphql"
 
 
+def parser_commands():
+    """Every (command,) or (command, subcommand) the parser knows."""
+    names = set()
+    for action in cli.parser()._subparsers._group_actions:  # noqa: SLF001
+        for name, sub in action.choices.items():
+            nested = [a for a in sub._actions if a.__class__.__name__ == "_SubParsersAction"]  # noqa: SLF001
+            names |= {(name, child) for child in nested[0].choices} if nested else {(name,)}
+    return names
+
+
 class AppCliTestCase(AppTestCase):
     def setUp(self):
         super().setUp()
@@ -65,6 +75,9 @@ class RoutingTests(AppCliTestCase):
         "train remove": (["train", "remove", "101"], {("DELETE", "repos/o/r/issues/101/labels/train"),
                                                       ("POST", "repos/o/r/issues/101/comments")}),
         "ci": (["ci", "mk4", "--ref", "feature/x"], {("POST", "repos/o/r/actions/workflows/ci.yml/dispatches")}),
+        "outage start": (["outage", "start", "claude", "--note", "limit"],
+                         {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
+                          ("POST", "repos/o/r/issues/900/comments")}),
     }
 
     def test_operational_writes_use_the_ops_token_and_reads_the_read_token(self):
@@ -105,7 +118,12 @@ class RoutingTests(AppCliTestCase):
         argvs = [["board"], ["whoami"], ["claim", "5", "--branch", "b"], ["release", "5"], ["send", "x"],
                  ["inbox"], ["ci", "mk4"], ["train", "add", "7"], ["train", "remove", "7"], ["train", "status"],
                  ["train", "approve", "7", "--note", "n"], ["train", "substitute-review", "7", "--note", "n"],
-                 ["train", "step"], ["token", "status"], ["token", "exec", "--", "true"]]
+                 ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
+                 ["conductor", "tick"], ["conductor", "status"], ["conductor", "pause", "--for", "1h"],
+                 ["conductor", "resume"], ["conductor", "escalate", "x"],
+                 ["token", "status"], ["token", "exec", "--", "true"]]
+        self.assertEqual({tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
+                          for argv in argvs}, parser_commands(), "every subcommand is decided here")
         for argv in argvs:
             args = cli.parser().parse_args(argv)
             args.func = capture
@@ -114,7 +132,9 @@ class RoutingTests(AppCliTestCase):
             self.assertIsNotNone(gh.app)
             cli.run(args, gh)
         self.assertEqual({name for name, on_app in seen.items() if not on_app}, set(cli.USER_IDENTITY))
-        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train substitute-review", "train step"})
+        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train substitute-review", "train step", "conductor tick",
+                                             "conductor status", "conductor pause", "conductor resume",
+                                             "conductor escalate"})
 
     def test_a_hand_run_train_step_never_touches_the_app(self):
         code, _, err = self.main(["train", "step", "--repo-dir", self.no_repo])
@@ -147,7 +167,8 @@ class RoutingTests(AppCliTestCase):
         code, out, _ = self.main(["whoami"])
         self.assertEqual(code, EXIT_OK)
         self.assertIn("githubIdentity: inisa-sidechain[bot] (installation not yet known)", out)
-        self.assertIn("Alex for `train approve`, `train step`, `train substitute-review`", out)
+        self.assertIn("Alex for `conductor escalate`", out)
+        self.assertIn("`train approve`, `train step`, `train substitute-review`", out)
         self.assertIn("apiBudget: API (app): no current reading", out)
         self.assertEqual(self.server.requests, [])
         self.assertEqual(self.security_calls(), [])
@@ -419,6 +440,16 @@ class NoLeakTests(AppCliTestCase):
     success and on failure: no `ghs_`, no JWT-shaped string, no key material, and none of
     the tokens or JWTs the fake saw, in stdout or stderr."""
 
+    def setUp(self):
+        super().setUp()
+        # The conductor's tick runs on Alex's (fake) gh; keep its state, checkout and model
+        # command inside the test directory.
+        for name, value in (("CONDUCTOR_HOME", self.no_repo), ("CONDUCTOR_STATE_DIR", os.path.join(self.root, "state")),
+                            ("CONDUCTOR_CLAUDE", os.path.join(self.root, "no-claude")),
+                            ("CONDUCTOR_UPDATE_CHECKOUT", "0")):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = value
+
     def argvs(self):
         return [
             ["board"], ["board", "--brief"], ["board", "--json"], ["board", "--fresh"], ["whoami"], ["whoami", "--json"],
@@ -427,12 +458,16 @@ class NoLeakTests(AppCliTestCase):
             ["inbox"], ["inbox", "--json", "--all"], ["ci", "mk4", "--ref", "feature/x"],
             ["train", "add", "101"], ["train", "remove", "101"], ["train", "status"], ["train", "status", "--json"],
             ["train", "approve", "101", "--note", "n"], ["train", "substitute-review", "101", "--note", "n"],
-            ["train", "step", "--repo-dir", self.no_repo], ["token", "status"],
-            ["token", "exec", "--", "true"], ["token", "exec", "--kind", "ops", "--", "true"],
+            ["train", "step", "--repo-dir", self.no_repo],
+            ["outage", "start", "claude", "--note", "limit"], ["outage", "end", "claude"],
+            ["conductor", "tick", "--dry-run", "--no-wake"], ["conductor", "status"],
+            ["conductor", "pause", "--for", "1h"], ["conductor", "resume"], ["conductor", "escalate", "look"],
+            ["token", "status"], ["token", "exec", "--", "true"], ["token", "exec", "--kind", "ops", "--", "true"],
         ]
 
     def test_no_subcommand_prints_a_secret(self):
-        commands = {tuple(argv[:2]) if argv[0] in ("train", "token") else (argv[0],) for argv in self.argvs()}
+        commands = {tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
+                    for argv in self.argvs()}
         for scenario in ("minting", "cached", "mint refused", "keychain fails"):
             self.server.mint_status = None
             if scenario in ("mint refused", "keychain fails"):
@@ -455,17 +490,7 @@ class NoLeakTests(AppCliTestCase):
                 self.assertEqual(len(self.security_calls()), calls_before, "the cached pass never ran security")
             if scenario in ("mint refused", "keychain fails"):
                 self.assertGreater(len(self.security_calls()), calls_before, "the failing passes really tried")
-        # Every subcommand the parser knows is in the sweep (15 today).
-        parser = cli.parser()
-        names = set()
-        for action in parser._subparsers._group_actions:  # noqa: SLF001
-            for name, sub in action.choices.items():
-                nested = [a for a in sub._actions if a.__class__.__name__ == "_SubParsersAction"]  # noqa: SLF001
-                if nested:
-                    names |= {(name, child) for child in nested[0].choices}
-                else:
-                    names.add((name,))
-        self.assertEqual(names - commands, set(), "a subcommand is missing from the no-leak sweep")
+        self.assertEqual(parser_commands() - commands, set(), "a subcommand is missing from the no-leak sweep")
 
     def test_redact_catches_every_shape(self):
         from coordlib.gh import redact

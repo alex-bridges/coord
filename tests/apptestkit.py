@@ -244,6 +244,10 @@ class FakeGitHub:
                 return FakeResponse([], headers)
             if route.endswith("/dispatches"):
                 return FakeResponse(None, headers, 204)
+        if method == "GET" and route.endswith("/actions/runners"):
+            return FakeResponse({"total_count": 0, "runners": []}, headers)
+        if method == "PATCH" and re.search(r"issues/comments/\d+$", route):
+            return FakeResponse({"id": int(route.rsplit("/", 1)[1])}, headers)
         if method == "DELETE" and re.search(r"issues/\d+/labels/", route):
             return FakeResponse([], headers)
         raise self._error(API + "/" + path, 404, {"message": f"fake: no route for {method} {route}"}, headers)
@@ -259,11 +263,13 @@ class FakeGitHub:
 
 
 class FakeRunner:
-    """A fake `gh` for Alex's identity: records every call; answers the probe and the few
-    endpoints the user-identity commands call."""
+    """A fake `gh` for Alex's identity: records every call, answers the budget probe, and
+    answers everything else from the fake GitHub's routes (as Alex: no app token, and not
+    recorded among the app's requests)."""
 
-    def __init__(self, reset: Optional[int] = None):
+    def __init__(self, server: "FakeGitHub", reset: Optional[int] = None):
         self.calls: List[List[str]] = []
+        self.server = server
         self.reset = reset or int(time.time()) + 1800
 
     def __call__(self, args, stdin):
@@ -273,11 +279,15 @@ class FakeRunner:
                    f"X-Ratelimit-Reset: {self.reset}\r\nX-Ratelimit-Resource: core\r\nX-Ratelimit-Used: 1000\r\n\r\n{{}}")
             return subprocess.CompletedProcess(args, 0, out, "")
         path = args[2] if len(args) > 2 else ""
-        if re.search(r"/pulls/\d+$", path):
-            return subprocess.CompletedProcess(args, 0, json.dumps({"head": {"sha": "a" * 40}}), "")
-        if path.endswith("/comments"):
-            return subprocess.CompletedProcess(args, 0, json.dumps({"html_url": "https://example/c/2"}), "")
-        return subprocess.CompletedProcess(args, 0, "[]", "")
+        method = args[args.index("--method") + 1] if "--method" in args else ("POST" if path == "graphql" else "GET")
+        body = json.loads(stdin) if stdin else None
+        try:
+            answer = json.loads(self.server._api_call(method, path, body).read() or b"null")  # noqa: SLF001
+        except urllib.error.HTTPError as error:
+            return subprocess.CompletedProcess(args, 1, "", f"gh: fake (HTTP {error.code})")
+        if "--slurp" in args:
+            answer = [answer]
+        return subprocess.CompletedProcess(args, 0, "" if answer is None else json.dumps(answer), "")
 
 
 class AppTestCase(unittest.TestCase):
@@ -315,7 +325,7 @@ class AppTestCase(unittest.TestCase):
         self.patch(apptoken, "SECURITY", security)
         self.server = FakeGitHub()
         self.patch(urllib.request, "urlopen", self.server)
-        self.runner = FakeRunner()
+        self.runner = FakeRunner(self.server)
         self.patch(ghmodule, "_default_runner", self.runner)
 
     def tearDown(self) -> None:
