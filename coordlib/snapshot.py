@@ -8,7 +8,8 @@ Sources, and why each is trustworthy without anyone maintaining it:
 - claimed issues and branches (GraphQL, one aliased query): whether a claim's
   issue is still open and whether its branch exists
 
-A board costs about 5 + (running workflow runs) calls; `calls` records it.
+A board costs about 5 + (running workflow runs) + (failed check runs at PR heads, at
+most MAX_ANNOTATION_READS a head) calls; `calls` records it.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ commits(last: 1) { nodes { commit {
   checkSuites(first: 20) { totalCount nodes { createdAt } }
   statusCheckRollup { state contexts(first: 100) { totalCount nodes {
     __typename
-    ... on CheckRun { name status conclusion annotations(first: 1) { nodes { message } } }
+    ... on CheckRun { databaseId name status conclusion }
     ... on StatusContext { context state }
   } } }
 } } }
@@ -100,35 +101,38 @@ REACTION_NAMES = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
 MAX_ANNOTATION_READS = 10
 
 
-def rest_check_run_annotations(gh: GitHub, runs: List[Dict[str, Any]]) -> Dict[Any, List[Dict[str, Any]]]:
-    """The first annotation of each failed check run, by run id: all review.never_started reads.
+def attach_first_annotations(gh: GitHub, contexts: List[Dict[str, Any]]) -> None:
+    """Give each failed check run in a rollup its first annotation (review.never_started).
 
-    One call per run, so only where it can change the answer: a failure-class conclusion,
-    not an ignored Xcode Cloud check (those fail on every PR), and `output.annotations_count`
-    not 0. Everything else, and every run past MAX_ANNOTATION_READS, is not read.
+    The one place both transports read annotations, over REST, one call per run. The
+    GraphQL query does not ask for them: the nested connection is priced per PR per
+    context, and it took the board query from 15 to 40 points a page for a case the
+    rollup rarely shows. Only runs whose answer can change are read
+    (review.needs_first_annotation), and not a REST run reporting no annotations
+    (`annotationsCount`, which GraphQL lacks), so a green head costs no call. At most
+    MAX_ANNOTATION_READS per commit.
     """
-    found: Dict[Any, List[Dict[str, Any]]] = {}
-    for run in runs:
-        if len(found) >= MAX_ANNOTATION_READS:
+    reads = 0
+    for context in contexts:
+        if reads >= MAX_ANNOTATION_READS:
             break
-        if (run.get("id") is None or not review.is_failed_conclusion(run.get("conclusion"))
-                or review.is_ignored_check(run.get("name"))
-                or (run.get("output") or {}).get("annotations_count") == 0):
+        run_id = context.get("databaseId")
+        if run_id is None or not review.needs_first_annotation(context) or context.get("annotationsCount") == 0:
             continue
-        listed = gh.rest(f"repos/{{repo}}/check-runs/{run['id']}/annotations?per_page=1") or []
-        found[run["id"]] = [{"message": a.get("message")} for a in listed[:1]]
-    return found
+        listed = gh.rest(f"repos/{{repo}}/check-runs/{run_id}/annotations?per_page=1") or []
+        reads += 1
+        context["annotations"] = {"nodes": [{"message": a.get("message")} for a in listed[:1]]}
 
 
 def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
-    """Every check run and commit status at `sha`, in the GraphQL rollup's node shape."""
+    """Every check run and commit status at `sha`, in the GraphQL rollup's node shape, plus
+    each run's `annotationsCount` so attach_first_annotations can skip runs that have none."""
     runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
             for r in page.get("check_runs", [])]
     statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
-    annotations = rest_check_run_annotations(gh, runs)
-    return ([{"__typename": "CheckRun", "name": r.get("name"), "status": _upper(r.get("status")),
-              "conclusion": _upper(r.get("conclusion")),
-              "annotations": {"nodes": annotations.get(r.get("id"), [])}} for r in runs]
+    return ([{"__typename": "CheckRun", "databaseId": r.get("id"), "name": r.get("name"),
+              "status": _upper(r.get("status")), "conclusion": _upper(r.get("conclusion")),
+              "annotationsCount": (r.get("output") or {}).get("annotations_count")} for r in runs]
             + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
                for c in statuses])
 
@@ -193,6 +197,7 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
             contexts = rest_contexts(gh, sha)
             rollup["contexts"] = {"totalCount": len(contexts), "nodes": contexts}
             commit["statusCheckRollup"] = rollup
+        attach_first_annotations(gh, ((rollup.get("contexts") or {}).get("nodes")) or [])
         if truncated(commit.get("checkSuites")):
             suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
                       for c in page.get("check_suites", [])]
@@ -416,7 +421,8 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
     files = rest_files(gh, number)
     reactions = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/reactions?per_page=100")
     contexts = rest_contexts(gh, sha)
-    suites = [c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
+    attach_first_annotations(gh, contexts)
+    suites =[c for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-suites?per_page=100")
               for c in page.get("check_suites", [])]
     committed = None
     if not suites:

@@ -142,13 +142,16 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
     return count
 
 
-def is_failed_conclusion(conclusion: Optional[str]) -> bool:
-    """A check-run conclusion (either case) that counts as red unless the run never started."""
-    return isinstance(conclusion, str) and conclusion.upper() in _FAILED
-
-
 def is_ignored_check(name: Optional[str]) -> bool:
     return (name or "").startswith(_IGNORED_CHECK_PREFIXES)
+
+
+def needs_first_annotation(context: Dict[str, Any]) -> bool:
+    """Whether a rollup node's first annotation can change what ci_state says about it: a
+    completed check run with a failure-class conclusion that is not an ignored check. The
+    snapshot reads annotations only for these, so a green head costs no call."""
+    return (context.get("__typename") == "CheckRun" and context.get("status") == "COMPLETED"
+            and context.get("conclusion") in _FAILED and not is_ignored_check(context.get("name")))
 
 
 def never_started(context: Dict[str, Any]) -> bool:
