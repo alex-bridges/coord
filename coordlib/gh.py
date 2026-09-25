@@ -4,13 +4,27 @@ Every agent environment that can push already has `gh` authenticated or a token
 (GH_TOKEN/GITHUB_TOKEN: Actions jobs, containers). Tycho's runners do not all
 have `gh`, so the HTTPS path is what the merge-train workflow uses there.
 
-All agents share ONE GitHub login (alex-bridges) and therefore one quota of
-5,000 REST and 5,000 GraphQL points an hour; `calls` counts what a command spent
-so the board can print it.
+Two identities (#1035):
+- **The app.** On a Mac with the app config, outside Actions and unless COORD_APP=off
+  (apptoken.detect), coord's own calls use the inisa-sidechain GitHub App: reads with a
+  read-only installation token, operational writes (claims, messages, train records,
+  CI dispatches) with a narrow write token. Each call goes over HTTPS with the token set
+  on that one request. GH_TOKEN is never exported, so `git push` and every other
+  process stay on Alex's login. A token that cannot be had raises AppAuthError, and
+  nothing falls back to Alex's token.
+- **Alex's login** (alex-bridges) for everything else: all of coord when app mode is off
+  (cloud sessions, other machines, COORD_APP=off), and, in app mode, the attestations
+  (`train approve`, `train substitute-review`) and a hand-run `train step`
+  (`GitHub.as_user`).
+
+Each identity has its own hourly budget; budget.py records every reading under the
+principal whose token made the call. `calls` counts what a command spent so the board
+can print it.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -32,6 +46,32 @@ class GitHubError(RuntimeError):
 
 class NotFound(GitHubError):
     pass
+
+
+class AppAuthError(GitHubError):
+    """No GitHub App token (config, Keychain, openssl, network, or GitHub refused the mint).
+
+    Never answered with Alex's token: the caller serves a cache or refuses, naming the
+    cause and COORD_APP=off as the deliberate override.
+    """
+
+
+# What must never reach a terminal or a log: GitHub tokens (an installation token is
+# `ghs_…`, and the stateless kind embeds a JWT), JWTs, PEM blocks, and long base64 runs
+# (the Keychain holds the key as base64).
+_SECRETS = (
+    re.compile(r"\b(?:gh[opsur]_|github_pat_)[A-Za-z0-9_.\-]+"),
+    re.compile(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    re.compile(r"-----BEGIN[^-]*-----.*?(?:-----END[^-]*-----|$)", re.S),
+    re.compile(r"[A-Za-z0-9+/=]{100,}"),
+)
+
+
+def redact(text: str) -> str:
+    """`text` with anything shaped like a token, JWT or key replaced by [redacted]."""
+    for pattern in _SECRETS:
+        text = pattern.sub("[redacted]", text)
+    return text
 
 
 Runner = Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"]
@@ -90,6 +130,15 @@ def _next_link(header: Optional[str]) -> Optional[str]:
     return None
 
 
+def token_kind(method: str, url: str) -> str:
+    """Which app token a call uses: `read` for a GET and for GraphQL (coord's GraphQL is
+    queries only; it sends no mutation), `ops` for every other method."""
+    path = url.split("?", 1)[0].rstrip("/")
+    if method == "GET" or path == "graphql" or path.endswith("/graphql"):
+        return "read"
+    return "ops"
+
+
 def repo_path_link(url: str, repo: str) -> str:
     """A next-page link rewritten from `repositories/<numeric id>/…` to `repos/<owner>/<name>/…`.
 
@@ -102,7 +151,11 @@ def repo_path_link(url: str, repo: str) -> str:
 
 
 class GitHub:
-    """`runner` injects a fake `gh` (tests); `transport` forces "gh" or "http"."""
+    """`runner` injects a fake `gh` (tests); `transport` forces "gh" or "http".
+
+    `app` is the app's token source (apptoken.AppTokens) when app mode is on for this
+    command. cli.main attaches it, so a GitHub built anywhere else is Alex's, as before.
+    """
 
     def __init__(
         self,
@@ -110,6 +163,7 @@ class GitHub:
         runner: Optional[Runner] = None,
         transport: Optional[str] = None,
         token: Optional[str] = None,
+        app: Optional[Any] = None,
     ):
         self.repo = repo or detect_repo()
         self.owner, self.name = self.repo.split("/", 1)
@@ -118,10 +172,31 @@ class GitHub:
         self._token = token
         self.api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
         self.calls = 0
+        self.app = app
+        self.app_mode: Optional[Any] = None  # apptoken.Mode, for status lines (cli.main sets it)
+
+    # MARK: - Identity
+
+    def as_user(self) -> "GitHub":
+        """This GitHub on Alex's identity (gh/keyring, or GH_TOKEN), for the commands that
+        stay his in app mode. Chosen per command, never as a fallback."""
+        user = copy.copy(self)
+        user.app = None
+        return user
+
+    def principal(self) -> Optional[str]:
+        """Whose budget this GitHub's calls spend: budget.USER, `app:<installation>`, or
+        None in app mode before any token has named the installation (no reading yet)."""
+        if self.app is None:
+            return budget.USER
+        installation = self.app.installation_id()
+        return budget.app_principal(installation) if installation else None
 
     # MARK: - Transport selection
 
     def transport(self) -> str:
+        if self.app is not None:
+            return "http"  # the app's token is set per request, never through gh
         if self._transport is None:
             if shutil.which("gh"):
                 self._transport = "gh"
@@ -148,13 +223,22 @@ class GitHub:
 
     # MARK: - HTTPS
 
-    def _http(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Tuple[Any, Dict[str, str]]:
+    def _http(self, method: str, url: str, body: Optional[Dict[str, Any]] = None,
+              kind: Optional[str] = None) -> Tuple[Any, Dict[str, str]]:
+        """One HTTPS call. In app mode the token is the app's `kind` (`token_kind`: `read`
+        for a GET or a GraphQL query, `ops` for every other write), obtained BEFORE anything
+        else: a failure raises AppAuthError and no request is sent, with any token."""
+        if self.app is not None:
+            bearer = self.app.token(kind or token_kind(method, url))
+            principal = self.principal() or budget.USER  # the token just named the installation
+        else:
+            bearer, principal = self.token(), budget.USER
         self.calls += 1
         if not url.startswith("http"):
             url = f"{self.api}/{url.lstrip('/')}"
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("Authorization", f"Bearer {self.token()}")
+        request.add_header("Authorization", f"Bearer {bearer}")
         request.add_header("Accept", "application/vnd.github+json")
         request.add_header("X-GitHub-Api-Version", "2022-11-28")
         request.add_header("User-Agent", "inisa-coord")
@@ -165,15 +249,20 @@ class GitHub:
             with urllib.request.urlopen(request, timeout=CALL_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
                 headers = {k.lower(): v for k, v in response.headers.items()}
-            budget.record(self.repo, headers, resource)
+            budget.record(self.repo, headers, resource, principal)
         except urllib.error.HTTPError as error:
             # The 403 of an exhausted budget carries `X-RateLimit-Remaining: 0`: the
             # reading that matters most.
-            budget.record(self.repo, dict(error.headers.items()) if error.headers else {}, resource)
+            error_headers = {k.lower(): v for k, v in error.headers.items()} if error.headers else {}
+            budget.record(self.repo, error_headers, resource, principal)
             # Whole, or nearly: a proxy's 403 can carry the list of routes to use instead.
             detail = error.read().decode(errors="replace")[:4000]
             if error.code == 404:
                 raise NotFound(f"HTTP 404 {method} {url}: {detail}") from error
+            # A token without a permission the endpoint needs: GitHub names the ones it accepts.
+            accepted = error_headers.get("x-accepted-github-permissions")
+            if accepted:
+                detail += f" (accepted permissions: {accepted})"
             raise GitHubError(f"HTTP {error.code} {method} {url}: {detail}") from error
         except (urllib.error.URLError, OSError) as error:
             raise GitHubError(f"{method} {url}: {error}") from error
@@ -247,7 +336,7 @@ class GitHub:
             result = (self._runner or _default_runner)(["gh", "api", "-i", f"repos/{self.repo}"], None)
         except GitHubError:
             return None
-        return budget.record(self.repo, budget.parse_header_block(result.stdout or ""), "core")
+        return budget.record(self.repo, budget.parse_header_block(result.stdout or ""), "core", budget.USER)
 
     def dispatch_workflow(self, workflow: str, ref: str, inputs: Optional[Dict[str, str]] = None) -> None:
         self.rest(f"repos/{{repo}}/actions/workflows/{workflow}/dispatches", method="POST",
