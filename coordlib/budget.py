@@ -70,7 +70,7 @@ AT_SKEW_SECONDS = 300  # how far in the future a reading's `at` may be (clock sk
 MAX_APP_WINDOWS = 8  # two were measured; more than a few live at once is a malformed file
 
 USER = cache.USER
-APP_PREFIX = "app:"
+APP_PREFIX = cache.APP_PREFIX  # budget.json: Alex's readings at the top level, each app under "app:<id>"
 
 # Command classes. Reads degrade to the cached snapshot below the read floor; `ci`
 # is a read whose one write (the dispatch) still needs the hard floor, and so is

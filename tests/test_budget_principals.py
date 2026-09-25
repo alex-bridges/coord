@@ -168,35 +168,80 @@ class FileFormatTests(PrincipalTestCase):
         with open(cache.budget_path(REPO), encoding="utf-8") as handle:
             return json.load(handle)
 
-    def test_an_old_single_reading_file_reads_as_the_user_principal(self):
+    def test_alex_stays_at_the_top_level_and_the_app_under_one_key(self):
         now = int(time.time())
         old = {"core": {"remaining": 1234, "limit": 5000, "used": 3766, "reset": now + 1800, "at": now}}
-        self.write_raw(old)
+        self.write_raw(old)  # a file #1033 wrote
         self.assertEqual(cache.load_budget(REPO), old)
         self.assertEqual(budget.left(budget.current(REPO)), 1234)
         self.assertEqual(cache.load_principal(REPO, APP), {})
-        # The first app reading writes version 2 and keeps Alex's reading as it was.
         self.feed(now + 1800, 40)
         raw = self.read_raw()
-        self.assertEqual(raw["version"], 2)
-        self.assertEqual(raw["user"], old)
+        self.assertEqual(set(raw), {"core", APP}, "no version marker, no nesting")
+        self.assertEqual(raw["core"], old["core"])
         self.assertEqual(raw[APP]["core"]["windows"][0]["used"], 40)
         self.assertEqual(budget.left(budget.current(REPO)), 1234)
-
-    def test_version_2_round_trips_both_principals(self):
-        now = int(time.time())
         self.feed(now + 1800, 100, principal=budget.USER)
-        self.feed(now + 1800, 7)
-        self.assertEqual(set(self.read_raw()), {"version", "user", APP})
-        self.assertEqual(budget.current(REPO)["used"], 100)
-        self.assertEqual(self.estimate()["used"], 7)
+        self.assertEqual(set(self.read_raw()), {"core", APP})
+        self.assertEqual(self.estimate()["used"], 40, "writing Alex's reading keeps the app's")
 
-    def test_a_malformed_version_2_file_fails_open(self):
-        for data in ({"version": 2, "user": "x"}, {"version": 2, APP: [1]}, {"version": 2}):
+    def test_the_first_drafts_nested_file_heals(self):
+        now = int(time.time())
+        reading = {"remaining": 900, "limit": 5000, "used": 4100, "reset": now + 1800, "at": now}
+        nested = {"core": dict(reading)}
+        for _ in range(60):  # what alternating the draft's writer with an old coord produced
+            nested = {"user": nested, "version": 2, "core": dict(reading), APP: {"core": {"windows": []}}}
+        self.write_raw(nested)
+        self.assertEqual(budget.current(REPO)["used"], 4100)
+        self.feed(now + 1800, 7)
+        self.assertEqual(set(self.read_raw()), {"core", APP})
+        self.assertLess(os.path.getsize(cache.budget_path(REPO)), 1024)
+
+    def test_a_file_too_deep_to_parse_fails_open_and_is_replaced(self):
+        depth = 5000  # past any recursion limit: json.load raises RecursionError
+        os.makedirs(os.path.dirname(cache.budget_path(REPO)), exist_ok=True)
+        with open(cache.budget_path(REPO), "w", encoding="utf-8") as handle:
+            handle.write('{"user":' * depth + "{}" + "}" * depth)
+        self.assertIsNone(budget.current(REPO))
+        self.assertIsNone(self.estimate())
+        self.assertEqual(budget.decision("train add", budget.current(REPO)), (budget.OK, ""))
+        now = int(time.time())
+        self.feed(now + 1800, 50, principal=budget.USER)
+        self.assertEqual(budget.current(REPO)["used"], 50)
+        self.assertLess(os.path.getsize(cache.budget_path(REPO)), 1024)
+
+    def test_a_malformed_file_fails_open(self):
+        for data in ({"version": 2, "user": "x"}, {APP: [1]}, {APP: {"core": "x"}}, {"core": 3}, [1], "x"):
             with self.subTest(data=data):
                 self.write_raw(data)
                 self.assertIsNone(budget.current(REPO))
                 self.assertIsNone(self.estimate())
+
+
+class LegacyWriterTests(PrincipalTestCase):
+    """The coord from before #1035 (tests/legacy_coordlib, a frozen copy) and this one on
+    ONE cache directory, turn about: the file stays small and both read what they wrote."""
+
+    def test_old_and_new_writers_share_the_file(self):
+        from legacy_coordlib import budget as old_budget
+        from legacy_coordlib import cache as old_cache
+        now = int(time.time())
+        sizes = []
+        for turn in range(250):
+            user_used = 1000 + turn
+            old_budget.record(REPO, rate_headers(user_used, now + 1800, "core"), "core")
+            self.feed(now + 1800 + turn % 2 * 3, 20 + turn)  # the app's two counters, alternating
+            budget.record(REPO, rate_headers(user_used + 1, now + 1800, "graphql"), "graphql", budget.USER)
+            old_budget.record(REPO, rate_headers(user_used + 2, now + 1800, "graphql"), "graphql")
+            sizes.append(os.path.getsize(cache.budget_path(REPO)))
+            self.assertEqual(old_budget.current(REPO)["used"], user_used, turn)
+            self.assertEqual(budget.current(REPO)["used"], user_used, turn)
+            self.assertEqual(budget.current(REPO, "graphql")["used"], user_used + 2, turn)
+            self.assertEqual(self.estimate()["used"], (20 + turn) + (19 + turn if turn else 0), turn)
+        self.assertLess(max(sizes), 2048, "the file does not grow with alternation")
+        self.assertEqual(set(old_cache.load_budget(REPO)), {"core", "graphql", APP},
+                         "the old reader sees the app's key as one more resource and writes it back")
+        self.assertIsNone(old_budget.current(REPO, APP), "and never gates on it")
 
 
 class FakeApp:

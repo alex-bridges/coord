@@ -29,23 +29,33 @@ def cache_dir(repo: str) -> str:
 
 
 def _read(path: str) -> Optional[Dict[str, Any]]:
+    """The file's JSON, or None. Anything a corrupt, truncated or absurdly deep file can
+    raise (ValueError, RecursionError, MemoryError, …) is no data: the cache fails open."""
     try:
         with open(path, encoding="utf-8") as handle:
             return json.load(handle)
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001 - a cache read must never take a command down
         return None
 
 
 def _write(path: str, data: Dict[str, Any]) -> None:
     """Atomic replace, so a concurrent reader sees the old file or the new one."""
+    tmp = None
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
         os.replace(tmp, path)
-    except OSError:
-        pass  # a cache that cannot be written is a slower board, not an error
+        tmp = None
+    except Exception:  # noqa: BLE001 - a cache that cannot be written is a slower board, not an error
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def snapshot_path(repo: str) -> str:
@@ -84,39 +94,50 @@ def budget_path(repo: str) -> str:
     return os.path.join(cache_dir(repo), "budget.json")
 
 
-BUDGET_VERSION = 2
 USER = "user"
+APP_PREFIX = "app:"
+# Keys an early draft of #1035 wrote ({"version": 2, "user": {…}}). A coord from before
+# #1035 keeps any dict it finds and adds its own top-level readings, so alternating the
+# two nested the file one level per write. They are dropped on read and never written.
+_DRAFT_KEYS = ("version", "user")
 
 
 def _budget_file(repo: str) -> Dict[str, Any]:
-    """budget.json as {principal: {resource: reading}} (budget.py).
+    """budget.json's top level, only the dict-valued keys a reader may use.
 
-    Version 2 is {"version": 2, "user": {…}, "app:<installation>": {…}}. The file before
-    it held one principal's readings at the top level, {"core": {…}, "graphql": {…}}, and
-    that principal was Alex's, so such a file reads as the `user` principal.
+    The format is the one #1033 wrote, so every coord on the machine can share the file:
+    Alex's readings (the `user` principal) at the TOP level, one key per resource
+    ({"core": {…}, "graphql": {…}}), and each app principal under ONE key of its own,
+    {"app:<installation>": {"core": {"windows": […]}, …}}. A coord from before #1035 reads
+    the app's key as a resource it does not know, gates only on "core", and writes the key
+    back untouched, so the file never grows with alternation.
     """
     data = _read(budget_path(repo))
     if not isinstance(data, dict):
         return {}  # a file of the wrong shape is no reading (budget.valid checks each one's fields)
-    if data.get("version") == BUDGET_VERSION:
-        return {principal: readings for principal, readings in data.items()
-                if principal != "version" and isinstance(readings, dict)}
-    return {USER: data}
+    return {key: value for key, value in data.items() if key not in _DRAFT_KEYS and isinstance(value, dict)}
 
 
 def load_principal(repo: str, principal: str) -> Dict[str, Any]:
     """One principal's last readings per resource, shared by every agent on the machine."""
-    readings = _budget_file(repo).get(principal)
-    if not isinstance(readings, dict):
-        return {}
+    data = _budget_file(repo)
+    if principal == USER:
+        readings = {key: value for key, value in data.items() if not key.startswith(APP_PREFIX)}
+    else:
+        readings = data.get(principal) or {}
     return {resource: reading for resource, reading in readings.items() if isinstance(reading, dict)}
 
 
 def store_principal(repo: str, principal: str, readings: Dict[str, Any]) -> None:
+    """Replace one principal's readings and keep every other principal's as they are."""
     data = _budget_file(repo)
-    data[principal] = readings
-    out: Dict[str, Any] = {"version": BUDGET_VERSION}
-    out.update(data)
+    if principal == USER:
+        out = {key: value for key, value in data.items() if key.startswith(APP_PREFIX)}
+        out.update({resource: reading for resource, reading in readings.items()
+                    if not str(resource).startswith(APP_PREFIX)})
+    else:
+        out = dict(data)
+        out[principal] = readings
     _write(budget_path(repo), out)
 
 
