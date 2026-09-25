@@ -53,8 +53,9 @@ WORKFLOW_DIR = ".github/workflows/"
 # deny list its runs load, and the watcher that starts them. The conductor must not be
 # able to widen its own powers through the train, so these wait for Alex's approval of
 # the head like a needs-alex PR, whoever queued them.
-ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/",
-                   "Tools/coord/coordlib/conductor.py", "Tools/coord/conductor/")
+# Everything the tick imports is under Tools/coord/, and CLAUDE.md is loaded into every run
+# (substitute review of #1043), so all of it is guarded, this list included.
+ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md")
 MAX_ATTEMPTS = 2
 # The most batch CI runs the train will start in 24 hours, whatever goes wrong: a
 # loop, a red main, a lost dispatch. At ~1 h of heavy runner time each, 12 is the

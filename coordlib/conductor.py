@@ -72,6 +72,9 @@ DENY = [
     "Bash(gh pr merge:*)", "Bash(gh api -X PUT repos/example-owner/example-repo/pulls/*/merge:*)",
     "Bash(gh variable:*)", "Bash(gh secret:*)", "Bash(gh repo delete:*)", "Bash(gh workflow disable:*)",
     "Bash(Tools/coord/coord train approve:*)", "Bash(launchctl:*)", "Bash(sudo:*)",
+    # Mid-command forms; prefix rules alone missed `git push origin --force` and an API
+    # merge (substitute review of #1043). .claude/hooks/conductor-guard.py is the backstop.
+    "Bash(git push * --force*)", "Bash(git push * -f*)", "Bash(gh api * pulls/*/merge*)", "Bash(* train approve*)",
 ]
 FAILED = ("failure", "timed_out", "startup_failure")
 
@@ -697,7 +700,9 @@ class Watcher:
         # A standby wakes only for its own machine; GitHub duties are the leader's.
         wakeable = [r for r in todo if r["wake"] and (leader or r["kind"] == "disk-low")]
         wakes_today = len(self.state.get("wakes") or [])
+        tampered = self.tampered() if wakeable and wake else ""
         blocked = ("waking is off (--no-wake)" if not wake
+                   else f"the conductor's own controls are modified in its checkout: {tampered}" if tampered
                    else f"Claude is down until {iso(down['end'])}" if down
                    else f"paused until {pause['until']} by {pause['agent']}" if pause
                    else f"{wakes_today} wakes in 24 h, the cap is {self.config.max_wakes_per_day}"
@@ -705,6 +710,11 @@ class Watcher:
                    else "API budget too low for a run" if not can_read else "")
         if wakeable and blocked:
             self.say(f"not waking: {blocked}")
+            if tampered and github_ok and self.state.get("tamperEscalated") != tampered:
+                self.escalate_text(f"The conductor stopped waking on {self.config.host}: files that govern it are "
+                                   f"modified in its checkout {self.config.home} ({tampered}). Look at `git status` "
+                                   "there; restore them (`git checkout -- .`) to let it wake again.")
+                self.state["tamperEscalated"] = tampered
             if wakes_today >= self.config.max_wakes_per_day and github_ok and not self.state.get("capEscalated"):
                 self.escalate_text(f"The conductor hit its cap of {self.config.max_wakes_per_day} wakes in 24 hours "
                                    f"and is holding {len(wakeable)} reasons. Raise CONDUCTOR_MAX_WAKES_PER_DAY or look at "
@@ -771,7 +781,7 @@ class Watcher:
         self.say(f"waking {model} for {sum(1 for r in reasons if r['wake'])} reasons")
         self.state.setdefault("wakes", []).append(iso(self.now))
         stop = threading.Event()
-        beating = threading.Thread(target=self._beat_while_running, args=(stop, extra), daemon=True)
+        beating = threading.Thread(target=self._beat_while_running, args=(stop, extra, role == "leader"), daemon=True)
         started = snapshot.now_utc()
         if self.issue is not None:
             beating.start()
@@ -792,10 +802,12 @@ class Watcher:
         self.say(f"run {'ok' if result['ok'] else 'FAILED'} in {seconds}s: {result['summary']}")
         return result
 
-    def _beat_while_running(self, stop: threading.Event, extra: Dict[str, Any]) -> None:
+    def _beat_while_running(self, stop: threading.Event, extra: Dict[str, Any], leader: bool) -> None:
+        """Beats during a long run, with the tick's own role: a standby's run must not
+        start calling itself leader, or the leader would adopt its cursor."""
         while not stop.wait(BEAT_DURING_RUN.total_seconds()):
             try:
-                self.beat(True, dict(extra, live=True))
+                self.beat(leader, dict(extra, live=True))
             except GitHubError:
                 pass
 
@@ -811,17 +823,18 @@ class Watcher:
             "until": iso(until), "reason": limit["reason"]})}
         last = self.state.get("outageComment") or {}
         last_until = _time(last.get("until"))
-        if isinstance(last.get("id"), int) and last_until is not None and self.now - last_until <= outage.PROBE_AFTER:
+        if (isinstance(last.get("id"), int) and last.get("issue") == self.issue and last_until is not None
+                and self.now - last_until <= outage.PROBE_AFTER):
             try:
                 self.gh.rest(f"repos/{{repo}}/issues/comments/{last['id']}", method="PATCH", body=body)
-                self.state["outageComment"] = {"id": last["id"], "until": iso(until)}
+                self.state["outageComment"] = {"id": last["id"], "issue": self.issue, "until": iso(until)}
                 self.say(f"usage limit again: the outage now runs until {iso(until)}")
                 return
             except GitHubError:
                 pass  # deleted: post a new one
         self.say(f"usage limit: posting a claude outage until {iso(until)}")
         posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
-        self.state["outageComment"] = {"id": posted.get("id"), "until": iso(until)}
+        self.state["outageComment"] = {"id": posted.get("id"), "issue": self.issue, "until": iso(until)}
 
     def post_outage_end(self, window: Dict[str, Any]) -> None:
         self.say("first good run after the outage: posting its end")
@@ -842,6 +855,12 @@ class Watcher:
         link = (posted or {}).get("html_url") or ""
         if not notify_alex(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
             self.say("could not dispatch Notify Alex; the escalation is on the board only")
+
+    def tampered(self) -> str:
+        """Local changes to what governs a run (orders, hooks, settings, the watcher): a run
+        must not be able to leave the next one unguarded. "" when clean or not a checkout."""
+        code, out = self.git(["status", "--porcelain", "--", *train.ALEX_ONLY_PATHS])
+        return "" if code != 0 else ", ".join(line[3:] for line in out.splitlines() if line.strip())[:200]
 
     # MARK: Self-update
 

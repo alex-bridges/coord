@@ -55,9 +55,17 @@ PY="$(command -v python3)"
 # launchd starts jobs with a bare PATH; give the watcher the one gh and claude run with here.
 JOB_PATH="$(dirname "$(command -v claude)"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-echo "checking a dry-run tick as $AGENT ..."
-(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \
-  "$PY" Tools/coord/coord conductor tick --dry-run)
+# Check the code that will run: bring a clean, detached checkout to origin/main first.
+if [ -z "$(git -C "$HOME_DIR" status --porcelain)" ] && ! git -C "$HOME_DIR" symbolic-ref -q HEAD >/dev/null; then
+  git -C "$HOME_DIR" fetch -q origin main && git -C "$HOME_DIR" checkout -q --detach FETCH_HEAD
+fi
+echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --short HEAD) ..."
+CHECK="$(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \
+  "$PY" Tools/coord/coord conductor tick --dry-run)"
+echo "$CHECK"
+case "$CHECK" in
+  *"another tick is running"*) echo "install.sh: a tick is running; try again when it ends" >&2; exit 1 ;;
+esac
 
 # Only now replace a running installation: a failed check above leaves it as it was.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true

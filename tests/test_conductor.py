@@ -520,6 +520,30 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(len(starts), 1)
         self.assertEqual(starts[0]["until"], snapshot.iso(at(130)))
 
+    def test_a_modified_guard_in_the_checkout_stops_wakes_and_is_escalated_once(self):
+        self.tick(0)
+        self.message(1)
+        dirty = lambda args: (0, " M .claude/hooks/conductor-guard.py\n") if args[0] == "status" else (0, "")
+        for minutes in (5, 10):
+            self.gh.clock_minutes = minutes
+            conductor.Watcher(self.config, self.gh, now=at(minutes), runner=self.runner, disk=lambda p: 100.0,
+                              git=dirty).tick()
+        self.assertEqual(self.runs, [])
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+
+    def test_a_standbys_run_beats_as_standby(self):
+        watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner, disk=lambda p: 100.0)
+        watcher.state, watcher.issue = {}, 900
+        self.gh.clock_minutes = 0
+        stop = conductor.threading.Event()
+        with mock.patch.object(conductor, "BEAT_DURING_RUN", dt.timedelta(seconds=0.01)):
+            thread = conductor.threading.Thread(target=watcher._beat_while_running, args=(stop, {}, False))
+            thread.start()
+            conductor.threading.Event().wait(0.1)
+            stop.set()
+            thread.join()
+        self.assertEqual([b["leader"] for b in self.gh.records("conductor", "beat")], [False])
+
     def test_dry_run_writes_nothing(self):
         self.message(-1)
         self.tick(0, dry_run=True)
@@ -594,7 +618,11 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NEEDS_ALEX))
         approved = dict(pr, labels=[train.ALEX_APPROVED_LABEL], alexApprovedHead="h" * 40)
         self.assertEqual(train.assess(approved)[0], train.READY)
-        self.assertEqual(train.assess(dict(pr, files=["Tools/coord/coordlib/cli.py"]))[0], train.READY)
+        self.assertEqual(train.assess(dict(pr, files=["Docs/agent-coordination.md"]))[0], train.READY)
+        for guarded in ("Tools/coord/coordlib/cli.py", "CLAUDE.md", ".claude/hooks/conductor-guard.py"):
+            self.assertEqual(train.assess(dict(pr, files=[guarded]))[1], train.HOLD_NEEDS_ALEX, guarded)
+        self.assertEqual(train.assess(dict(pr, files=["Apps/AppAlpha/CLAUDE.md"]))[0], train.READY,
+                         "only the root CLAUDE.md is loaded into a conductor run")
 
     def test_5_the_run_is_denied_the_dangerous_commands(self):
         command = conductor.model_command(make_config("/tmp"), "p", "sonnet")
@@ -607,6 +635,46 @@ class ReviewRegressionTests(unittest.TestCase):
         done = conductor.default_runner(["/bin/sh", "-c", "sleep 30 & sleep 30"], "/tmp", dict(os.environ), 1)
         self.assertEqual(done.returncode, 124)
         self.assertLess((dt.datetime.now() - started).total_seconds(), 10)
+
+
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "hooks", "conductor-guard.py")
+
+
+class GuardHookTests(unittest.TestCase):
+    """.claude/hooks/conductor-guard.py, the substitute review's P1: prefix deny rules missed these."""
+
+    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp", project="/tmp/home", raw=None):
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"CLAUDE_PROJECT_DIR": project, "HOME": os.path.expanduser("~")})
+        if agent:
+            env["COORD_AGENT"] = agent
+        payload = raw if raw is not None else json.dumps({"tool_name": tool, "tool_input": data, "cwd": cwd})
+        done = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env)
+        return done.returncode
+
+    def test_what_the_prefix_rules_missed_is_blocked(self):
+        for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge --help",
+                        "git push origin --force --dry-run HEAD", "./Tools/coord/coord train approve 1 --note x",
+                        "git push origin +HEAD:main", "git push origin HEAD:main", "git push -uf origin x",
+                        "gh pr merge 5 --squash", "gh variable set X", "bash -c 'gh pr merge 5'",
+                        "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "sudo rm -rf /", "launchctl list",
+                        "gh auth token", "sed -i '' s/x/y/ /tmp/home/.claude/hooks/conductor-guard.py"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+
+    def test_ordinary_work_is_allowed(self):
+        for command in ("git push -u origin conductor/fix-cache", "gh pr create --fill", "Tools/coord/coord train add 5",
+                        "gh run rerun 123 --failed", "git push origin conductor/main-red-fix",
+                        "Tools/coord/coord inbox", "cat .claude/hooks/README.md"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}, cwd="/tmp/elsewhere"), 0, command)
+
+    def test_its_own_controls_cannot_be_edited_but_a_worktrees_can(self):
+        self.assertEqual(self.run_guard("Edit", {"file_path": "/tmp/home/.claude/settings.json"}), 2)
+        self.assertEqual(self.run_guard("Write", {"file_path": "/tmp/home/.claude/agents/conductor.md"}), 2)
+        self.assertEqual(self.run_guard("Edit", {"file_path": "/tmp/wt/.claude/hooks/conductor-guard.py"}), 0)
+
+    def test_silent_outside_the_conductor_and_closed_inside_it(self):
+        self.assertEqual(self.run_guard("Bash", {"command": "gh pr merge 5"}, agent=""), 0)
+        self.assertEqual(self.run_guard("Bash", {}, raw="not json"), 2)
 
 
 class TrainRecipientTests(unittest.TestCase):

@@ -31,7 +31,7 @@ from test_coord import BOT, NOW, REAL_FAILURE, check, codex_summary, pr_node, re
 # selector and rules, so a change to either is exercised here too.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
-LIGHT_PATH = "Tools/coord/x.py"
+LIGHT_PATH = ".claude/skills/x.md"  # the docs lane only, and not one of train.ALEX_ONLY_PATHS
 
 
 def checkout_file(path: str) -> str:
@@ -1277,8 +1277,8 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
         self.land(name, tip)
-        h4 = self.pr_branch(4, "Tools/coord/z.py", "light again\n")
-        fresh = self.restart(fake, [nodes[1], ready_node(4, h4, "pr4", files=("Tools/coord/z.py",))])
+        h4 = self.pr_branch(4, ".claude/skills/z.md", "light again\n")
+        fresh = self.restart(fake, [nodes[1], ready_node(4, h4, "pr4", files=(".claude/skills/z.md",))])
         self.queue(fresh, 4, h4, 5)
 
         # A minute later, as a real next build is: a batch built in the same second as the
