@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
-from test_coord import BOT, NOW, check, codex_summary, pr_node, reaction  # noqa: E402
+from test_coord import BOT, NOW, REAL_FAILURE, check, codex_summary, pr_node, reaction, refused_check  # noqa: E402
 
 
 def ready_node(number: int, head: str, branch: str, files=("Packages/CoreKit/Sources/A.swift",), labels=("train",)):
@@ -81,6 +81,32 @@ class EligibilityTests(unittest.TestCase):
                          train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": [], "pending": ["x"], "verdict": "pending"}))[0],
                          train.READY)
+
+    def summary_with_checks(self, *checks):
+        node = ready_node(1, "a" * 40, "b")
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = [check("CI verdict")] + list(checks)
+        return snapshot.summarize_pr(node)
+
+    def test_checks_github_never_started_neither_hold_nor_count(self):
+        # #1026: both plugin probes refused by the Actions budget before any step ran.
+        refused = [refused_check("Linux plugin probe (x86_64)"),
+                   refused_check("Windows plugin probe (dynamic runtime)")]
+        pr = self.summary_with_checks(*refused)
+        self.assertEqual(pr["ci"]["not_run"], ["Linux plugin probe (x86_64)", "Windows plugin probe (dynamic runtime)"])
+        self.assertEqual(train.eligibility(pr), (train.READY, "ready"))
+        # Not run is neutral, not green: the other conditions still decide.
+        self.assertEqual(train.eligibility(dict(pr, isDraft=True))[0], train.HOLD)
+        self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
+
+    def test_a_real_failure_beside_a_never_started_check_still_holds(self):
+        pr = self.summary_with_checks(
+            refused_check("Linux plugin probe (x86_64)"),
+            check("Android", conclusion="FAILURE", annotations=[REAL_FAILURE]))
+        self.assertEqual(train.eligibility(pr), (train.HOLD, "CI is red at its head: Android"))
+        unannotated = self.summary_with_checks(
+            refused_check("Linux plugin probe (x86_64)"),
+            check("Android", conclusion="FAILURE"))
+        self.assertEqual(train.eligibility(unannotated), (train.HOLD, "CI is red at its head: Android"))
 
 
 class PlanAndRunTests(unittest.TestCase):

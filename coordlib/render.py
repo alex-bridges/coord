@@ -34,6 +34,14 @@ def _count(n: int, noun: str) -> str:
 
 
 def ci_words(ci: Dict[str, Any]) -> str:
+    """One phrase for a PR's CI, plus how many checks GitHub never started (review.NOT_RUN_PREFIX):
+    those are neither red nor green, so they are counted beside the verdict, not in it."""
+    words = _ci_verdict_words(ci)
+    not_run = ci.get("not_run") or []
+    return f"{words}, {len(not_run)} not run (billing)" if not_run else words
+
+
+def _ci_verdict_words(ci: Dict[str, Any]) -> str:
     verdict = ci.get("verdict")
     if ci.get("failing"):
         names = ", ".join(ci["failing"][:3]) + (" …" if len(ci["failing"]) > 3 else "")

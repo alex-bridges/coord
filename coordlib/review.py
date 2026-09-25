@@ -31,6 +31,12 @@ VERDICT_CHECK = "CI verdict"
 
 # CANCELLED is absent on purpose: a cancelled check is a superseded run, not a red.
 _FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
+# A job GitHub refused to start concludes `failure` with this as its one annotation
+# (#1026, check run 10000099: "The job was not started because an Actions budget is
+# preventing further use.", started and completed 2 s apart, no step run). It never
+# ran, so it is not evidence either way: NOT RUN, neither red nor green. Only this
+# prefix; any other annotation on a failed run leaves it red.
+NOT_RUN_PREFIX = "The job was not started because"
 # Xcode Cloud checks are billing-dead (memory: reference_xcode_cloud_out_of_credits)
 # and report failure on every PR; they are not CI for this repository.
 _IGNORED_CHECK_PREFIXES = ("LegacyCI | ",)
@@ -136,29 +142,72 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
     return count
 
 
+def is_ignored_check(name: Optional[str]) -> bool:
+    return (name or "").startswith(_IGNORED_CHECK_PREFIXES)
+
+
+def needs_first_annotation(context: Dict[str, Any]) -> bool:
+    """Whether a rollup node's first annotation can change what ci_state says about it: a
+    completed check run with a failure-class conclusion that is not an ignored check. The
+    snapshot reads annotations only for these, so a green head costs no call."""
+    return (context.get("__typename") == "CheckRun" and context.get("status") == "COMPLETED"
+            and context.get("conclusion") in _FAILED and not is_ignored_check(context.get("name")))
+
+
+def first_annotation_is_refusal(context: Dict[str, Any]) -> bool:
+    """Whether a check run's FIRST annotation says GitHub did not start the job."""
+    nodes = ((context.get("annotations") or {}).get("nodes")) or []
+    message = (nodes[0] or {}).get("message") if nodes else None
+    return isinstance(message, str) and message.startswith(NOT_RUN_PREFIX)
+
+
+# Set on a refused run by snapshot.attach_first_annotations, and only there, once it
+# has read every other attempt of the same check name at the commit and found none
+# that failed for real.
+NO_OTHER_ATTEMPT_FAILED = "noOtherAttemptFailed"
+
+
+def never_started(context: Dict[str, Any]) -> bool:
+    """A check run GitHub did not start, with no real failure hiding behind it.
+
+    The rollup and REST's default `filter=latest` show only the newest attempt of a
+    check. A real failure on attempt 1 followed by a re-run the budget refused would
+    otherwise read as not run, and the red would vanish (review of #1032). So a refusal
+    counts only when the snapshot has also cleared the other attempts
+    (NO_OTHER_ATTEMPT_FAILED is True). Fails closed: without that, the run stays red.
+    """
+    return first_annotation_is_refusal(context) and context.get(NO_OTHER_ATTEMPT_FAILED) is True
+
+
 def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     """The CI picture at the head commit.
 
     `verdict` is the `CI verdict` aggregate job when present (success, failure,
     pending, skipped, cancelled, or none). `failing`/`pending` list the individual checks,
-    minus the ignored Xcode Cloud ones.
+    minus the ignored Xcode Cloud ones. `not_run` lists failed check runs GitHub never
+    started (NOT_RUN_PREFIX); they are neither red nor green, so nothing reads them as
+    a reason to hold or to merge.
     """
     rollup = _head_commit(pr).get("statusCheckRollup") or {}
     contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
     failing: List[str] = []
     pending: List[str] = []
     started: List[str] = []
+    not_run: List[str] = []
     verdict = "none"
     for context in contexts:
+        refused = False
         if context.get("__typename") == "CheckRun":
             name = context.get("name") or ""
             status = context.get("status")
             conclusion = context.get("conclusion")
             done = status == "COMPLETED"
             failed = done and conclusion in _FAILED
-            if status == "IN_PROGRESS" and not (context.get("name") or "").startswith(_IGNORED_CHECK_PREFIXES):
+            refused = failed and never_started(context)
+            if status == "IN_PROGRESS" and not is_ignored_check(name):
                 started.append(name)
-            if name == VERDICT_CHECK:
+            # A verdict job that never ran says nothing; the verdict stays as it was.
+            if name == VERDICT_CHECK and not refused:
                 if not done:
                     verdict = "pending"
                 elif conclusion == "SUCCESS":
@@ -172,15 +221,18 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
             state = context.get("state")
             done = state not in ("PENDING", "EXPECTED")
             failed = state in _FAILED
-        if name.startswith(_IGNORED_CHECK_PREFIXES):
+        if is_ignored_check(name):
             continue
-        if failed:
+        if refused:
+            not_run.append(name)
+        elif failed:
             failing.append(name)
         elif not done:
             pending.append(name)
     # `started` is the part of `pending` a runner has picked up; the rest waits in the
     # queue. The board says "running" only when something started (probe 5: a PR row
     # said "running" while the header, which counts workflow runs, said 0 running).
+    # A name that also failed for real is red, never "not run".
     return {"verdict": verdict, "failing": sorted(set(failing)), "pending": sorted(set(pending)),
-            "started": sorted(set(started))}
+            "started": sorted(set(started)), "not_run": sorted(set(not_run) - set(failing))}
 

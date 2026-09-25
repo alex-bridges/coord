@@ -17,7 +17,9 @@ AND again just before main moves — the `train` label is intent, not approval:
   outage (Alex's rule), the `codex-unavailable` label PLUS a `review-substitute`
   comment naming the current head (`coord train substitute-review`);
 - no unanswered Codex findings;
-- CI at the head not red (pending is fine: the batch runs the gates anyway);
+- CI at the head not red (pending is fine: the batch runs the gates anyway). A check
+  GitHub never started (review.NOT_RUN_PREFIX, e.g. refused by the Actions budget) is
+  in `ci.not_run`, not `ci.failing`: it neither holds the PR nor counts for it;
 - not a carve-out: sound-character changes, persistence changes without a
   migration and public API breaks carry `needs-alex` until Alex approves THE
   CURRENT HEAD (`coord train approve`, which records the head and adds
