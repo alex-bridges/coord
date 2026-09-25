@@ -1281,7 +1281,10 @@ class StepTests(unittest.TestCase):
         fresh = self.restart(fake, [nodes[1], ready_node(4, h4, "pr4", files=("Tools/coord/z.py",))])
         self.queue(fresh, 4, h4, 5)
 
-        lines = self.step(fresh).run()
+        # A minute later, as a real next build is: a batch built in the same second as the
+        # landed one would share its train/<stamp> name, and parse_batch would read that
+        # batch's merges (now on main) as this one's.
+        lines = self.step(fresh, now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
         name, tip = self.batch_on_origin()
         self.assertEqual([m["pr"] for m in self.members(name)], [1],
                          f"heavy has its turn although light #4 is ready: {lines}")
@@ -1304,7 +1307,7 @@ class StepTests(unittest.TestCase):
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
 
-        lines = self.step(self.restart(fake, nodes)).run()
+        lines = self.step(self.restart(fake, nodes), now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
         name, tip = self.batch_on_origin()
         self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
 
@@ -1366,6 +1369,41 @@ class StepTests(unittest.TestCase):
         self.queue(fake, 2, h2, 40)
         lines = self.step(fake).run()
         self.assertTrue(any("#1 is heavy" in line for line in lines), lines)
+
+    def test_a_head_the_pr_ref_no_longer_points_at_is_heavy(self):
+        # GitHub's snapshot names an older head than refs/pull/1/head: the diff at that
+        # head is light, but it is not the PR any more, so the train does not trust it.
+        self.install_selector()
+        old = self.pr_branch(1, LIGHT_PATH, "light\n")
+        sh(self.work, "checkout", "-q", "pr1")
+        self.write(HEAVY_PATH, "then heavy\n")
+        self.commit("pr 1, pushed again")
+        sh(self.work, "push", "-q", "origin", "HEAD:refs/pull/1/head")
+        sh(self.work, "checkout", "-q", "main")
+        h2 = self.pr_branch(2, "Docs/y.md", "prose\n")
+        fake = FakeGitHub([ready_node(1, old, "pr1", files=(LIGHT_PATH,)),
+                           ready_node(2, h2, "pr2", files=("Docs/y.md",))], self.main)
+        self.queue(fake, 1, old, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy: its diff is unknown or empty" in line for line in lines), lines)
+        self.assertEqual(fake.posted("overtaken"), [1])
+
+    def test_a_pr_whose_head_cannot_be_fetched_is_heavy(self):
+        self.install_selector()
+        sh(self.work, "checkout", "-q", "-b", "pr1", self.main)
+        self.write(LIGHT_PATH, "light, never pushed\n")
+        h1 = self.commit("pr 1")  # only in the work repository: origin has no refs/pull/1/head
+        sh(self.work, "checkout", "-q", "main")
+        h2 = self.pr_branch(2, "Docs/y.md", "prose\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(LIGHT_PATH,)),
+                           ready_node(2, h2, "pr2", files=("Docs/y.md",))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy: its diff is unknown or empty" in line for line in lines), lines)
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2])
 
     def test_the_selector_missing_from_main_keeps_the_old_order(self):
         # Every ready PR counts as heavy, so one class is ready: the queue order decides.
