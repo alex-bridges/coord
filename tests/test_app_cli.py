@@ -10,6 +10,7 @@ runs the real script as a subprocess, with a pre-seeded token cache so nothing i
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -322,6 +323,87 @@ class NoFallbackTests(AppCliTestCase):
         self.assertEqual(len(self.security_calls()), 1, "the failure is not retried within the command")
 
 
+class RevokedTokenTests(AppCliTestCase):
+    """A cached token GitHub answers 401 to (revoked, or the installation suspended) is
+    dropped from the cache and refused; nothing goes to Alex (review of #1046)."""
+
+    def test_a_401_evicts_the_kind_and_reads_serve_the_cache(self):
+        self.seed_snapshot(age_seconds=7200)
+        revoked = self.seed_token("read")
+        del self.server.tokens[revoked]  # GitHub no longer knows it
+        os.environ["GH_TOKEN"] = USER_TOKEN
+        code, out, err = self.main(["board"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("GitHub refused the app's read token (HTTP 401", err)
+        self.assertIn("COORD_APP=off", err)
+        self.assertIn("showing the snapshot from 2h00m ago", err)
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.json")), "the refused token is gone")
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual([r for r in self.server.requests if r["bearer"] == USER_TOKEN], [])
+        self.assertEqual(len(self.server.api_requests()), 1, "one refused call, then the cache")
+        self.assert_no_secret(out, err)
+        # The next command mints a fresh token.
+        self.keychain("key")
+        code, _, err = self.main(["board"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(self.server.mints, 1)
+
+    def test_a_401_on_a_write_refuses(self):
+        self.seed_token("read")
+        revoked = self.seed_token("ops")
+        del self.server.tokens[revoked]
+        code, _, err = self.main(["send", "hi", "--on", "101"])
+        self.assertEqual(code, EXIT_BACKEND)
+        self.assertIn("GitHub refused the app's ops token (HTTP 401", err)
+        self.assertTrue(os.path.exists(os.path.join(self.token_dir, "read.json")), "only the refused kind goes")
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.json")))
+        self.assertEqual(self.runner.calls, [])
+
+
+class StaleBoardTests(AppCliTestCase):
+    """A board served from the cache after an app failure says how old it is, first."""
+
+    def test_the_board_and_the_brief_lead_with_the_age_and_the_cause(self):
+        self.seed_snapshot(age_seconds=3 * 3600)
+        self.keychain("missing")
+        code, out, _ = self.main(["board"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertRegex(out.splitlines()[0], r" · STALE: snapshot from 3h00m ago; GitHub App token unavailable: "
+                                              r"the Keychain did not return the app key.*COORD_APP=off")
+        code, out, _ = self.main(["board", "--brief"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertTrue(out.startswith("coord (claude@test:app): STALE: snapshot from 3h00m ago; "
+                                       "GitHub App token unavailable: "), out)
+        code, out, _ = self.main(["board", "--json"])
+        self.assertEqual(json.loads(out)["stale"]["ago"], "3h00m")
+
+    def test_a_fresh_board_says_nothing_of_the_kind(self):
+        self.keychain("key")
+        code, out, _ = self.main(["board", "--brief"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("STALE", out)
+
+
+class EchoedSecretTests(AppCliTestCase):
+    """An error body that repeats the bearer token and a JWT never reaches the terminal:
+    every printed error passes through gh.redact (review of #1046, mutant M18b)."""
+
+    def test_no_command_prints_an_echoed_token_or_jwt(self):
+        self.keychain("key")
+        errors = []
+        for status in (400, 404, 409, 422):
+            for argv in (["send", "hi", "--on", "101"], ["claim", "55", "--branch", "feature/x"], ["board", "--fresh"],
+                         ["train", "add", "101"], ["ci", "mk4", "--ref", "feature/x"], ["inbox"],
+                         ["outage", "end", "claude"], ["token", "exec", "--", "true"]):
+                with self.subTest(status=status, argv=argv):
+                    self.server.echo_secrets = status
+                    code, out, err = self.main(argv)
+                    errors.append(err)
+                    self.assert_no_secret(out, err)
+        self.assertGreater(self.server.mints, 0, "real tokens were minted and echoed back")
+        self.assertIn("[redacted]", "".join(errors), "the echoed secrets reached the printing path and were redacted")
+
+
 # MARK: - coord token
 
 
@@ -358,6 +440,21 @@ class TokenStatusTests(AppCliTestCase):
         code, out, _ = self.main(["token", "status"])
         self.assertIn("app mode: on (the app config exists but cannot be used)", out)
         self.assertIn("every app call refuses: the app config", out)
+
+    def test_status_names_another_api_url_as_the_reason(self):
+        os.environ["GITHUB_API_URL"] = "http://127.0.0.1:9"
+        code, out, _ = self.main(["token", "status"])
+        self.assertIn("app mode: off (GITHUB_API_URL is http://127.0.0.1:9, not https://api.github.com; "
+                      "app credentials go to GitHub only)", out)
+        self.assertIn("githubIdentity: Alex's gh/keyring login", self.main(["whoami"])[1])
+
+    def test_status_shows_a_held_mint_failure(self):
+        self.keychain("missing")
+        self.main(["board"])
+        code, out, err = self.main(["token", "status"])
+        self.assertRegex(out, r"read token: none cached\n  a mint failed \d+s ago and is not retried before "
+                              r"\d\d:\d\d:\d\dZ: the Keychain did not return the app key")
+        self.assert_no_secret(out, err)
 
 
 class TokenExecTests(AppCliTestCase):
@@ -417,6 +514,11 @@ class ScriptTests(AppCliTestCase):
 
     def run_script(self, *argv):
         env = {name: value for name, value in os.environ.items() if name not in ("GH_TOKEN", "GITHUB_TOKEN")}
+        # The subprocess does not inherit this process's patches: point its `security` at
+        # the tripwire (honoured because COORD_APP_CONFIG is a test config), so it can never
+        # reach /usr/bin/security, and its GitHub at nothing it could reach.
+        env["COORD_SECURITY_BIN"] = apptoken.SECURITY
+        env["FAKE_SECURITY_MODE"] = "tripwire"
         return subprocess.run([sys.executable, COORD, *argv], capture_output=True, text=True, env=env, timeout=60)
 
     def test_exec_hands_the_child_the_cached_token_and_prints_none(self):
@@ -430,6 +532,16 @@ class ScriptTests(AppCliTestCase):
         self.assertIn("read token: reusable", status.stdout)
         self.assert_no_secret(status.stdout, status.stderr)
         self.assertEqual(self.security_calls(), [])
+
+    def test_a_subprocess_that_must_mint_reaches_only_the_tripwire(self):
+        # No cached token: the script has to mint, so it asks `security` for the key. The
+        # tripwire answers (and logs the call); /usr/bin/security never runs, and nothing
+        # reaches the network because the key is refused before any request is built.
+        result = self.run_script("token", "exec", "--", "true")
+        self.assertEqual(result.returncode, EXIT_BACKEND, result.stderr)
+        self.assertIn("tripwire", result.stderr)
+        self.assertEqual(len(self.security_calls()), 1, "the fake saw the one call; the real one saw none")
+        self.assert_no_secret(result.stdout, result.stderr)
 
 
 # MARK: - No secret in any output

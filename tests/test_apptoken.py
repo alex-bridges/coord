@@ -114,9 +114,12 @@ class MintTests(AppTestCase):
         self.assertEqual(tokens.installation_id(), INSTALLATION)
 
     def test_the_ops_token_carries_only_the_operational_writes(self):
+        # Issues AND pull_requests write: GitHub enforces the one matching the number
+        # (measured 2026-09-25 on PR #1046 and issue #991); actions write for dispatches.
         self.tokens().token("ops")
         mint = self.server.requests[-1]
-        self.assertEqual(mint["body"]["permissions"], {"actions": "write", "issues": "write", "metadata": "read"})
+        self.assertEqual(mint["body"]["permissions"],
+                         {"actions": "write", "issues": "write", "metadata": "read", "pull_requests": "write"})
 
     def test_one_jwt_and_one_keychain_read_serve_both_kinds_in_one_process(self):
         tokens = self.tokens()
@@ -198,6 +201,7 @@ class MintTests(AppTestCase):
             with self.subTest(mode=mode):
                 self.keychain(mode)
                 open(os.environ["FAKE_SECURITY_LOG"], "w").close()
+                self.forget_failures()
                 tokens = self.tokens()
                 with self.assertRaises(AppAuthError) as caught:
                     tokens.token("read")
@@ -209,6 +213,7 @@ class MintTests(AppTestCase):
         for status in (401, 403):
             with self.subTest(status=status):
                 self.server.mint_status = status
+                self.forget_failures()
                 with self.assertRaises(AppAuthError) as caught:
                     self.tokens().token("read")
                 self.assertIn(f"answered HTTP {status}", str(caught.exception))
@@ -292,7 +297,7 @@ class ModeTests(AppTestCase):
         mode = apptoken.detect(REPO)
         self.assertTrue(mode.on)
         self.assertEqual(mode.config["client_id"], CLIENT_ID)
-        self.assertIsInstance(apptoken.for_mode(mode, API), apptoken.AppTokens)
+        self.assertIsInstance(apptoken.for_mode(mode), apptoken.AppTokens)
 
     def test_off_in_github_actions(self):
         os.environ["GITHUB_ACTIONS"] = "true"
@@ -329,7 +334,7 @@ class ModeTests(AppTestCase):
                 mode = apptoken.detect(REPO)
                 self.assertTrue(mode.on)
                 self.assertTrue(mode.error)
-                source = apptoken.for_mode(mode, API)
+                source = apptoken.for_mode(mode)
                 with self.assertRaises(AppAuthError):
                     source.token("read")
                 self.assertIsNone(source.installation_id())
@@ -354,6 +359,192 @@ class DescribeTests(AppTestCase):
         self.assertEqual(self.tokens().describe("ops"), {"state": "none cached"})
         self.seed_token("ops", permissions=apptoken.READ_PERMISSIONS)
         self.assertIn("permissions differ", self.tokens().describe("ops")["state"])
+
+
+class APIHostTests(AppTestCase):
+    """App credentials go to https://api.github.com and nowhere else (review of #1046)."""
+
+    def test_any_other_api_url_turns_app_mode_off(self):
+        for url in ("http://127.0.0.1:9", "https://proxy.example/api", "http://api.github.com",
+                    "https://api.github.com.evil.example"):
+            with self.subTest(url=url):
+                os.environ["GITHUB_API_URL"] = url
+                mode = apptoken.detect(REPO)
+                self.assertFalse(mode.on)
+                self.assertIn(f"GITHUB_API_URL is {url}", mode.reason)
+                self.assertIn("app credentials go to GitHub only", mode.reason)
+        for url in ("https://api.github.com", "https://api.github.com/"):
+            with self.subTest(url=url):
+                os.environ["GITHUB_API_URL"] = url
+                self.assertTrue(apptoken.detect(REPO).on)
+
+    def test_the_token_source_talks_to_github_only(self):
+        self.assertEqual(self.tokens().api, "https://api.github.com")
+
+    def test_an_app_token_is_never_sent_off_github(self):
+        from coordlib.gh import GitHub
+
+        class Source:
+            asked = []
+
+            def token(self, kind):
+                self.asked.append(kind)
+                return "ghs_must_not_leave"
+
+            def installation_id(self):
+                return INSTALLATION
+
+        gh = GitHub(REPO, app=Source())
+        for url in ("https://evil.example/repos/o/r/issues", "http://api.github.com/repos/o/r/issues",
+                    "https://api.github.com.evil.example/x"):
+            with self.subTest(url=url):
+                with self.assertRaises(AppAuthError):
+                    gh._http("GET", url)  # noqa: SLF001
+        self.assertEqual(Source.asked, [], "no token was even fetched")
+        self.assertEqual(self.server.requests, [])
+
+
+class FailureMemoryTests(AppTestCase):
+    """A failed mint is remembered across processes for FAILURE_HOLD_SECONDS, in a 0600
+    file that holds the cause and the time and never a secret (review of #1046)."""
+
+    def test_a_keychain_failure_holds_both_kinds_without_asking_again(self):
+        self.keychain("missing")
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        self.assertEqual(len(self.security_calls()), 1)
+        for kind in apptoken.KINDS:
+            path = os.path.join(self.token_dir, f"{kind}.failed.json")
+            self.assertEqual(file_mode(path), 0o600)
+            record = json.load(open(path, encoding="utf-8"))
+            self.assertEqual(set(record), {"at", "cause", "stage"})
+            self.assertIn("the Keychain did not return the app key", record["cause"])
+            self.assert_no_secret(json.dumps(record))
+        for kind in apptoken.KINDS:  # the next processes
+            with self.subTest(kind=kind):
+                with self.assertRaises(AppAuthError) as caught:
+                    self.tokens().token(kind)
+                self.assertIn("a mint failed", str(caught.exception))
+                self.assertIn("the Keychain did not return the app key", str(caught.exception))
+        self.assertEqual(len(self.security_calls()), 1, "no second Keychain prompt")
+        self.assertEqual(self.server.requests, [])
+
+    def test_the_hold_ends_after_five_minutes_and_a_success_clears_it(self):
+        self.keychain("missing")
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        self.keychain("key")
+        later = time.time() + apptoken.FAILURE_HOLD_SECONDS - 5
+        with self.assertRaises(AppAuthError):
+            self.tokens(clock=lambda: later).token("read")
+        self.assertEqual(len(self.security_calls()), 1)
+        after = time.time() + apptoken.FAILURE_HOLD_SECONDS + 1
+        self.assertTrue(self.tokens(clock=lambda: after).token("read"))
+        self.assertEqual(len(self.security_calls()), 2)
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.failed.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.failed.json")),
+                         "a key failure is cleared for both kinds once the key works")
+
+    def test_a_refused_mint_holds_only_its_kind(self):
+        self.keychain("key")
+        self.server.grant = dict(apptoken.READ_PERMISSIONS, issues="write")  # refused for read only
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        self.server.grant = None
+        self.assertTrue(os.path.exists(os.path.join(self.token_dir, "read.failed.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.failed.json")))
+        self.assertTrue(self.tokens().token("ops"))
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+
+    def test_a_lock_timeout_is_not_remembered(self):
+        os.makedirs(self.token_dir, exist_ok=True)
+        fd = os.open(os.path.join(self.token_dir, "read.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        self.patch(apptoken, "LOCK_TIMEOUT_SECONDS", 0.2)
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.failed.json")))
+
+    def test_a_marker_others_can_read_or_from_the_future_is_ignored(self):
+        os.makedirs(self.token_dir, exist_ok=True)
+        path = os.path.join(self.token_dir, "read.failed.json")
+        for at, mode in ((time.time(), 0o644), (time.time() + 3600, 0o600), ("now", 0o600)):
+            with self.subTest(at=at, mode=mode):
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump({"at": at, "cause": "x", "stage": "key"}, handle)
+                os.chmod(path, mode)
+                self.assertIsNone(self.tokens().failure("read"))
+
+
+class MintErrorTests(AppTestCase):
+    """Anything the mint path can raise becomes an AppAuthError, never a traceback."""
+
+    def setUp(self):
+        super().setUp()
+        self.keychain("key")
+
+    def failing_urlopen(self, error=None, body=None):
+        def urlopen(request, timeout=None):
+            if error is not None:
+                raise error
+
+            class Response:
+                headers = {}
+
+                def read(self):
+                    return body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            return Response()
+        return urlopen
+
+    def test_every_transport_error_is_an_app_auth_error(self):
+        import http.client
+        cases = {
+            "IncompleteRead": dict(error=http.client.IncompleteRead(b"partial", 100)),
+            "BadStatusLine": dict(error=http.client.BadStatusLine("garbage")),
+            "RemoteDisconnected": dict(error=http.client.RemoteDisconnected("closed")),
+            "not UTF-8": dict(body=b"\xff\xfe\xfd"),
+            "not JSON": dict(body=b"<html>"),
+            "timeout": dict(error=TimeoutError("timed out")),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(case=name):
+                self.forget_failures()
+                self.patch(apptoken.urllib.request, "urlopen", self.failing_urlopen(**kwargs))
+                with self.assertRaises(AppAuthError) as caught:
+                    self.tokens().token("read")
+                self.assert_no_secret(str(caught.exception))
+
+    def test_an_unexpected_error_in_the_mint_is_contained(self):
+        def broken(*args, **kwargs):
+            raise KeyError("a bug")
+        self.patch(apptoken.AppTokens, "_mint_with", broken)
+        with self.assertRaises(AppAuthError) as caught:
+            self.tokens().token("read")
+        self.assertIn("minting failed (KeyError", str(caught.exception))
+
+
+class SecurityOverrideTests(AppTestCase):
+    """COORD_SECURITY_BIN reaches the `coord` script in a subprocess, which module patches
+    cannot; it is honoured only with a non-default app config."""
+
+    def test_the_override_needs_a_test_config(self):
+        self.patch(apptoken, "SECURITY", "/usr/bin/security")
+        fake = os.path.join(self.root, "bin", "security")
+        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake}), "/usr/bin/security")
+        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake,
+                                                   "COORD_APP_CONFIG": apptoken.default_config_path()}),
+                         "/usr/bin/security", "never with the real config")
+        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake, "COORD_APP_CONFIG": self.config_path}),
+                         fake)
 
 
 if __name__ == "__main__":

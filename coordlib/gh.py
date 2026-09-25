@@ -25,6 +25,7 @@ can print it.
 from __future__ import annotations
 
 import copy
+import http.client
 import json
 import os
 import re
@@ -37,6 +38,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from . import budget
 
 DEFAULT_REPO = "example-owner/example-repo"
+# The one place the app's JWT and tokens may go (apptoken.detect turns app mode off when
+# GITHUB_API_URL names anything else).
+GITHUB_API = "https://api.github.com"
 CALL_TIMEOUT_SECONDS = 30
 
 
@@ -170,7 +174,7 @@ class GitHub:
         self._runner = runner
         self._transport = transport or os.environ.get("COORD_TRANSPORT") or ("gh" if runner else None)
         self._token = token
-        self.api = (os.environ.get("GITHUB_API_URL") or "https://api.github.com").rstrip("/")
+        self.api = (os.environ.get("GITHUB_API_URL") or GITHUB_API).rstrip("/")
         self.calls = 0
         self.app = app
         self.app_mode: Optional[Any] = None  # apptoken.Mode, for status lines (cli.main sets it)
@@ -228,14 +232,19 @@ class GitHub:
         """One HTTPS call. In app mode the token is the app's `kind` (`token_kind`: `read`
         for a GET or a GraphQL query, `ops` for every other write), obtained BEFORE anything
         else: a failure raises AppAuthError and no request is sent, with any token."""
+        kind = kind or token_kind(method, url)
+        if not url.startswith("http"):
+            url = f"{(GITHUB_API if self.app is not None else self.api)}/{url.lstrip('/')}"
         if self.app is not None:
-            bearer = self.app.token(kind or token_kind(method, url))
+            if not url.startswith(GITHUB_API + "/"):
+                # A next-page link or anything else pointing off GitHub never gets an app token.
+                raise AppAuthError(f"not sending an app token to {url.split('?', 1)[0]}: app credentials go to "
+                                   f"{GITHUB_API} only")
+            bearer = self.app.token(kind)
             principal = self.principal() or budget.USER  # the token just named the installation
         else:
             bearer, principal = self.token(), budget.USER
         self.calls += 1
-        if not url.startswith("http"):
-            url = f"{self.api}/{url.lstrip('/')}"
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Authorization", f"Bearer {bearer}")
@@ -256,7 +265,16 @@ class GitHub:
             error_headers = {k.lower(): v for k, v in error.headers.items()} if error.headers else {}
             budget.record(self.repo, error_headers, resource, principal)
             # Whole, or nearly: a proxy's 403 can carry the list of routes to use instead.
-            detail = error.read().decode(errors="replace")[:4000]
+            try:
+                detail = error.read().decode(errors="replace")[:4000]
+            except Exception:  # noqa: BLE001 - an unreadable error body is still this HTTP error
+                detail = "(no readable body)"
+            if error.code == 401 and self.app is not None:
+                # The app's token was refused: revoked, or the installation suspended. Drop
+                # it from the cache and refuse (reads serve their cache; nothing goes to Alex).
+                reason = f"GitHub refused the app's {kind} token (HTTP 401: {redact(detail)[:200]})"
+                self.app.reject(kind, bearer, reason)
+                raise AppAuthError(reason) from None
             if error.code == 404:
                 raise NotFound(f"HTTP 404 {method} {url}: {detail}") from error
             # A token without a permission the endpoint needs: GitHub names the ones it accepts.
@@ -264,8 +282,8 @@ class GitHub:
             if accepted:
                 detail += f" (accepted permissions: {accepted})"
             raise GitHubError(f"HTTP {error.code} {method} {url}: {detail}") from error
-        except (urllib.error.URLError, OSError) as error:
-            raise GitHubError(f"{method} {url}: {error}") from error
+        except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as error:
+            raise GitHubError(f"{method} {url}: {type(error).__name__}: {error}") from error
         return (json.loads(raw) if raw.strip() else None), headers
 
     # MARK: - API

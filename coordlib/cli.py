@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
@@ -55,6 +56,11 @@ def app_words(error: Exception) -> str:
     return f"GitHub App token unavailable ({redact(str(error))}); nothing was sent as Alex ({apptoken.OVERRIDE})"
 
 
+def app_stale_words(error: Exception) -> str:
+    """The same, short enough for the board's first line."""
+    return f"GitHub App token unavailable: {render._clip(redact(str(error)), 120)}; COORD_APP=off uses Alex's gh"
+
+
 class ArgumentParser(argparse.ArgumentParser):
     """argparse exits 2 on a bad invocation; here 2 means a claim conflict, so a usage
     error must exit EXIT_USAGE (Codex on #989). Subparsers inherit this class."""
@@ -73,7 +79,7 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
         return snapshot_despite_budget(gh, low)
     unavailable = getattr(gh, "app_unavailable", None)
     if unavailable:
-        return snapshot_despite_budget(gh, unavailable, AppRefused)
+        return snapshot_despite_budget(gh, unavailable, AppRefused, getattr(gh, "app_stale", None))
     if max_age > 0:
         cached = cache.load_snapshot(gh.repo, max_age)
         if cached is not None and cached.get("schema") == 1:
@@ -85,16 +91,24 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
         # else (a claim's conflict check) must not act on a stale one, and refuses.
         if not getattr(gh, "cache_read", False):
             raise
-        gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
-        return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused)
+        mark_app_unavailable(gh, error)
+        return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused, gh.app_stale)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
 
 
-def snapshot_despite_budget(gh: GitHub, low: str, refused: type = BudgetRefused) -> Dict[str, Any]:
+def mark_app_unavailable(gh: GitHub, error: Exception) -> None:
+    """From here on this command reads only the cache: the app has no token."""
+    gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+    gh.app_stale = app_stale_words(error)  # type: ignore[attr-defined]
+
+
+def snapshot_despite_budget(gh: GitHub, low: str, refused: type = BudgetRefused,
+                            stale: Optional[str] = None) -> Dict[str, Any]:
     """The budget is below the read floor, or the app has no token: the machine's cached
     snapshot at any age, `--max-age` and `--fresh` notwithstanding, with a one-line
-    warning; no API call."""
+    warning; no API call. The snapshot carries `stale` (its age and why), which the
+    board's first line and the brief show first, so a stale board never looks current."""
     cached = cache.load_snapshot(gh.repo, float("inf"))
     if cached is None or cached.get("schema") != 1:
         raise refused(f"{low}; no cached snapshot on this machine to show")
@@ -103,7 +117,9 @@ def snapshot_despite_budget(gh: GitHub, low: str, refused: type = BudgetRefused)
     if generated is not None:
         # An invalidated snapshot's file time is the epoch; its own timestamp is the truth.
         cached["cacheAgeSeconds"] = max(0, int((now - generated).total_seconds()))
-    print(f"coord: {low}; showing the snapshot from {render.ago(cached.get('generatedAt'), now)} ago", file=sys.stderr)
+    age = render.ago(cached.get("generatedAt"), now)
+    cached["stale"] = {"ago": age, "reason": stale or low}
+    print(f"coord: {low}; showing the snapshot from {age} ago", file=sys.stderr)
     return cached
 
 
@@ -498,7 +514,7 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
     except AppAuthError as error:
         if not getattr(gh, "app_unavailable", None):  # get_snapshot served a fresh cache and said nothing
-            gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+            mark_app_unavailable(gh, error)
             print(f"coord: {gh.app_unavailable}; counting from the cached snapshot", file=sys.stderr)
         return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
@@ -636,7 +652,8 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     try:
         refs = [] if low else gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
     except AppAuthError as error:
-        low = gh.app_unavailable = app_words(error)  # type: ignore[attr-defined]
+        mark_app_unavailable(gh, error)
+        low = gh.app_unavailable
         print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
         refs = []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
@@ -684,7 +701,7 @@ def cmd_token_status(args: argparse.Namespace, gh: GitHub) -> int:
               f"installed on {mode.config['repo']})")
     app = getattr(gh, "app", None)
     if app is None and mode.config is not None:
-        app = apptoken.AppTokens(mode.config, apptoken.token_cache_dir(), gh.api)  # to read the cache only
+        app = apptoken.AppTokens(mode.config, apptoken.token_cache_dir())  # to read the cache only
     if app is None:
         return EXIT_OK
     installation = app.installation_id()
@@ -701,6 +718,10 @@ def cmd_token_status(args: argparse.Namespace, gh: GitHub) -> int:
         if info.get("permissions"):
             line += "; permissions " + ", ".join(f"{k}:{v}" for k, v in sorted(info["permissions"].items()))
         print(line)
+        held = app.failure(kind) if hasattr(app, "failure") else None
+        if held:
+            print(f"  a mint failed {int(time.time() - held['at'])}s ago and is not retried before "
+                  f"{time.strftime('%H:%M:%SZ', time.gmtime(held['until']))}: {redact(held['cause'])}")
     if installation:
         print(budget.header_words(gh.repo, principal=budget.app_principal(installation)))
     return EXIT_OK
@@ -1003,7 +1024,7 @@ def attach_app(gh: GitHub) -> None:
     calls use the app. Nothing is minted here; the first call that needs a token does."""
     mode = apptoken.detect(gh.repo)
     gh.app_mode = mode
-    gh.app = apptoken.for_mode(mode, gh.api) if mode.on else None
+    gh.app = apptoken.for_mode(mode) if mode.on else None
 
 
 def run(args: argparse.Namespace, gh: GitHub) -> int:

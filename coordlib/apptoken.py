@@ -45,6 +45,7 @@ import binascii
 import contextlib
 import errno
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -54,19 +55,22 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
 from . import review
-from .gh import AppAuthError, redact
+from .gh import GITHUB_API, AppAuthError, redact
 
 SWITCH_ENV = "COORD_APP"
 CONFIG_ENV = "COORD_APP_CONFIG"
 TOKEN_CACHE_ENV = "COORD_TOKEN_CACHE_DIR"
+SECURITY_ENV = "COORD_SECURITY_BIN"
 KEYCHAIN_SERVICE = "example-coord-github-app"
 
-# Absolute paths, never looked up on PATH and never taken from the environment: the PEM
-# goes into OPENSSL, so whoever could choose that binary could read the key. Tests
-# replace these module attributes.
+# Absolute paths, never looked up on PATH. The PEM goes INTO openssl, so whoever could
+# choose that binary could read the key: OPENSSL is never taken from the environment.
+# `security` only hands a key OUT, so a test may replace it (security_binary), and only
+# with a non-default app config, whose client id the real Keychain does not hold. Tests
+# in this process replace the module attributes.
 SECURITY = "/usr/bin/security"
 OPENSSL = "/usr/bin/openssl"
 
@@ -75,15 +79,19 @@ READ_PERMISSIONS = {
     "actions": "read", "checks": "read", "contents": "read", "issues": "read",
     "metadata": "read", "pull_requests": "read", "statuses": "read",
 }
-# The writes coord makes as the app, and the permission each needs (GitHub's endpoint
-# documentation: comments and labels accept Issues OR Pull requests write):
-# - issues write: POST issues/{n}/comments (claim, release, send, train add/remove),
-#   POST and DELETE issues/{n}/labels (train add/remove), POST labels (the mailbox and
-#   train labels), POST issues (the mailbox issue);
-# - actions write: POST actions/workflows/{id}/dispatches (`coord ci`, the train wake);
+# The writes coord makes as the app, and the permission each needs:
+# - issues AND pull_requests write: POST issues/{n}/comments (claim, release, send, train
+#   add/remove, outage), POST and DELETE issues/{n}/labels (train add/remove), POST labels
+#   (the mailbox, train and conductor labels), POST issues (the mailbox and conductor
+#   issues). GitHub's docs say "at least one of" the two, but it enforces the one that
+#   matches the NUMBER: measured 2026-09-25 ~23:15Z with non-mutating probes, issues
+#   write alone was refused (403 "Resource not accessible by integration") for a
+#   comment, a label add and a label remove on PR #1046 and worked on issue #991;
+#   pull_requests write alone was the mirror image; both together worked on both.
+# - actions write: POST actions/workflows/{id}/dispatches (`coord ci`, the train wake).
 # - metadata read: mandatory for any repository permission.
-# Every read goes through the `read` token, so ops carries no read permission.
-OPS_PERMISSIONS = {"actions": "write", "issues": "write", "metadata": "read"}
+# Every read goes through the `read` token, so ops carries no read permission of its own.
+OPS_PERMISSIONS = {"actions": "write", "issues": "write", "metadata": "read", "pull_requests": "write"}
 PERMISSIONS = {"read": READ_PERMISSIONS, "ops": OPS_PERMISSIONS}
 
 REUSE_MARGIN_SECONDS = 300
@@ -93,6 +101,9 @@ JWT_REUSE_SECONDS = 240  # one JWT signs both kinds' mints within one command
 LOCK_TIMEOUT_SECONDS = 60
 SUBPROCESS_TIMEOUT_SECONDS = 20
 HTTP_TIMEOUT_SECONDS = 30
+# A failed mint is remembered this long across processes (`<kind>.failed.json`), so a
+# locked Keychain or a refused mint costs one prompt or one stall, not one per command.
+FAILURE_HOLD_SECONDS = 300
 
 OVERRIDE = "COORD_APP=off runs coord on Alex's gh identity instead, deliberately"
 
@@ -112,9 +123,25 @@ class Mode:
         self.error = error
 
 
+def default_config_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".config", "inisa-coord", "github-app.json")
+
+
 def config_path(env: Optional[Dict[str, str]] = None) -> str:
     env = os.environ if env is None else env
-    return env.get(CONFIG_ENV) or os.path.join(os.path.expanduser("~"), ".config", "inisa-coord", "github-app.json")
+    return env.get(CONFIG_ENV) or default_config_path()
+
+
+def security_binary(env: Optional[Dict[str, str]] = None) -> str:
+    """SECURITY, or COORD_SECURITY_BIN when a NON-default app config is in use (tests that
+    run the `coord` script as a subprocess, which module patches cannot reach). With the
+    real config the override is ignored, so it can never point the real client id's
+    Keychain lookup anywhere else."""
+    env = os.environ if env is None else env
+    override, configured = env.get(SECURITY_ENV), env.get(CONFIG_ENV)
+    if override and configured and os.path.abspath(configured) != os.path.abspath(default_config_path()):
+        return override
+    return SECURITY
 
 
 def token_cache_dir(env: Optional[Dict[str, str]] = None) -> str:
@@ -153,6 +180,11 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
         return Mode(False, "COORD_APP=off: the deliberate override, Alex's gh/keyring identity", path)
     if env.get("GITHUB_ACTIONS") == "true":
         return Mode(False, "in GitHub Actions, where the train keeps GITHUB_TOKEN", path)
+    api = (env.get("GITHUB_API_URL") or GITHUB_API).rstrip("/")
+    if api != GITHUB_API:
+        # The app's JWT and tokens go to GitHub and nowhere else (a local test port, a
+        # proxy, a typo), so any other API URL means Alex's identity, as before the app.
+        return Mode(False, f"GITHUB_API_URL is {api}, not {GITHUB_API}; app credentials go to GitHub only", path)
     if not os.path.lexists(path):
         return Mode(False, f"no app config at {path} (cloud sessions and machines without the app)", path)
     try:
@@ -164,11 +196,12 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
     return Mode(True, f"app config {path}", path, config)
 
 
-def for_mode(mode: Mode, api: str) -> "AppTokens":
-    """The token source for an app-mode command (a failing one when the config is broken)."""
+def for_mode(mode: Mode) -> "AppTokens":
+    """The token source for an app-mode command (a failing one when the config is broken).
+    It talks to GITHUB_API only; `detect` turned app mode off for any other API URL."""
     if mode.error or mode.config is None:
         return Unavailable(mode.error or "no app config")
-    return AppTokens(mode.config, token_cache_dir(), api)
+    return AppTokens(mode.config, token_cache_dir())
 
 
 # MARK: - JWT
@@ -261,11 +294,11 @@ def expiry_epoch(entry: Dict[str, Any]) -> Optional[float]:
 class AppTokens:
     """Mints, caches and hands out the app's installation tokens for one config."""
 
-    def __init__(self, config: Dict[str, Any], cache_dir: str, api: str = "https://api.github.com",
+    def __init__(self, config: Dict[str, Any], cache_dir: str,
                  urlopen: Optional[Callable[..., Any]] = None, clock: Callable[[], float] = time.time):
         self.config = config
         self.cache_dir = cache_dir
-        self.api = api.rstrip("/")
+        self.api = GITHUB_API  # never anything else: app credentials go to GitHub only
         self.owner, self.name = config["repo"].split("/", 1)
         self._urlopen = urlopen
         self._clock = clock
@@ -281,7 +314,9 @@ class AppTokens:
         """The `kind` token: cached while it has more than five minutes, else minted.
 
         Raises AppAuthError on any failure, and repeats the first failure for the rest of
-        the process instead of asking the Keychain again.
+        the process instead of asking the Keychain again. A failed mint is also remembered
+        for FAILURE_HOLD_SECONDS across processes (`<kind>.failed.json`), so the next
+        commands refuse at once instead of prompting or stalling again.
         """
         if kind not in PERMISSIONS:
             raise ValueError(f"unknown token kind {kind!r}")
@@ -290,15 +325,28 @@ class AppTokens:
         try:
             entry = self.cached(kind)
             if entry is None:
+                self._check_failed(kind)
                 with self._lock(kind):
                     entry = self.cached(kind)  # another process may have minted meanwhile
                     if entry is None:
-                        entry = self._mint(kind)
+                        self._check_failed(kind)  # or failed meanwhile
+                        entry = self._mint_remembering_failure(kind)
         except AppAuthError as error:
             self._failure = redact(str(error))
             raise AppAuthError(self._failure) from None
         self._installation = entry["installation_id"]
         return entry["token"]
+
+    def reject(self, kind: str, token: str, reason: str) -> None:
+        """GitHub answered 401 to this kind's token (revoked, or the installation suspended):
+        drop the cached token if it is still the one that was refused, and refuse for the
+        rest of this process. The next command mints afresh (and remembers a failure)."""
+        path = self.path(kind)
+        entry = _read_json(path)
+        if entry is not None and entry.get("token") == token:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        self._failure = redact(reason)
 
     def installation_id(self) -> Optional[int]:
         """The installation, from this process or any token cache entry of this config
@@ -332,8 +380,48 @@ class AppTokens:
             out["state"] = "expired or within five minutes of expiry (the next call mints)"
         return out
 
+    def failure(self, kind: str) -> Optional[Dict[str, Any]]:
+        """A mint failure of this kind still being held: {"at", "cause", "until"}, or None."""
+        record = _read_json(self.failed_path(kind))
+        if not record or not isinstance(record.get("cause"), str):
+            return None
+        at = record.get("at")
+        now = self._clock()
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or not 0 <= at <= now + 60:
+            return None
+        if now - at >= FAILURE_HOLD_SECONDS or not self._private_file(self.failed_path(kind)):
+            return None
+        return {"at": at, "cause": record["cause"], "until": at + FAILURE_HOLD_SECONDS}
+
     def path(self, kind: str) -> str:
         return os.path.join(self.cache_dir, f"{kind}.json")
+
+    def failed_path(self, kind: str) -> str:
+        return os.path.join(self.cache_dir, f"{kind}.failed.json")
+
+    # MARK: failures across processes
+
+    def _check_failed(self, kind: str) -> None:
+        held = self.failure(kind)
+        if held is not None:
+            clock = time.strftime("%H:%M:%SZ", time.gmtime(held["until"]))
+            raise AppAuthError(f"{held['cause']} (a mint failed {int(self._clock() - held['at'])}s ago; the next "
+                               f"try is after {clock}, or delete {self.failed_path(kind)})")
+
+    def _mint_remembering_failure(self, kind: str) -> Dict[str, Any]:
+        try:
+            entry = self._mint(kind)
+        except AppAuthError as error:
+            for failed in getattr(error, "kinds", (kind,)):
+                self._write_private(self.failed_path(failed), {"at": self._clock(), "cause": redact(str(error))[:300],
+                                                               "stage": getattr(error, "stage", "mint")})
+            raise
+        for other in KINDS:
+            record = _read_json(self.failed_path(other))
+            if other == kind or (record or {}).get("stage") == "key":
+                with contextlib.suppress(OSError):
+                    os.unlink(self.failed_path(other))  # the key works again
+        return entry
 
     # MARK: cache
 
@@ -369,17 +457,21 @@ class AppTokens:
         return entry
 
     def _store(self, kind: str, entry: Dict[str, Any]) -> None:
+        self._write_private(self.path(kind), entry)
+
+    def _write_private(self, path: str, data: Dict[str, Any]) -> None:
         """Atomic replace; mkstemp creates the file 0600. A cache that cannot be written
         costs a mint next time, never the command."""
         tmp = None
         try:
-            fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=f".{kind}-")
+            os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=".tmp-")
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(entry, handle)
-            os.replace(tmp, self.path(kind))
+                json.dump(data, handle)
+            os.replace(tmp, path)
             tmp = None
-        except OSError:
+        except (OSError, ValueError, TypeError):
             pass
         finally:
             if tmp is not None:
@@ -414,17 +506,18 @@ class AppTokens:
 
     def _private_key(self) -> bytes:
         """The PEM from the login Keychain. Only minting calls this."""
-        command = [SECURITY, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.config["client_id"], "-w"]
+        binary = security_binary()
+        command = [binary, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.config["client_id"], "-w"]
         try:
             result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                                     timeout=SUBPROCESS_TIMEOUT_SECONDS)
         except FileNotFoundError:
-            raise AppAuthError(f"{SECURITY} is not available (the app key lives in the macOS login Keychain)") from None
+            raise AppAuthError(f"{binary} is not available (the app key lives in the macOS login Keychain)") from None
         except subprocess.TimeoutExpired:
             raise AppAuthError(f"the Keychain did not answer within {SUBPROCESS_TIMEOUT_SECONDS}s "
                                "(locked, or waiting on an access prompt)") from None
         except OSError as error:
-            raise AppAuthError(f"{SECURITY} could not be started ({error.strerror})") from None
+            raise AppAuthError(f"{binary} could not be started ({error.strerror})") from None
         if result.returncode != 0:
             detail = redact(result.stderr.decode(errors="replace").strip())[:200]
             raise AppAuthError(f"the Keychain did not return the app key (security exited {result.returncode}: {detail})")
@@ -459,12 +552,17 @@ class AppTokens:
             with opener(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
         except urllib.error.HTTPError as error:
-            detail = redact(error.read().decode(errors="replace").strip())[:300]
+            try:
+                detail = redact(error.read().decode(errors="replace").strip())[:300]
+            except Exception:  # noqa: BLE001 - an unreadable error body is still this HTTP error
+                detail = "(no readable body)"
             failure = AppAuthError(f"{method} {path} answered HTTP {error.code}: {detail}")
             failure.status = error.code  # type: ignore[attr-defined]
             raise failure from None
-        except (urllib.error.URLError, OSError) as error:
-            raise AppAuthError(f"{method} {path} failed: {redact(str(error))}") from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as error:
+            # A refused connection, a timeout, a truncated or malformed answer, bytes that
+            # are not UTF-8: all the same to the caller, no token.
+            raise AppAuthError(f"{method} {path} failed ({type(error).__name__}: {redact(str(error))[:200]})") from None
         try:
             return json.loads(raw) if raw.strip() else None
         except ValueError:
@@ -478,8 +576,20 @@ class AppTokens:
         return installation
 
     def _mint(self, kind: str) -> Dict[str, Any]:
-        jwt = self._app_jwt()
-        installation = self.installation_id() or self._discover(jwt)
+        """Mint one token. Every failure is an AppAuthError, never a traceback, and says
+        which kinds it holds back: a failure getting the key, the JWT or the installation
+        (`stage` "key") holds both, a refused mint only this kind."""
+        try:
+            jwt = self._app_jwt()
+            installation = self.installation_id() or self._discover(jwt)
+        except Exception as error:  # noqa: BLE001 - see _staged
+            raise _staged(error, "key", KINDS) from None
+        try:
+            return self._mint_with(kind, jwt, installation)
+        except Exception as error:  # noqa: BLE001 - see _staged
+            raise _staged(error, "mint", (kind,)) from None
+
+    def _mint_with(self, kind: str, jwt: str, installation: int) -> Dict[str, Any]:
         body = {"repositories": [self.name], "permissions": PERMISSIONS[kind]}
         path = f"app/installations/{installation}/access_tokens"
         try:
@@ -510,6 +620,19 @@ class AppTokens:
         return entry
 
 
+def _staged(error: Exception, stage: str, kinds: Sequence[str]) -> AppAuthError:
+    """`error` as an AppAuthError that knows its stage and the kinds it holds back. Anything
+    that is not already one (http.client's IncompleteRead or BadStatusLine, a bad byte, a
+    bug) becomes one with its type and a redacted message, never a traceback."""
+    if isinstance(error, AppAuthError):
+        failure = error
+    else:
+        failure = AppAuthError(f"minting failed ({type(error).__name__}: {redact(str(error))[:200]})")
+    failure.stage = stage  # type: ignore[attr-defined]
+    failure.kinds = tuple(kinds)  # type: ignore[attr-defined]
+    return failure
+
+
 class Unavailable:
     """App mode is on but cannot work (a broken config): every token request refuses."""
 
@@ -520,6 +643,12 @@ class Unavailable:
 
     def token(self, kind: str) -> str:
         raise AppAuthError(self.reason)
+
+    def reject(self, kind: str, token: str, reason: str) -> None:
+        pass
+
+    def failure(self, kind: str) -> Optional[Dict[str, Any]]:
+        return None
 
     def installation_id(self) -> Optional[int]:
         return None

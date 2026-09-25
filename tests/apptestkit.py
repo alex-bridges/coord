@@ -6,11 +6,14 @@ Nothing here reaches GitHub, the real Keychain item or the real token cache:
   test asks for it, and otherwise trips: exit 97, logged;
 - a fake GitHub behind `urllib.request.urlopen`, which mints tokens shaped like the real
   ones (`ghs_…`, 390 characters) and answers the endpoints coord calls;
-- a fake `gh` runner that records every call.
+- a fake `gh` runner that records every call and answers from the fake GitHub.
 
 `AppTestCase` points COORD_APP_CONFIG, COORD_TOKEN_CACHE_DIR and COORD_CACHE_DIR at a
-temporary directory, sets GITHUB_API_URL to a closed local port, and installs the fakes
-for every test, so a test that forgets one fails instead of reaching anything real.
+temporary directory and installs the fakes for every test, so a test that forgets one
+fails instead of reaching anything real. App mode sends credentials to
+https://api.github.com only (apptoken.detect), so the tests leave GITHUB_API_URL unset
+and the fake `urlopen` answers for that host: it is patched on `urllib.request` itself,
+which both gh.py and apptoken.py call, and it fails any request to another host.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ from coordlib import gh as ghmodule  # noqa: E402
 REPO = "o/r"
 CLIENT_ID = "Iv23test0client"
 INSTALLATION = 1000001
-API = "http://127.0.0.1:9"
+API = "https://api.github.com"  # the fake urlopen answers for it; nothing leaves the process
 TOKEN_LENGTH = 390  # observed 2026-09-25; nothing may rely on it
 
 OPENSSLS = [path for path in ("/usr/bin/openssl", "/opt/homebrew/bin/openssl") if os.path.exists(path)]
@@ -146,6 +149,7 @@ class FakeGitHub:
         self.used = 10
         self.prs: List[Dict[str, Any]] = [pr_node()]
         self.forbid_writes = ""  # answer every write 403 with this X-Accepted-GitHub-Permissions
+        self.echo_secrets = 0  # answer every API call with this 4xx, its body echoing the token and a JWT
         self.lock = threading.Lock()
 
     # MARK: urlopen
@@ -169,6 +173,11 @@ class FakeGitHub:
             # What GitHub answers a token that lacks the endpoint's permission.
             raise self._error(url, 403, {"message": "Resource not accessible by integration"},
                               {"X-Accepted-GitHub-Permissions": self.forbid_writes})
+        if self.echo_secrets:
+            # A hostile or buggy 4xx whose body repeats the credentials it was sent.
+            jwt = self.jwts[-1] if self.jwts else "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjIzIn0.c2lnbmF0dXJlLWJ5dGVz"
+            raise self._error(url, self.echo_secrets, {"message": f"Validation failed for token {bearer}",
+                                                        "jwt": jwt, "authorization": auth})
         return self._api_call(method, path, body)
 
     def _error(self, url: str, code: int, body: Dict[str, Any], headers: Optional[Dict[str, str]] = None):
@@ -298,7 +307,7 @@ class AppTestCase(unittest.TestCase):
            "COORD_AGENT", "GITHUB_ACTIONS", "GITHUB_API_URL", "GH_TOKEN", "GITHUB_TOKEN", "COORD_TRANSPORT",
            "COORD_BUDGET_READ_FLOOR", "COORD_BUDGET_HARD_FLOOR", "COORD_BUDGET_USER_LIMIT",
            "COORD_BUDGET_APP_LIMIT", "CLAUDE_CODE_REMOTE", "COORD_REST_ONLY",
-           "FAKE_SECURITY_LOG", "FAKE_SECURITY_MODE", "FAKE_KEYCHAIN_B64", "TMPDIR")
+           "FAKE_SECURITY_LOG", "FAKE_SECURITY_MODE", "FAKE_KEYCHAIN_B64", "TMPDIR", "COORD_SECURITY_BIN")
 
     def setUp(self) -> None:
         self.saved_env = {name: os.environ.get(name) for name in self.ENV}
@@ -313,7 +322,7 @@ class AppTestCase(unittest.TestCase):
         os.environ.update({
             "COORD_APP_CONFIG": self.config_path, "COORD_TOKEN_CACHE_DIR": self.token_dir,
             "COORD_CACHE_DIR": os.path.join(self.root, "cache"), "COORD_REPO": REPO,
-            "COORD_AGENT": "claude@test:app", "GITHUB_API_URL": API,
+            "COORD_AGENT": "claude@test:app",
             "FAKE_SECURITY_LOG": os.path.join(self.root, "security.log"), "FAKE_SECURITY_MODE": "tripwire",
             "FAKE_KEYCHAIN_B64": PEM_B64,
         })
@@ -350,6 +359,14 @@ class AppTestCase(unittest.TestCase):
     def keychain(self, mode: str = "key") -> None:
         os.environ["FAKE_SECURITY_MODE"] = mode
 
+    def forget_failures(self) -> None:
+        """Remove the remembered mint failures (as FAILURE_HOLD_SECONDS passing would)."""
+        for kind in apptoken.KINDS:
+            try:
+                os.remove(os.path.join(self.token_dir, f"{kind}.failed.json"))
+            except OSError:
+                pass
+
     def security_calls(self) -> List[str]:
         try:
             with open(os.environ["FAKE_SECURITY_LOG"], encoding="utf-8") as handle:
@@ -359,7 +376,7 @@ class AppTestCase(unittest.TestCase):
 
     def tokens(self, clock=None) -> apptoken.AppTokens:
         config = apptoken.load_config(self.config_path)
-        return apptoken.AppTokens(config, self.token_dir, API, clock=clock or time.time)
+        return apptoken.AppTokens(config, self.token_dir, clock=clock or time.time)
 
     def main(self, argv: List[str]):
         """cli.main in-process, exactly as the `coord` script runs it: (code, stdout, stderr)."""
