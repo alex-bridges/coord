@@ -33,7 +33,6 @@ fails open, and on gh the next probe replaces it.
 
 from __future__ import annotations
 
-import math
 import os
 import time
 from typing import Any, Dict, Mapping, Optional, Tuple
@@ -145,16 +144,18 @@ def valid(reading: Any, now: Optional[float] = None) -> bool:
     """A reading of the shape `record` writes. Anything else (a hand edit, a half-written
     file, another version's format) is treated as absent, so the guard fails open.
 
-    `at` must be a finite time no later than AT_SKEW_SECONDS from now: `until()` caps a
-    hold at `at` plus an hour, and a NaN, infinite or far-future `at` would defeat that
-    cap (min(reset, nan) is reset) and keep `needs_probe` from ever firing.
+    `at` must lie between the epoch and AT_SKEW_SECONDS from now: `until()` caps a hold
+    at `at` plus an hour, and a NaN, infinite or far-future `at` would defeat that cap
+    (min(reset, nan) is reset) and keep `needs_probe` from ever firing. The bounds are
+    plain comparisons, which reject NaN and ±inf and compare an int of any size exactly;
+    a float conversion (math.isfinite) raises OverflowError on a 309-digit JSON integer.
     """
     if not isinstance(reading, dict) or not all(_is_int(reading.get(key)) for key in ("remaining", "used", "reset")):
         return False
     at = reading.get("at")
-    if not isinstance(at, (int, float)) or isinstance(at, bool) or not math.isfinite(at):
+    if not isinstance(at, (int, float)) or isinstance(at, bool):
         return False
-    return at <= (time.time() if now is None else now) + AT_SKEW_SECONDS
+    return 0 <= at <= (time.time() if now is None else now) + AT_SKEW_SECONDS
 
 
 def until(reading: Dict[str, Any]) -> float:

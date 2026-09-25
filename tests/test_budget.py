@@ -498,14 +498,22 @@ class BadShapeTests(BudgetTestCase):
         # is reset) and keep the gh probe from ever refreshing the reading.
         now = time.time()
         far = int(now) + 10 * 3600
-        for at in (float("nan"), float("inf"), now + 10 * 3600):
+        # Also integers past float range (309+ digits), which a float conversion cannot
+        # take (OverflowError), and a time before the epoch.
+        for at in (float("nan"), float("inf"), float("-inf"), now + 10 * 3600, 10 ** 400, -10 ** 400, -1):
+            label = str(at)[:20]
             self.write_budget_file('{"core": {"remaining": 100, "limit": 5000, "used": 4900, '
                                    f'"reset": {far}, "at": {json.dumps(at)}}}}}')
             raw = cache.load_budget(REPO)["core"]
-            self.assertFalse(budget.valid(raw), at)
-            self.assertIsNone(budget.current(REPO), at)
-            self.assertTrue(budget.needs_probe(raw), at)
-            self.assertIsNone(cli.gate(cli.parser().parse_args(["train", "add", "7"]), self.silent_http()), at)
+            if at == at:  # NaN is the one value unequal to itself
+                self.assertEqual(raw["at"], at, f"the file holds exactly this `at`: {label}")
+            self.assertFalse(budget.valid(raw), label)
+            self.assertIsNone(budget.current(REPO), label)
+            self.assertTrue(budget.needs_probe(raw), label)
+            self.assertIsNone(cli.gate(cli.parser().parse_args(["train", "add", "7"]), self.silent_http()), label)
+            code, out, _ = self.run_cli(["whoami"], self.silent_http())
+            self.assertEqual(code, EXIT_OK, label)
+            self.assertIn("apiBudget: API: no current reading", out, label)
         # A few seconds of clock skew between writers is still a reading.
         self.seed(100, age=-(budget.AT_SKEW_SECONDS - 30))
         self.assertIsNotNone(budget.current(REPO))
