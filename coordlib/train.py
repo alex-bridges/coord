@@ -53,6 +53,8 @@ LABELS = {
     TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
     SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
     CODEX_UNAVAILABLE_LABEL: ("d93f0b", "coord: Codex out of quota; a substitute review is recorded per head"),
+    NEEDS_ALEX_LABEL: ("b60205", "coord: a carve-out; the train holds it until Alex approves its head"),
+    ALEX_APPROVED_LABEL: ("0e8a16", "coord: Alex approved a head (coord train approve records which)"),
 }
 
 

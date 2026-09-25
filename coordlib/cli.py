@@ -226,6 +226,11 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_release(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
+    if not args.everyone:
+        mine = [c for c in _issue_claims(gh, args.issue, []) if c["agent"] == me]
+        if not mine:
+            print(f"coord: {me} holds no claim on #{args.issue}; nothing to release", file=sys.stderr)
+            return EXIT_NOT_FOUND
     payload = {"kind": "release", "v": 1, "agent": me, "issue": args.issue}
     text = f"**Released** by `{me}`."
     if args.everyone:

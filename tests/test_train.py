@@ -643,6 +643,24 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertEqual(fake.posted("ejected"), [1], "main red in Android does not excuse a red release gate")
 
+    def test_a_closed_batch_starts_the_next_step_and_a_build_does_not(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])  # build_batch clears `dispatched`
+        self.assertNotIn("merge-train.yml", [d[0] for d in fake.dispatched], "building never self-wakes")
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.jobs[77] = [{"name": "App-owned SwiftPM packages", "conclusion": "failure"},
+                         {"name": "CI verdict", "conclusion": "failure"}]
+        self.step(fake).run()
+        self.assertIn(("merge-train.yml", "main", None), fake.dispatched)
+        ejected = [body for method, path, body in fake.writes if method == "POST" and path.endswith("/comments")
+                   and "Removed from the merge train" in (body or {}).get("body", "")]
+        self.assertTrue(ejected and "App-owned SwiftPM packages" in ejected[0]["body"])
+        self.assertNotIn("CI verdict", ejected[0]["body"].split("<!--")[0], "the aggregate verdict is not a failed lane")
+
+    def test_the_train_creates_the_carve_out_labels(self):
+        self.assertIn(train.NEEDS_ALEX_LABEL, train.LABELS)
+        self.assertIn(train.ALEX_APPROVED_LABEL, train.LABELS)
+
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
         seen = []

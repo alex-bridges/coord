@@ -82,6 +82,7 @@ class Step:
         self.agent = agent
         self.log = log
         self.sleep = sleep
+        self.closed_batch = False
         self.lines: List[str] = []
         self._labels_ready = False
 
@@ -112,6 +113,7 @@ class Step:
     def delete_branch(self, name: str) -> None:
         try:
             self.gh.rest(f"repos/{{repo}}/git/refs/heads/{name}", method="DELETE")
+            self.closed_batch = True
         except (NotFound, GitHubError) as error:
             self.note(f"could not delete {name}: {error}")
 
@@ -277,9 +279,22 @@ class Step:
         if batches:
             name, tip = batches[0]
             self.advance(name, tip, main, prs)
+            if self.closed_batch:
+                self.wake_next()
         else:
             self.build(main, prs)
         return self.lines
+
+    def wake_next(self) -> None:
+        """A batch just ended (merged, ejected, split, abandoned): start the next step now
+        instead of leaving the queue to the late cron (stress test, 2026-09-25). Bounded:
+        only a step that closed a batch dispatches, and a step that finds nothing ready
+        closes nothing."""
+        try:
+            self.gh.dispatch_workflow("merge-train.yml", "main")
+            self.note("dispatched the next train step")
+        except GitHubError as error:
+            self.note(f"could not dispatch the next train step ({error}); the cron will")
 
     def already_posted(self, number: int, event: str, batch: str) -> bool:
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
@@ -382,7 +397,8 @@ class Step:
             return
         if action in ("eject", "split"):
             failed = self.failed_jobs(run["id"])
-            jobs = ", ".join(failed[:5]) or "see the run"
+            lanes = [job for job in failed if job not in FINAL_JOBS]  # the aggregate verdict adds nothing
+            jobs = ", ".join((lanes or failed)[:5]) or "see the run"
             main_state = self.main_ci(main)
             # Lane jobs only: the aggregate verdict is red whenever anything is, so it
             # would always look "shared" between two red runs.
