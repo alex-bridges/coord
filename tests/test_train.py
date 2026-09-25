@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import json
 import os
 import re
 import subprocess
@@ -23,7 +24,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
+from coordlib.gh import GitHubError  # noqa: E402
 from test_coord import BOT, NOW, REAL_FAILURE, check, codex_summary, pr_node, reaction, refused_check  # noqa: E402
+
+# The repository checkout these tests run in: the light/heavy tests use its REAL lane
+# selector and rules, so a change to either is exercised here too.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
+LIGHT_PATH = "Tools/coord/x.py"
+
+
+def checkout_file(path: str) -> str:
+    with open(os.path.join(REPO_ROOT, path)) as handle:
+        return handle.read()
 
 
 def ready_node(number: int, head: str, branch: str, files=("Packages/CoreKit/Sources/A.swift",), labels=("train",)):
@@ -145,12 +158,153 @@ class PlanAndRunTests(unittest.TestCase):
             self.assertEqual(train.run_action({"status": "completed", "conclusion": infrastructure, "run_attempt": 2}, 1),
                              "abandon", "an outage is not the PR's fault")
 
+    def test_plan_names_no_overtake_without_classes(self):
+        chosen = train.plan([{"pr": 1}], {1: (train.READY, "")}, {1: []})
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([1], None))
+
     def test_parse_batch_reads_only_this_batchs_merges(self):
         log = ("c3\tc2 p3\ttrain/B\tMerge pull request #30 from o/c\n"
                "c2\tc1 p2\ttrain/B\tMerge pull request #20 from o/b\n"
                "c1\tm0 p1\ttrain/A\tMerge pull request #10 from o/a\n")  # an EARLIER batch, already on main
         self.assertEqual(train.parse_batch(log, "train/B"), ("c1", [{"pr": 20, "sha": "p2"}, {"pr": 30, "sha": "p3"}]))
         self.assertEqual(train.parse_batch(log, "train/C"), (None, []))
+
+
+L, H = train.LIGHT, train.HEAVY
+
+
+class LightPriorityPlanTests(unittest.TestCase):
+    """Bounded light priority (Alex, 2026-09-25): at most one light batch ahead of ready
+    heavy work, and a batch never mixes the two."""
+
+    def plan(self, order, classes, overtaken=(), solo=(), verdicts=None, cap=3):
+        queue = [{"pr": n} for n in order]
+        verdicts = verdicts or {n: (train.READY, "") for n in order}
+        labels = {n: (["train:solo"] if n in solo else []) for n in order}
+        return train.plan(queue, verdicts, labels, cap=cap, classes=classes, overtaken=overtaken)
+
+    def test_one_class_plans_exactly_as_before(self):
+        order = [1, 2, 3, 4, 5, 6]
+        verdicts = {1: (train.READY, ""), 2: (train.HOLD, "h"), 3: (train.READY, ""), 4: (train.DROP, "d"),
+                    5: (train.READY, ""), 6: (train.READY, "")}
+        for solo in ((), (1,), (3,), (1, 3)):
+            before = self.plan(order, None, solo=solo, verdicts=verdicts)
+            for kind in (L, H):
+                classes = {n: kind for n in order}
+                for overtaken in ((), (1, 3, 5)):
+                    now = self.plan(order, classes, overtaken=overtaken, solo=solo, verdicts=verdicts)
+                    self.assertEqual(now, before, (kind, solo, overtaken))
+                    self.assertIsNone(now["overtakes"])
+
+    def test_one_light_batch_overtakes_then_heavy_goes_while_light_waits(self):
+        classes = {1: H, 2: L, 3: H, 4: L, 5: L, 6: L, 7: L, 8: H}
+        first = self.plan([1, 2, 3, 4, 5, 6, 7], classes)
+        self.assertEqual((first["batch"], first["overtakes"]), ([2, 4, 5], 1),
+                         "one light batch goes ahead of the oldest ready heavy PR")
+        # That batch left the queue; the step recorded the overtake on #1.
+        second = self.plan([1, 3, 6, 7], classes, overtaken=[1])
+        self.assertEqual((second["batch"], second["overtakes"]), ([1, 3], None),
+                         "heavy goes next, although light PRs are still waiting")
+        # Heavy work had its turn; the next oldest heavy PR allows one light batch again.
+        third = self.plan([6, 7, 8], classes)
+        self.assertEqual((third["batch"], third["overtakes"]), ([6, 7], 8))
+
+    def test_any_overtaken_ready_heavy_pr_gives_heavy_the_turn(self):
+        # #3 was overtaken; #1, older and held back then, is ready again. Heavy goes
+        # (both of them), not a second light batch.
+        chosen = self.plan([1, 2, 3], {1: H, 2: L, 3: H}, overtaken=[3])
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([1, 3], None))
+
+    def test_a_batch_never_mixes_classes(self):
+        chosen = self.plan([1, 2, 3], {1: L, 2: H, 3: L})
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([1, 3], 2))
+        chosen = self.plan([1, 2, 3], {1: L, 2: H, 3: L}, overtaken=[2])
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([2], None),
+                         "a light PR queued before the overtaken one still waits: heavy has the turn")
+
+    def test_solo_applies_within_the_chosen_class(self):
+        chosen = self.plan([1, 2, 3], {1: H, 2: L, 3: L}, solo=(2,))
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([2], 1))
+        chosen = self.plan([1, 2, 3, 4], {1: H, 2: L, 3: H, 4: L}, solo=(3,), overtaken=[1])
+        self.assertEqual(chosen["batch"], [1], "a solo PR behind the front is skipped, as before")
+
+    def test_held_prs_neither_overtake_nor_are_overtaken(self):
+        verdicts = {1: (train.HOLD, "h"), 2: (train.READY, "")}
+        chosen = self.plan([1, 2], {2: L}, verdicts=verdicts)
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([2], None), "no ready heavy work to overtake")
+
+    def test_an_unclassified_ready_pr_is_heavy(self):
+        chosen = self.plan([1, 2], {2: L})
+        self.assertEqual((chosen["batch"], chosen["overtakes"]), ([2], 1))
+        chosen = self.plan([1, 2], {2: L}, overtaken=[1])
+        self.assertEqual(chosen["batch"], [1])
+
+
+class LaneClassifierTests(unittest.TestCase):
+    """The classifier runs the REAL selector and rules from this checkout."""
+
+    def classify(self, *paths):
+        return train.LaneClassifier(checkout_file).classify(list(paths))
+
+    def test_ci_infrastructure_is_heavy(self):
+        for path in (".github/scripts/select-ci-lanes.py", ".github/ci-lanes.json",
+                     ".github/actions/attach/action.yml", ".github/workflows/ci.yml"):
+            kind, reason = self.classify(path)
+            self.assertEqual(kind, H, path)
+            self.assertIn("CI graph itself changed", reason, path)
+
+    def test_engine_package_and_app_changes_are_heavy(self):
+        for path in (HEAVY_PATH, "Packages/CoreKit/Package.swift", "Packages/DesignKit/Sources/A.swift",
+                     "Apps/AppBeta/AppBeta/App.swift"):
+            self.assertEqual(self.classify(path)[0], H, path)
+
+    def test_docs_tools_and_prose_are_light(self):
+        for path in ("Docs/agent-coordination.md", LIGHT_PATH, "Packages/CoreKit/Docs/Plan.md",
+                     "Packages/CoreKit/Sources/CoreKitCore/CoreKitCore.docc/A.md", "Apps/AppBeta/README.md",
+                     "Apps/AppAlpha/Marketing/Screenshots/shot.png"):
+            self.assertEqual(self.classify(path)[0], L, path)
+
+    def test_one_heavy_path_makes_the_pr_heavy(self):
+        kind, reason = self.classify("Docs/agent-coordination.md", LIGHT_PATH, HEAVY_PATH)
+        self.assertEqual(kind, H)
+        self.assertIn("mk4-debug", reason)
+
+    def test_an_unknown_or_empty_diff_is_heavy(self):
+        classifier = train.LaneClassifier(checkout_file)
+        self.assertIsNone(classifier.error)
+        self.assertEqual(classifier.classify(None)[0], H)
+        self.assertEqual(classifier.classify([])[0], H)
+
+    def test_a_selector_that_does_not_load_makes_everything_heavy(self):
+        def missing(path):
+            raise FileNotFoundError(path)
+
+        def broken_rules(path):
+            return "{not json" if path == train.LANE_RULES else checkout_file(path)
+
+        def rules_missing_a_lane(path):
+            if path != train.LANE_RULES:
+                return checkout_file(path)
+            rules = json.loads(checkout_file(path))
+            del rules["lanes"]["mk4"]
+            return json.dumps(rules)
+
+        for show in (missing, lambda path: "def (", broken_rules, rules_missing_a_lane):
+            classifier = train.LaneClassifier(show)
+            self.assertIsNotNone(classifier.error)
+            self.assertEqual(classifier.classify([LIGHT_PATH])[0], H)
+
+    def test_a_failure_while_selecting_is_heavy(self):
+        classifier = train.LaneClassifier(checkout_file)
+
+        def explode(*args):
+            raise RuntimeError("new selector code")
+
+        classifier.selector = type("Selector", (), {"Selection": classifier.selector.Selection,
+                                                    "select_for_paths": staticmethod(explode)})
+        kind, reason = classifier.classify([LIGHT_PATH])
+        self.assertEqual(kind, H)
+        self.assertIn("lane selection failed", reason)
 
 
 # MARK: - Step against real git and a fake GitHub
@@ -274,7 +428,9 @@ class StepTests(unittest.TestCase):
                                "file://" + self.origin, self.clone])
 
     def write(self, path, text):
-        with open(os.path.join(self.work, path), "w") as handle:
+        full = os.path.join(self.work, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as handle:
             handle.write(text)
 
     def commit(self, message):
@@ -1068,6 +1224,229 @@ class StepTests(unittest.TestCase):
         [(payload, text)] = self.held(fake, 1)
         self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["conductor@*"]))
         self.assertIn("@alex-bridges", text)
+
+    # MARK: Bounded light priority
+
+    def install_selector(self):
+        """Put this checkout's real lane selector and rules on the fake main. The step's
+        clone is blob-less, so reading them exercises the on-demand fetch too."""
+        for path in (train.LANE_SELECTOR, train.LANE_RULES):
+            self.write(path, checkout_file(path))
+        self.main = self.commit("the CI lane selector")
+        sh(self.work, "push", "-q", "origin", "main")
+
+    def restart(self, fake, nodes):
+        """A new step on a new clone, with only what GitHub keeps: the PRs and comments."""
+        self.clone = os.path.join(self.tmp.name, f"clone-{len(os.listdir(self.tmp.name))}")
+        subprocess.check_call(["git", "clone", "-q", "--filter=blob:none", "--no-checkout",
+                               "file://" + self.origin, self.clone])
+        fresh = FakeGitHub(nodes, self.main)
+        fresh.issue_comments = {n: list(c) for n, c in fake.issue_comments.items()}
+        return fresh
+
+    def land(self, name, tip):
+        """What a green live batch leaves behind: main at the tip, no batch branch."""
+        sh(self.origin, "update-ref", "refs/heads/main", tip)
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+        sh(self.work, "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+        self.main = tip
+
+    def batch_on_origin(self):
+        name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+        return name, (sh(self.origin, "rev-parse", name) if name else "")
+
+    def test_one_light_batch_goes_ahead_of_heavy_then_heavy_goes_even_after_a_restart(self):
+        self.install_selector()
+        h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        h3 = self.pr_branch(3, "Docs/y.md", "prose\n")
+        nodes = {1: ready_node(1, h1, "pr1", files=(HEAVY_PATH,)), 2: ready_node(2, h2, "pr2", files=(LIGHT_PATH,)),
+                 3: ready_node(3, h3, "pr3", files=("Docs/y.md",))}
+        fake = FakeGitHub(list(nodes.values()), self.main)
+        for number, head, minutes in ((1, h1, 50), (2, h2, 40), (3, h3, 30)):
+            self.queue(fake, number, head, minutes)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy: it selects" in line for line in lines), lines)
+        self.assertTrue(any("#2 is light: it selects docs" in line for line in lines), lines)
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2, 3], "light only, ahead of the older heavy #1")
+        self.assertEqual(fake.posted("overtaken"), [1])
+
+        # Green: main moves, the light PRs merge, another light PR arrives.
+        self.run_on(fake, name, tip, conclusion="success")
+        self.step(fake).run()
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        self.land(name, tip)
+        h4 = self.pr_branch(4, "Tools/coord/z.py", "light again\n")
+        fresh = self.restart(fake, [nodes[1], ready_node(4, h4, "pr4", files=("Tools/coord/z.py",))])
+        self.queue(fresh, 4, h4, 5)
+
+        # A minute later, as a real next build is: a batch built in the same second as the
+        # landed one would share its train/<stamp> name, and parse_batch would read that
+        # batch's merges (now on main) as this one's.
+        lines = self.step(fresh, now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [1],
+                         f"heavy has its turn although light #4 is ready: {lines}")
+        self.assertEqual(fresh.posted("overtaken"), [], "no second overtake")
+
+    def test_the_overtake_holds_when_the_light_batch_never_lands(self):
+        # A merge-commit trailer would be lost here: the batch is deleted, not merged.
+        self.install_selector()
+        h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        nodes = [ready_node(1, h1, "pr1", files=(HEAVY_PATH,)), ready_node(2, h2, "pr2", files=(LIGHT_PATH,))]
+        fake = FakeGitHub(nodes, self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        self.step(fake).run()
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2])
+        self.run_on(fake, name, tip, conclusion="timed_out")
+        self.step(fake).run()  # abandoned: the batch branch is deleted, main never moved
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+
+        lines = self.step(self.restart(fake, nodes), now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
+
+    def test_a_new_train_add_gets_its_own_overtake(self):
+        fake = FakeGitHub([], self.main)
+        def record(kind, **fields):
+            return {"created_at": snapshot.iso(NOW), "user": {"login": train_step.BOT_NAME},
+                    "body": marker.compose("x", dict(fields, kind=kind, pr=1))}
+        added = record("train-add", head="a")
+        overtaken = record("train", event="overtaken", batch="train/1", agent=train_step.TRAIN_AGENT)
+        for comments, expected in (([added, overtaken], "train/1"), ([added, overtaken, added], None), ([added], None)):
+            fake.issue_comments[1] = comments
+            pr = {"number": 1}
+            self.step(fake).train_added(pr)
+            self.assertEqual(pr["overtakenBy"], expected)
+
+    def test_only_the_trains_own_overtake_record_counts(self):
+        # Every agent posts as alex-bridges and can write any marker (own_record, #1037): a
+        # forged record must not give heavy its turn early, and the train's own must hold.
+        self.install_selector()
+        h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(HEAVY_PATH,)),
+                           ready_node(2, h2, "pr2", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        record = {"kind": "train", "v": 1, "event": train.OVERTAKEN_EVENT, "pr": 1, "batch": "train/forged"}
+        for agent, login in (("claude@Eidolon:wt", "alex-bridges"),          # another agent's marker
+                             (train_step.TRAIN_AGENT, "alex-bridges"),        # the train's name, not the bot
+                             ("claude@Eidolon:wt", train_step.BOT_NAME)):     # the bot, not the train's name
+            fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
+                                           "body": marker.compose("overtaken?", dict(record, agent=agent))})
+        self.step(fake).run()
+        name, tip = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2], "no forged record gives heavy its turn")
+        self.assertEqual(fake.posted("overtaken"), [1], "the train records its own overtake")
+        # That light batch never lands; the train's own record still gives heavy the turn.
+        self.run_on(fake, name, tip, conclusion="timed_out")
+        self.step(fake).run()
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+        lines = self.step(fake, now=snapshot.now_utc() + dt.timedelta(minutes=1)).run()
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [1], lines)
+
+    def test_the_overtake_is_recorded_before_the_batch_is_pushed(self):
+        self.install_selector()
+        h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(HEAVY_PATH,)),
+                           ready_node(2, h2, "pr2", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        fake.fail_writes = 1  # the record is this step's first write
+        with self.assertRaises(GitHubError):
+            self.step(fake).run()
+        self.assertEqual(self.batch_on_origin(), ("", ""), "no record, no light batch")
+        self.assertEqual(fake.dispatched, [])
+
+    def test_the_prs_own_selector_is_never_run(self):
+        self.install_selector()
+        sentinel = os.path.join(self.tmp.name, "pr-code-ran")
+        h1 = self.pr_branch(1, train.LANE_SELECTOR,
+                            f"open({sentinel!r}, 'w').close()\nLIGHT_LANES = HEAVY_LANES = ()\n")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(train.LANE_SELECTOR,)),
+                           ready_node(2, h2, "pr2", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertFalse(os.path.exists(sentinel), "the step executed the PR's selector")
+        self.assertTrue(any("#1 is heavy" in line and "CI graph itself changed" in line for line in lines), lines)
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2])
+
+    def test_a_rename_counts_both_sides_as_the_selector_does(self):
+        # GitHub lists a rename by its new path only; ci.yml's diff (--no-renames) has both.
+        self.write(HEAVY_PATH, "moved out of the engine\n")
+        self.install_selector()
+        sh(self.work, "checkout", "-q", "-b", "pr1", self.main)
+        os.makedirs(os.path.join(self.work, "Docs"))
+        sh(self.work, "mv", HEAVY_PATH, "Docs/A.md")
+        h1 = self.commit("pr 1")
+        sh(self.work, "push", "-q", "origin", "HEAD:refs/pull/1/head")
+        sh(self.work, "checkout", "-q", "main")
+        h2 = self.pr_branch(2, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=("Docs/A.md",)),
+                           ready_node(2, h2, "pr2", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy" in line for line in lines), lines)
+
+    def test_a_head_the_pr_ref_no_longer_points_at_is_heavy(self):
+        # GitHub's snapshot names an older head than refs/pull/1/head: the diff at that
+        # head is light, but it is not the PR any more, so the train does not trust it.
+        self.install_selector()
+        old = self.pr_branch(1, LIGHT_PATH, "light\n")
+        sh(self.work, "checkout", "-q", "pr1")
+        self.write(HEAVY_PATH, "then heavy\n")
+        self.commit("pr 1, pushed again")
+        sh(self.work, "push", "-q", "origin", "HEAD:refs/pull/1/head")
+        sh(self.work, "checkout", "-q", "main")
+        h2 = self.pr_branch(2, "Docs/y.md", "prose\n")
+        fake = FakeGitHub([ready_node(1, old, "pr1", files=(LIGHT_PATH,)),
+                           ready_node(2, h2, "pr2", files=("Docs/y.md",))], self.main)
+        self.queue(fake, 1, old, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy: its diff is unknown or empty" in line for line in lines), lines)
+        self.assertEqual(fake.posted("overtaken"), [1])
+
+    def test_a_pr_whose_head_cannot_be_fetched_is_heavy(self):
+        self.install_selector()
+        sh(self.work, "checkout", "-q", "-b", "pr1", self.main)
+        self.write(LIGHT_PATH, "light, never pushed\n")
+        h1 = self.commit("pr 1")  # only in the work repository: origin has no refs/pull/1/head
+        sh(self.work, "checkout", "-q", "main")
+        h2 = self.pr_branch(2, "Docs/y.md", "prose\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(LIGHT_PATH,)),
+                           ready_node(2, h2, "pr2", files=("Docs/y.md",))], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("#1 is heavy: its diff is unknown or empty" in line for line in lines), lines)
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [2])
+
+    def test_the_selector_missing_from_main_keeps_the_old_order(self):
+        # Every ready PR counts as heavy, so one class is ready: the queue order decides.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        h2 = self.pr_branch(2, "d.txt", "d\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1"), ready_node(2, h2, "pr2")], self.main)
+        self.queue(fake, 1, h1, 50)
+        self.queue(fake, 2, h2, 40)
+        lines = self.step(fake).run()
+        self.assertTrue(any("every ready PR counts as heavy" in line for line in lines), lines)
+        name, _ = self.batch_on_origin()
+        self.assertEqual([m["pr"] for m in self.members(name)], [1, 2])
+        self.assertEqual(fake.posted("overtaken"), [])
 
 
 if __name__ == "__main__":
