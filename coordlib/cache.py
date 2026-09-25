@@ -1,21 +1,24 @@
 """Per-machine cache: the last board snapshot, each agent's inbox cursor, and the last
-GitHub API budget reading.
+GitHub API budget readings of each principal.
 
 The snapshot is shared by every agent on one machine (same user), so ten
 sessions polling the board within a minute cost GitHub one snapshot, not ten.
 Nothing here is authoritative; deleting the directory loses only the inbox
-cursors (the next inbox shows the last 7 days again).
+cursors (the next inbox shows the last 7 days again). The GitHub App's tokens are
+cached elsewhere (apptoken.py), never here.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 
 def cache_dir(repo: str) -> str:
@@ -81,17 +84,77 @@ def budget_path(repo: str) -> str:
     return os.path.join(cache_dir(repo), "budget.json")
 
 
-def load_budget(repo: str) -> Dict[str, Any]:
-    """The last GitHub API budget reading per resource (budget.py), shared by every agent
-    on the machine: {"core": {"remaining", "limit", "used", "reset", "at"}, "graphql": {…}}."""
+BUDGET_VERSION = 2
+USER = "user"
+
+
+def _budget_file(repo: str) -> Dict[str, Any]:
+    """budget.json as {principal: {resource: reading}} (budget.py).
+
+    Version 2 is {"version": 2, "user": {…}, "app:<installation>": {…}}. The file before
+    it held one principal's readings at the top level, {"core": {…}, "graphql": {…}}, and
+    that principal was Alex's, so such a file reads as the `user` principal.
+    """
     data = _read(budget_path(repo))
     if not isinstance(data, dict):
         return {}  # a file of the wrong shape is no reading (budget.valid checks each one's fields)
-    return {resource: reading for resource, reading in data.items() if isinstance(reading, dict)}
+    if data.get("version") == BUDGET_VERSION:
+        return {principal: readings for principal, readings in data.items()
+                if principal != "version" and isinstance(readings, dict)}
+    return {USER: data}
+
+
+def load_principal(repo: str, principal: str) -> Dict[str, Any]:
+    """One principal's last readings per resource, shared by every agent on the machine."""
+    readings = _budget_file(repo).get(principal)
+    if not isinstance(readings, dict):
+        return {}
+    return {resource: reading for resource, reading in readings.items() if isinstance(reading, dict)}
+
+
+def store_principal(repo: str, principal: str, readings: Dict[str, Any]) -> None:
+    data = _budget_file(repo)
+    data[principal] = readings
+    out: Dict[str, Any] = {"version": BUDGET_VERSION}
+    out.update(data)
+    _write(budget_path(repo), out)
+
+
+def load_budget(repo: str) -> Dict[str, Any]:
+    """Alex's (the `user` principal's) last reading per resource:
+    {"core": {"remaining", "limit", "used", "reset", "at"}, "graphql": {…}}."""
+    return load_principal(repo, USER)
 
 
 def store_budget(repo: str, readings: Dict[str, Any]) -> None:
-    _write(budget_path(repo), readings)
+    store_principal(repo, USER, readings)
+
+
+@contextlib.contextmanager
+def budget_lock(repo: str, timeout_seconds: float = 5.0) -> Iterator[None]:
+    """Serialize read-modify-writes of budget.json between processes, so one agent's
+    reading cannot overwrite another's (the app principal keeps a maximum per window).
+    Best effort: a lock that cannot be had within the timeout is skipped, not waited on."""
+    fd = None
+    try:
+        os.makedirs(cache_dir(repo), exist_ok=True)
+        fd = os.open(os.path.join(cache_dir(repo), "budget.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.02)
+    except OSError:
+        pass
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _cursor_path(repo: str, agent: str) -> str:
