@@ -758,15 +758,34 @@ class GuardHookTests(unittest.TestCase):
                         "cd Tools/coord && python3 -c \"import coordlib.apptoken as a\"",
                         "python3 -B -c 'from coordlib.apptoken import AppTokens'",
                         "/usr/bin/python3 -c 'import coordlib.apptoken'",
-                        "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF"):
+                        "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF",
+                        "python3 -c 'import sys; from coordlib import apptoken'",
+                        "true && python3 -c 'from coordlib.apptoken import AppTokens'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("python3 -m unittest discover -s Tools/coord/tests",
                         "python3 -m unittest test_apptoken", "grep -n AppTokens Tools/coord/coordlib/apptoken.py",
-                        "python3 -c 'print(1)'", "git log --oneline -- Tools/coord/coordlib/apptoken.py"):
+                        "python3 -c 'print(1)'", "git log --oneline -- Tools/coord/coordlib/apptoken.py",
+                        # Round four of the #1046 review: both must be in ONE command segment.
+                        "python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py",
+                        "python3 -c 'print(1)' && grep -n AppTokens Tools/coord/coordlib/apptoken.py",
+                        "python3 -c 'print(1)' | grep -c apptoken"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
+        for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
+                        "'-s', 'example-coord-github-app', '-w'])\"",
+                        "'security' find-generic-password -s example-coord-github-app -w",
+                        "env x=1 bash -c \"security find-generic-password -s example-coord-github-app\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token status"}), 0)
 
     def test_the_deny_list_names_token_exec(self):
         self.assertIn("Bash(* token exec*)", conductor.DENY)
+
+    def test_the_deny_list_keeps_the_read_tool_out_of_the_token_cache(self):
+        # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
+        self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
+        self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
