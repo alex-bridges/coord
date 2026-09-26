@@ -198,10 +198,15 @@ class FileFormatTests(PrincipalTestCase):
         self.assertLess(os.path.getsize(cache.budget_path(REPO)), 1024)
 
     def test_a_file_too_deep_to_parse_fails_open_and_is_replaced(self):
-        depth = 5000  # past any recursion limit: json.load raises RecursionError
+        # Deep enough that json.load raises RecursionError on every Python this runs on:
+        # 3.9 gives up near 1,000 levels, 3.14's C parser only between 100,000 and 400,000.
+        depth = 1_000_000
+        content = '{"user":' * depth + "{}" + "}" * depth
+        with self.assertRaises(RecursionError, msg="the fixture must really be too deep to parse"):
+            json.loads(content)
         os.makedirs(os.path.dirname(cache.budget_path(REPO)), exist_ok=True)
         with open(cache.budget_path(REPO), "w", encoding="utf-8") as handle:
-            handle.write('{"user":' * depth + "{}" + "}" * depth)
+            handle.write(content)
         self.assertIsNone(budget.current(REPO))
         self.assertIsNone(self.estimate())
         self.assertEqual(budget.decision("train add", budget.current(REPO)), (budget.OK, ""))
