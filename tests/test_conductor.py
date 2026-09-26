@@ -788,7 +788,10 @@ class GuardHookTests(unittest.TestCase):
                         "python3 - <<'EOF'\r\nimport coordlib.apptoken\r\nEOF\r\n",
                         # The test module's name is exempt, nothing else in the command is.
                         "python3 -m unittest test_apptoken; python3 - <<'Y'\nimport coordlib.apptoken\nY",
-                        "echo 'import coordlib.apptoken' | /opt/homebrew/bin/python3t -"):
+                        "echo 'import coordlib.apptoken' | /opt/homebrew/bin/python3t -",
+                        # macOS's filesystem ignores case: these run python3.
+                        "Python3 - <<'Y'\nimport coordlib.apptoken\nY",
+                        "/usr/bin/PYTHON3 -c 'import coordlib.apptoken'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_prose_that_names_python_and_apptoken_is_refused_with_the_way_out(self):

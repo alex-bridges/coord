@@ -542,7 +542,8 @@ INTENDED_UNBLOCKS = {}
 
 def names_python_and_apptoken(command: str) -> bool:
     """Round eight's rule, restated here so the guard is checked against it, not against itself."""
-    return bool(re.search(r"\bpython[0-9.]*\b|/python", command)) and "apptoken" in command.replace("test_apptoken", "")
+    return (bool(re.search(r"\bpython[0-9.]*\b|/python", command, re.IGNORECASE))
+            and "apptoken" in command.replace("test_apptoken", ""))
 
 
 class GuardDifferentialTests(unittest.TestCase):
