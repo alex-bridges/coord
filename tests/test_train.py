@@ -116,7 +116,9 @@ class EligibilityTests(unittest.TestCase):
         verdict, hold, reason = train.assess(self.unreviewed())
         self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW))
         self.assertIn("no clean review of it recorded", reason)
-        self.assertIn("coord train review 1 --head aaaaaaaaa --by <agent>", reason)
+        self.assertIn("coord train review 1 --head <reviewed-sha> --by <agent>", reason)
+        self.assertIn("current head aaaaaaaaa", reason, "the held head is named, outside the command")
+        self.assertNotIn("--head aaaaaaa", reason, "never pre-filled with the current head")
         self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
 
     def test_codex_re_reviewing_still_holds_a_recorded_review(self):
@@ -1182,7 +1184,9 @@ class StepTests(unittest.TestCase):
         self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
         self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
         self.assertIn("waits for Alex", text, "the reason")
-        self.assertIn(f"coord train approve 1 --head {self.H1[:9]}", text, "the action that clears it, at this head")
+        self.assertIn("coord train approve 1 --head <sha-Alex-approved>", text, "the action that clears it")
+        self.assertIn(f"at head `{self.H1[:9]}`", text, "the held head is named, outside the command")
+        self.assertNotIn(f"--head {self.H1[:7]}", text, "never pre-filled with the current head")
         [(payload, _)] = self.held(fake, 2)
         self.assertEqual(payload["to"], ["conductor@*"], "no agent on record: the conductor still hears")
 
@@ -1234,6 +1238,22 @@ class StepTests(unittest.TestCase):
             self.assertEqual(payload["hold"], hold)
             self.assertEqual("@alex-bridges" in text, hold in train.OWNER_HOLDS, hold)
         self.assertEqual(train.OWNER_HOLDS, {"needs-alex", "partial-data"})
+
+    def test_no_notice_pre_fills_the_current_head_into_an_attestation(self):
+        # Copying a pre-filled current head would attest whatever is there now, not the
+        # head that was reviewed or approved (review of #1054 at 7d9213923).
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NO_REVIEW),
+                           self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.add(fake, 2, self.H2, 20)
+        self.step(fake).run()
+        for number, head, command in ((1, self.H1, "coord train review 1 --head <reviewed-sha> --by <agent>"),
+                                      (2, self.H2, "coord train approve 2 --head <sha-Alex-approved>")):
+            with self.subTest(pr=number):
+                [(_, text)] = self.held(fake, number)
+                self.assertIn(command, text)
+                self.assertIn(f"at head `{head[:9]}`", text, "the held head is still named, for comparison")
+                self.assertNotIn(f"--head {head[:7]}", text)
 
     def test_new_wording_or_a_later_step_is_not_a_new_notice(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_CI_RED, "Android")], self.main)

@@ -326,7 +326,7 @@ class Step:
                 return
             to = list(dict.fromkeys(agent for agent in (pr.get("trainAddedBy"), train.CONDUCTOR) if agent))
             text = (f"**Held in the merge train** at head `{head[:9]}`: {reason}.\n\n"
-                    + train.HOLD_ACTIONS[hold].format(pr=number, head=head[:9]) + "\n\n"
+                    + train.HOLD_ACTIONS[hold].format(pr=number) + "\n\n"
                     + "To " + ", ".join(f"`{agent}`" for agent in to)
                     + ". The train says this once per head and reason.")
             if hold in train.OWNER_HOLDS:
