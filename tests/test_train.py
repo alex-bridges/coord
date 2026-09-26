@@ -332,6 +332,8 @@ class FakeGitHub:
         self.fail_held = ""       # every POST of a `held` notice raises GitHubError(this)
         self.fail_comment_reads = ""  # every read of a PR's comments raises GitHubError(this)
         self.login = train_step.BOT_NAME  # who GitHub says posted what the step posts
+        self.issue_states: Dict[int, str] = {}  # GET issues/N answers {"state": this}
+        self.pull_bodies: Dict[int, str] = {}   # GET pulls/N answers {"body": this}
 
     def graphql(self, query, variables=None):
         return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": self.main}},
@@ -343,6 +345,18 @@ class FakeGitHub:
         if method == "PATCH" and self.patch_error:
             self.writes.append((method, path, body))
             raise GitHubError(self.patch_error)
+        issue_read = re.search(r"issues/(\d+)$", path)
+        if method == "GET" and issue_read:
+            state = self.issue_states.get(int(issue_read.group(1)))
+            if state == "missing":
+                from coordlib.gh import NotFound
+                raise NotFound("HTTP 404")
+            if state == "open-pr":
+                return {"state": "open", "pull_request": {"url": "u"}}
+            return {"state": state}
+        pull_read = re.search(r"pulls/(\d+)$", path)
+        if method == "GET" and pull_read and int(pull_read.group(1)) in self.pull_bodies:
+            return {"body": self.pull_bodies[int(pull_read.group(1))], "head": {"ref": "x"}}
         if path.endswith("git/ref/heads/main"):
             if self.reread_error:
                 raise GitHubError(self.reread_error)
@@ -560,6 +574,73 @@ class StepTests(unittest.TestCase):
         # GitHub marks a PR merged when its head becomes reachable from main.
         for head in (h1, h2):
             subprocess.check_call(["git", "-C", self.origin, "merge-base", "--is-ancestor", head, tip])
+
+    def closed_issues(self, fake):
+        return [path.rsplit("/", 1)[1] for method, path, body in fake.writes
+                if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
+                                                                                     "state_reason": "completed"}]
+
+    def test_a_merged_batch_closes_the_issues_its_prs_close(self):
+        # pr_node names #55 in closingIssuesReferences; GitHub does not close it for a ref update.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.issue_states = {55: "open"}
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()
+        self.assertEqual(self.closed_issues(fake), ["55"])
+        receipt = [marker.decode(body["body"]) for method, path, body in fake.writes
+                   if method == "POST" and path.endswith("issues/55/comments")]
+        self.assertEqual([(r["event"], r["pr"], r["issue"]) for r in receipt], [("closed-issue", 1, 55)])
+        self.assertTrue(any("closed #55" in line for line in lines), lines)
+
+    def test_an_issue_already_closed_is_left_alone_and_dry_run_closes_nothing(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.issue_states = {55: "closed"}
+        self.run_on(fake, name, tip, conclusion="success")
+        self.step(fake).run()
+        self.assertEqual(self.closed_issues(fake), [])
+        sh(self.origin, "update-ref", "-d", f"refs/heads/{name}")
+        sh(self.origin, "update-ref", "refs/heads/main", sh(self.origin, "rev-parse", f"{tip}^1"))
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.issue_states = {55: "open"}
+        self.run_on(fake, name, tip, conclusion="success")
+        self.step(fake, mode="dry-run").run()
+        self.assertEqual(self.closed_issues(fake), [])
+
+    def test_a_later_step_finishing_the_batch_reads_the_merged_prs_body(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.fail_writes = 1  # the first write after the fast-forward fails: clean-up resumes next step
+        self.step(fake).run()
+        sh(self.origin, "update-ref", "refs/heads/main", tip)
+        fake.nodes = []  # merged: no longer an open PR
+        fake.pull_bodies = {1: "Fixes the thing.\n\nCloses #56"}
+        fake.issue_states = {56: "open"}
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(self.closed_issues(fake), ["56"])
+
+    def test_closing_is_best_effort_and_never_touches_prs_or_other_repositories(self):
+        # Substitute review of #1050: a permanent error must not stall the train; a PR number
+        # or another repository's issue must never be closed.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.nodes[0]["closingIssuesReferences"] = {"nodes": [
+            {"number": 55}, {"number": 56}, {"number": 57},
+            {"number": 58, "repository": {"nameWithOwner": "someone/else"}},
+            {"number": 59, "repository": {"nameWithOwner": "O/R"}}]}
+        fake.issue_states = {55: "missing", 56: "open-pr", 57: "open", 58: "open", 59: "open"}
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()
+        self.assertEqual(self.closed_issues(fake), ["57", "59"])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes,
+                      "a failed close does not keep the batch branch")
+        self.assertTrue(any("could not close #55" in line for line in lines), lines)
+        order = [(method, path) for method, path, _ in fake.writes if path.startswith("repos/{repo}/issues/57")]
+        self.assertEqual(order, [("PATCH", "repos/{repo}/issues/57"), ("POST", "repos/{repo}/issues/57/comments")],
+                         "closed first, then the receipt")
 
     def test_green_batch_in_dry_run_leaves_main_alone(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")

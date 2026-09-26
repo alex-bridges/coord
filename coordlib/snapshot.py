@@ -37,7 +37,7 @@ labels(first: 100) { totalCount nodes { name } }
 files(first: 100) { totalCount nodes { path changeType } }
 reactions(first: 100) { totalCount nodes { content createdAt user { login } } }
 comments(first: 10) { totalCount nodes { author { login } body } }
-closingIssuesReferences(first: 10) { totalCount nodes { number } }
+closingIssuesReferences(first: 10) { totalCount nodes { number repository { nameWithOwner } } }
 commits(last: 1) { nodes { commit {
   oid committedDate
   checkSuites(first: 20) { totalCount nodes { createdAt } }
@@ -567,6 +567,9 @@ def summarize_pr(pr: Dict[str, Any]) -> Dict[str, Any]:
         "updatedAt": pr.get("updatedAt"),
         "labels": [l["name"] for l in ((pr.get("labels") or {}).get("nodes")) or []],
         "closes": [n["number"] for n in ((pr.get("closingIssuesReferences") or {}).get("nodes")) or []],
+        # With the repository, so the train never closes an issue of another repository by number.
+        "closesRefs": [{"number": n.get("number"), "repo": ((n.get("repository") or {}).get("nameWithOwner")) or ""}
+                       for n in ((pr.get("closingIssuesReferences") or {}).get("nodes")) or []],
         "files": [f["path"] for f in files],
         "filesTruncated": total > len(files),
         "ci": review.ci_state(pr),
