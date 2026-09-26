@@ -242,13 +242,9 @@ def wrapped_heredocs() -> list:
     return commands
 
 
-# Commands the old guard blocked that this one allows on purpose. Each needs a reason.
-INTENDED_UNBLOCKS = {
-    # Python's heredoc is `print(1)`; apptoken is in a later git command. 4f7d4a4fd searched
-    # everything after `python3 - <<` for apptoken; the guard now searches the heredoc's body.
-    "python3 - <<'EOF'\nprint(1)\nEOF\ngit log -- Tools/coord/coordlib/apptoken.py",
-    "python3 - <<'EOF'\nprint(1)\nEOF\ngit log --oneline -- Tools/coord/coordlib/apptoken.py",
-}
+# Commands the old guard blocked that this one allows on purpose. Each needs a reason. None since
+# round eight, which blocks python and apptoken anywhere in one command.
+INTENDED_UNBLOCKS = {}
 
 
 class GuardDifferentialTests(unittest.TestCase):

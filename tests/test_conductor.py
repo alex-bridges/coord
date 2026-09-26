@@ -643,7 +643,8 @@ GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..
 class GuardHookTests(unittest.TestCase):
     """.claude/hooks/conductor-guard.py: the substitute reviews of 7afafab1 and 4d3b200b."""
 
-    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None):
+    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None,
+                  full=False):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE", "CLAUDE_PROJECT_DIR")}
         env["HOME"] = os.path.expanduser("~")
         if project:
@@ -651,7 +652,8 @@ class GuardHookTests(unittest.TestCase):
         if agent:
             env["COORD_AGENT"] = agent
         payload = raw if raw is not None else json.dumps({"tool_name": tool, "tool_input": data, "cwd": cwd})
-        return subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env).returncode
+        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env)
+        return result if full else result.returncode
 
     def test_moving_main_merging_and_approving_are_blocked(self):
         for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
@@ -753,7 +755,10 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord token status"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
-    def test_apptoken_one_liners_are_blocked(self):
+    def test_python_and_apptoken_in_one_command_are_blocked(self):
+        # Round eight of the #1046 review: the rule is co-occurrence on the raw command. Two
+        # rounds of parsing pipelines and heredocs failed open, so nothing is parsed.
+        heredoc = "<<'EOF'\nimport coordlib.apptoken\nEOF"
         for command in ("python3 -c 'from coordlib import apptoken; print(apptoken.AppTokens)'",
                         "cd Tools/coord && python3 -c \"import coordlib.apptoken as a\"",
                         "python3 -B -c 'from coordlib.apptoken import AppTokens'",
@@ -761,69 +766,62 @@ class GuardHookTests(unittest.TestCase):
                         "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF",
                         "python3 -c 'import sys; from coordlib import apptoken'",
                         "true && python3 -c 'from coordlib.apptoken import AppTokens'",
-                        # Round five of the #1046 review: a script on stdin, from a pipe or a heredoc,
-                        # and quotes that do not pair.
                         "echo 'from coordlib import apptoken' | python3 -",
                         "printf 'import coordlib.apptoken\\n' | python3 -",
                         "cat <<EOF | python3 -\nfrom coordlib import apptoken\nEOF",
                         "echo 'import coordlib.apptoken' | python3", "python3 <<EOF\nimport coordlib.apptoken\nEOF",
                         "echo 'import coordlib.apptoken' | /usr/bin/python3 -B -",
                         "python3 -c 'print(\"it'\\''s\"); import coordlib.apptoken'",
-                        "python3 -c $'print(\\'x\\'); import coordlib.apptoken'"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        for command in ("python3 -m unittest discover -s Tools/coord/tests",
-                        "python3 -m unittest test_apptoken", "grep -n AppTokens Tools/coord/coordlib/apptoken.py",
-                        "python3 -c 'print(1)'", "git log --oneline -- Tools/coord/coordlib/apptoken.py",
-                        # Round four of the #1046 review: both must be in ONE command segment.
-                        "python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py",
-                        "python3 -c 'print(1)' && grep -n AppTokens Tools/coord/coordlib/apptoken.py",
-                        "python3 -c 'print(1)' | grep -c apptoken",
-                        "grep -rn apptoken Tools/coord | grep python3", "echo apptoken; python3 -"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
-
-    def test_wrapped_and_redirected_stdin_scripts_are_blocked(self):
-        # Round seven of the #1046 review: round six anchored the stdin check at a stage's start
-        # and un-blocked every wrapped `python3 - <<EOF` (test_guard_differential now catches that).
-        heredoc = "<<'EOF'\nimport coordlib.apptoken\nEOF"
-        for command in ("timeout 30 python3 - " + heredoc, "( python3 - " + heredoc + "\n)",
+                        "python3 -c $'print(\\'x\\'); import coordlib.apptoken'",
+                        "timeout 30 python3 - " + heredoc, "( python3 - " + heredoc + "\n)",
                         "{ python3 - " + heredoc + "\n}", "/usr/bin/env python3 - " + heredoc,
                         "cd Tools/coord && timeout 60 python3 - <<'EOF'\nfrom coordlib.apptoken import AppTokens\nEOF",
                         "python3 - 2>&1 " + heredoc, "python3 -X utf8 - " + heredoc, "python3 /dev/stdin " + heredoc,
                         "echo 'import coordlib.apptoken' | python3 - 2>&1",
-                        "echo 'import coordlib.apptoken' | python3 - arg",
-                        "echo 'import coordlib.apptoken' | python3 - >out",
-                        "echo 'import coordlib.apptoken' | nice python3 -",
-                        "echo 'import coordlib.apptoken' | /usr/bin/env python3 -",
-                        "echo 'import coordlib.apptoken' | python3 -W ignore -",
-                        "echo 'import coordlib.apptoken' | python3 /dev/stdin",
-                        "echo 'import coordlib.apptoken' | (uv run python3 -)",
-                        # No dash: python after a wrapper, reading stdin.
                         "echo 'import coordlib.apptoken' | nice -n 5 python3",
-                        "echo 'import coordlib.apptoken' | env PYTHONPATH=Tools/coord python3 2>&1",
                         "echo 'import coordlib.apptoken' | env GREETING='hi there' python3",
-                        # A heredoc's quotes do not pair with the shell's; its lines are commands to a shell.
-                        "git commit -q -F - <<'EOF'\ndon't\nEOF\npython3 - <<'X'\nimport coordlib.apptoken\nX",
-                        "git commit -q -F - <<'EOF'\ndon't\nEOF\npython3 <<'X'\nimport coordlib.apptoken\nX",
-                        "bash <<'EOF'\necho 'import coordlib.apptoken' | python3\nEOF",
-                        # A -c script that reads its heredoc.
-                        "python3 -c 'import sys; exec(sys.stdin.read())' <<'EOF'\nimport coordlib.apptoken\nEOF",
-                        "python3 -c \"$(cat <<'EOF'\nimport coordlib.apptoken\nEOF\n)\""):
+                        "bash <<'X'\npython3 - <<'Y'\nimport coordlib.apptoken\nY\nX",
+                        "python3 -c 'import sys; exec(sys.stdin.read())' " + heredoc,
+                        # Round seven's parser took these `<<`s for heredocs, and missed what followed.
+                        "echo \"<<X\"\npython3 - " + heredoc, "true # <<X\npython3 - " + heredoc,
+                        "echo $((1<<2))\npython3 - " + heredoc, "cat <<$'Z'\nhi\nZ\npython3 - " + heredoc,
+                        "python3 - <<'EOF'\r\nimport coordlib.apptoken\r\nEOF\r\n",
+                        # The test module's name is exempt, nothing else in the command is.
+                        "python3 -m unittest test_apptoken; python3 - <<'Y'\nimport coordlib.apptoken\nY",
+                        "echo 'import coordlib.apptoken' | /opt/homebrew/bin/python3t -"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        for command in ("gh pr view 5 --json files | python3 -m json.tool | grep apptoken",
-                        "gh pr view 5 --json files | python3 -c 'import json,sys; print(json.load(sys.stdin))' | grep apptoken",
-                        "python3 -W ignore -m unittest test_apptoken 2>&1 | tail -3",
-                        "gh pr diff 1046 | grep -n 'python3 - ' | grep -c apptoken",
-                        # The heredoc is python's script; apptoken is after it, in a git command.
-                        "python3 - <<'EOF'\nprint(1)\nEOF\ngit log -- Tools/coord/coordlib/apptoken.py"):
+
+    def test_prose_that_names_python_and_apptoken_is_refused_with_the_way_out(self):
+        # The cost of not parsing, accepted in round eight: it fails closed, and says what to do.
+        for command in ("python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py",
+                        "python3 -c 'print(1)' | grep -c apptoken", "grep -rn apptoken Tools/coord | grep python3",
+                        "gh pr view 5 --json files | python3 -m json.tool | grep apptoken",
+                        "git commit -q -F - <<'EOF'\ncoord: don't let apptoken run from python3 stdin\nEOF",
+                        "gh pr create --title x --body-file - <<'EOF'\nThe guard's apptoken check for python3 stdin.\nEOF",
+                        "Tools/coord/coord send --on 1046 'the apptoken test'\\''s python3 run is green'"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("put it in a file and pass the file (--body-file / -F", result.stderr, command)
+        for command in ("gh pr create --title x --body-file /tmp/body.md", "git commit -q -F /tmp/message.txt",
+                        "Tools/coord/coord send --on 1046 \"$(cat /tmp/note.txt)\""):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
-    def test_prose_with_an_apostrophe_is_not_python(self):
-        # Round seven (P3-b): the conductor writes commit messages and PR bodies.
-        for command in ("git commit -q -F - <<'EOF'\ncoord: don't let apptoken run from python3 stdin\nEOF",
-                        "gh pr create --title x --body-file - <<'EOF'\nThe guard's apptoken check for python3 stdin.\nEOF",
-                        "Tools/coord/coord send --on 1046 'the apptoken test'\\''s python3 run is green'",
-                        "python3 -m unittest test_apptoken && git commit -q -F - <<'EOF'\n"
-                        "coord: don't let apptoken run from python3 stdin\nEOF"):
+    def test_the_test_runner_and_the_conductors_own_commands_are_allowed(self):
+        for command in ("python3 -m unittest test_apptoken", "python3 -m unittest discover -s Tools/coord/tests",
+                        "cd Tools/coord/tests && python3 -W ignore -m unittest test_apptoken 2>&1 | tail -3",
+                        "grep -rn apptoken Tools/coord", "Tools/coord/coord send --on 1 'the apptoken test passed'",
+                        "grep -n AppTokens Tools/coord/coordlib/apptoken.py", "python3 -c 'print(1)'",
+                        "git log --oneline -- Tools/coord/coordlib/apptoken.py",
+                        # .claude/agents/conductor.md
+                        "cat \"$CONDUCTOR_STATE_DIR/notes.md\"", "Tools/coord/coord inbox", "Tools/coord/coord board",
+                        "Tools/coord/coord board --json | python3 -m json.tool | head -50",
+                        "Tools/coord/coord send --on 1046 'the train is moving again'",
+                        "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'", "Tools/coord/coord claim 991",
+                        "Tools/coord/coord train add 1046", "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
+                        "Tools/coord/coord conductor pause --for 2h", "gh run view 123456 --log-failed | tail -80",
+                        "tail -50 ~/Library/Logs/inisa/ci-health.log", "du -xhd1 /Users/dev 2>/dev/null | sort -h",
+                        "git worktree add -b conductor/fix-x ../conductor-fix-x origin/main",
+                        "gh pr diff 1046 -- Tools/coord/coordlib/apptoken.py | head -100"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_a_very_long_command_is_refused_quickly(self):
