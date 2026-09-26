@@ -581,6 +581,30 @@ class TokenStatusTests(AppCliTestCase):
         self.assertIn("app mode: on (the app config exists but cannot be used)", out)
         self.assertIn("cannot be read (RecursionError)", out)
 
+    def test_a_cached_token_whose_expiry_is_not_a_string_is_a_miss(self):
+        # The review of 2d13f6b1e..752135947 (P2): review.parse_time calls .strip(), so an
+        # `expires_at` of 1 or true raised AttributeError out of token status, cached() and token().
+        self.keychain("key")
+        for value in (1, True, []):
+            with self.subTest(expires_at=value):
+                for kind in apptoken.KINDS:
+                    self.seed_token(kind)
+                    path = os.path.join(self.token_dir, f"{kind}.json")
+                    with open(path, encoding="utf-8") as handle:
+                        entry = json.load(handle)
+                    entry["expires_at"] = value
+                    with open(path, "w", encoding="utf-8") as handle:
+                        json.dump(entry, handle)
+                code, out, err = self.main(["token", "status"])
+                self.assertEqual(code, EXIT_OK, err)
+                self.assertNotIn("Traceback", err)
+                for kind in apptoken.KINDS:
+                    self.assertIn(f"{kind} token: expired or within five minutes of expiry (the next call mints)", out)
+                    self.assertIsNone(self.tokens().cached(kind))
+                mints = self.server.mints
+                self.assertTrue(self.tokens().token("read").startswith("ghs_"))
+                self.assertEqual(self.server.mints, mints + 1, "a miss: the next call mints")
+
     def test_a_group_readable_cached_token_is_not_reported_reusable(self):
         # Codex on a774ba186 (P2): describe() said `reusable` for a 0644 file that cached()
         # refuses, so `token status` disagreed with what the next call does.

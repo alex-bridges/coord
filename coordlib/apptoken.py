@@ -355,8 +355,11 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
 
 
 def expiry_epoch(entry: Dict[str, Any]) -> Optional[float]:
+    value = entry.get("expires_at")
+    if not isinstance(value, str):
+        return None  # a number, bool or list here is a malformed entry: a miss, never an AttributeError
     try:
-        moment = review.parse_time(entry.get("expires_at"))
+        moment = review.parse_time(value)
     except (TypeError, ValueError):
         return None
     return None if moment is None else moment.timestamp()
