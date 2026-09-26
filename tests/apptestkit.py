@@ -150,6 +150,7 @@ class FakeGitHub:
         self.prs: List[Dict[str, Any]] = [pr_node()]
         self.forbid_writes = ""  # answer every write 403 with this X-Accepted-GitHub-Permissions
         self.echo_secrets = 0  # answer every API call with this 4xx, its body echoing the token and a JWT
+        self.refuse_kinds: set = set()  # refuse to mint these kinds (403)
         self.lock = threading.Lock()
 
     # MARK: urlopen
@@ -207,6 +208,8 @@ class FakeGitHub:
             raise self._error(API + "/" + path, self.mint_status,
                               {"message": "A JSON web token could not be decoded"})
         kind = "ops" if body["permissions"] == apptoken.OPS_PERMISSIONS else "read"
+        if kind in self.refuse_kinds:
+            raise self._error(API + "/" + path, 403, {"message": f"fake: no {kind} token today"})
         token = "ghs_" + secrets.token_urlsafe(self.token_length)[: self.token_length - 4]
         with self.lock:
             self.tokens[token] = kind
@@ -428,3 +431,8 @@ class AppTestCase(unittest.TestCase):
 
 def file_mode(path: str) -> int:
     return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def read_json(path: str) -> Any:
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)

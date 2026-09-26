@@ -22,7 +22,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apptestkit import (API, CLIENT_ID, INSTALLATION, OPENSSLS, PEM, PEM_B64, PUBLIC_PEM, REPO,  # noqa: E402
-                        AppTestCase, file_mode, jwt_parts)
+                        AppTestCase, file_mode, jwt_parts, read_json)
 from coordlib import apptoken  # noqa: E402
 from coordlib.gh import AppAuthError  # noqa: E402
 
@@ -109,7 +109,7 @@ class MintTests(AppTestCase):
         self.assertEqual(self.server.tokens[token], "read")
         self.assertEqual(self.security_calls(),
                          [f"find-generic-password -s example-coord-github-app -a {CLIENT_ID} -w"])
-        entry = json.load(open(os.path.join(self.token_dir, "read.json"), encoding="utf-8"))
+        entry = read_json(os.path.join(self.token_dir, "read.json"))
         self.assertEqual({k: entry[k] for k in ("token", "installation_id", "permissions")},
                          {"token": token, "installation_id": INSTALLATION, "permissions": apptoken.READ_PERMISSIONS})
         self.assertEqual(file_mode(os.path.join(self.token_dir, "read.json")), 0o600)
@@ -141,7 +141,7 @@ class MintTests(AppTestCase):
 
     def test_a_token_with_five_minutes_or_less_left_is_minted_again(self):
         first = self.tokens().token("read")
-        expires = apptoken.expiry_epoch(json.load(open(os.path.join(self.token_dir, "read.json"))))
+        expires = apptoken.expiry_epoch(read_json(os.path.join(self.token_dir, "read.json")))
         self.assertEqual(self.tokens(clock=lambda: expires - 301).token("read"), first, "5 min 1 s left: reused")
         again = self.tokens(clock=lambda: expires - 300).token("read")
         self.assertNotEqual(again, first, "5 min left: minted again")
@@ -418,8 +418,8 @@ class FailureMemoryTests(AppTestCase):
         for kind in apptoken.KINDS:
             path = os.path.join(self.token_dir, f"{kind}.failed.json")
             self.assertEqual(file_mode(path), 0o600)
-            record = json.load(open(path, encoding="utf-8"))
-            self.assertEqual(set(record), {"at", "cause", "stage"})
+            record = read_json(path)
+            self.assertEqual(set(record), {"at", "cause", "stage", "client_id", "repo"})
             self.assertIn("the Keychain did not return the app key", record["cause"])
             self.assert_no_secret(json.dumps(record))
         for kind in apptoken.KINDS:  # the next processes
@@ -458,6 +458,40 @@ class FailureMemoryTests(AppTestCase):
         self.assertTrue(self.tokens().token("ops"))
         with self.assertRaises(AppAuthError):
             self.tokens().token("read")
+
+    def test_a_hold_belongs_to_its_config(self):
+        # Two app configs share one token cache directory (review of #1046, P3-4).
+        self.keychain("missing")
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        other = apptoken.AppTokens({"client_id": "Iv23otherapp", "repo": "o/other", "app_login": "", "app_id": None},
+                                   self.token_dir)
+        self.assertIsNone(other.failure("read"), "another config's hold does not stop this one")
+        self.keychain("key")
+        self.assertTrue(other.token("read"), "and it mints")
+        self.assertIsNotNone(self.tokens().failure("read"), "its success does not clear the first config's hold")
+        with self.assertRaises(AppAuthError) as caught:
+            self.tokens().token("read")
+        self.assertIn("a mint failed", str(caught.exception))
+
+    def test_a_record_without_its_config_is_ignored(self):
+        os.makedirs(self.token_dir, exist_ok=True)
+        path = os.path.join(self.token_dir, "read.failed.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"at": time.time(), "cause": "x", "stage": "key"}, handle)  # the shape before P3-4
+        os.chmod(path, 0o600)
+        self.assertIsNone(self.tokens().failure("read"))
+
+    def test_a_refused_read_mint_does_not_stop_the_ops_token_in_the_same_process(self):
+        self.keychain("key")
+        self.server.refuse_kinds = {"read"}
+        tokens = self.tokens()
+        with self.assertRaises(AppAuthError):
+            tokens.token("read")
+        self.assertTrue(tokens.token("ops"), "a mint refused for one kind holds only that kind")
+        with self.assertRaises(AppAuthError):
+            tokens.token("read")
+        self.assertEqual(len(self.security_calls()), 1)
 
     def test_a_lock_timeout_is_not_remembered(self):
         os.makedirs(self.token_dir, exist_ok=True)
@@ -647,17 +681,68 @@ class RedirectTests(unittest.TestCase):
 
 class SecurityOverrideTests(AppTestCase):
     """COORD_SECURITY_BIN reaches the `coord` script in a subprocess, which module patches
-    cannot; it is honoured only with a non-default app config."""
+    cannot. It is refused for the default config by ANY spelling of its path, and for any
+    config carrying the default config's client id (review of #1046, P3-3)."""
 
-    def test_the_override_needs_a_test_config(self):
+    REAL_ID = "Iv23realdefault"
+
+    def setUp(self):
+        super().setUp()
         self.patch(apptoken, "SECURITY", "/usr/bin/security")
-        fake = os.path.join(self.root, "bin", "security")
-        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake}), "/usr/bin/security")
-        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake,
-                                                   "COORD_APP_CONFIG": apptoken.default_config_path()}),
-                         "/usr/bin/security", "never with the real config")
-        self.assertEqual(apptoken.security_binary({"COORD_SECURITY_BIN": fake, "COORD_APP_CONFIG": self.config_path}),
-                         fake)
+        self.fake = os.path.join(self.root, "bin", "security")
+        # This test's stand-in for ~/.config/inisa-coord/github-app.json, holding "the real"
+        # client id (never the real file: the test must mean the same on every machine).
+        home = os.path.join(self.root, "Home")
+        self.default = os.path.join(home, ".config", "inisa-coord", "github-app.json")
+        os.makedirs(os.path.dirname(self.default))
+        with open(self.default, "w", encoding="utf-8") as handle:
+            json.dump({"client_id": self.REAL_ID, "repo": REPO}, handle)
+        self.patch(apptoken, "default_config_path", lambda: self.default)
+
+    def binary(self, configured, client_id=CLIENT_ID):
+        env = {"COORD_SECURITY_BIN": self.fake}
+        if configured is not None:
+            env["COORD_APP_CONFIG"] = configured
+        return apptoken.security_binary(env, client_id)
+
+    def test_a_test_config_with_a_test_client_id_may_use_the_override(self):
+        self.assertEqual(self.binary(self.config_path), self.fake)
+
+    def test_no_config_named_means_the_default(self):
+        self.assertEqual(self.binary(None), "/usr/bin/security")
+
+    def test_every_spelling_of_the_default_path_is_refused(self):
+        folder = os.path.dirname(self.default)
+        link = os.path.join(self.root, "link.json")
+        os.symlink(self.default, link)
+        linked_dir = os.path.join(self.root, "linked-dir")
+        os.symlink(folder, linked_dir)
+        spellings = {
+            "itself": self.default,
+            "a symlink to the file": link,
+            "through a symlinked folder": os.path.join(linked_dir, "github-app.json"),
+            "with ..": os.path.join(folder, "..", "inisa-coord", "github-app.json"),
+            "with ./": os.path.join(folder, ".", "github-app.json"),
+            "in other letter case": self.default.replace("/Home/", "/HOME/").replace("github-app", "GitHub-App"),
+        }
+        for name, path in spellings.items():
+            with self.subTest(spelling=name):
+                self.assertEqual(self.binary(path), "/usr/bin/security")
+
+    def test_the_default_client_id_is_refused_from_any_config(self):
+        copy = os.path.join(self.root, "copy.json")
+        with open(copy, "w", encoding="utf-8") as handle:
+            json.dump({"client_id": self.REAL_ID, "repo": REPO}, handle)
+        self.assertEqual(self.binary(copy, client_id=self.REAL_ID), "/usr/bin/security")
+        self.assertEqual(self.binary(self.config_path, client_id=None), "/usr/bin/security",
+                         "no client id named: no override")
+
+    def test_the_mint_passes_its_client_id(self):
+        seen = []
+        self.patch(apptoken, "security_binary", lambda env=None, client_id=None: seen.append(client_id) or self.fake)
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")  # the fake trips (tripwire mode); the argument is what matters
+        self.assertEqual(seen, [CLIENT_ID])
 
 
 if __name__ == "__main__":

@@ -72,9 +72,10 @@ KEYCHAIN_SERVICE = "example-coord-github-app"
 
 # Absolute paths, never looked up on PATH. The PEM goes INTO openssl, so whoever could
 # choose that binary could read the key: OPENSSL is never taken from the environment.
-# `security` only hands a key OUT, so a test may replace it (security_binary), and only
-# with a non-default app config, whose client id the real Keychain does not hold. Tests
-# in this process replace the module attributes.
+# `security` only hands a key OUT, so a test that runs the script as a subprocess may
+# replace it (security_binary): only with an app config that is not the default one by
+# any spelling, and only for a client id that is not the default config's. Tests in this
+# process replace the module attributes.
 SECURITY = "/usr/bin/security"
 OPENSSL = "/usr/bin/openssl"
 
@@ -136,16 +137,41 @@ def config_path(env: Optional[Dict[str, str]] = None) -> str:
     return env.get(CONFIG_ENV) or default_config_path()
 
 
-def security_binary(env: Optional[Dict[str, str]] = None) -> str:
-    """SECURITY, or COORD_SECURITY_BIN when a NON-default app config is in use (tests that
-    run the `coord` script as a subprocess, which module patches cannot reach). With the
-    real config the override is ignored, so it can never point the real client id's
-    Keychain lookup anywhere else."""
+def _is_default_config(path: str) -> bool:
+    """Whether `path` names the default config, however it is spelled: through a symlink,
+    with `..`, or in other letter case (macOS volumes are case-insensitive by default, so
+    the comparison is too; being wrong that way only refuses an override)."""
+    default = default_config_path()
+    try:
+        if os.path.samefile(path, default):
+            return True
+    except OSError:
+        pass
+    return os.path.realpath(path).lower() == os.path.realpath(default).lower()
+
+
+def _default_client_id() -> Optional[str]:
+    try:
+        return load_config(default_config_path())["client_id"]
+    except AppAuthError:
+        return None
+
+
+def security_binary(env: Optional[Dict[str, str]] = None, client_id: Optional[str] = None) -> str:
+    """SECURITY, or COORD_SECURITY_BIN for tests that run the `coord` script as a
+    subprocess (which module patches cannot reach). The override is refused, and
+    /usr/bin/security used, unless COORD_APP_CONFIG names a config that is NOT the default
+    one by any spelling (`_is_default_config`) AND whose client id (`client_id`, the one
+    about to be looked up) is not the default config's client id. So the Keychain item of
+    the app's real client id can never be fetched through the override."""
     env = os.environ if env is None else env
     override, configured = env.get(SECURITY_ENV), env.get(CONFIG_ENV)
-    if override and configured and os.path.abspath(configured) != os.path.abspath(default_config_path()):
-        return override
-    return SECURITY
+    if not override or not configured or _is_default_config(configured):
+        return SECURITY
+    real = _default_client_id()
+    if client_id is None or (real is not None and client_id == real):
+        return SECURITY
+    return override
 
 
 def token_cache_dir(env: Optional[Dict[str, str]] = None) -> str:
@@ -309,7 +335,7 @@ class AppTokens:
         self._installation: Optional[int] = None
         self._jwt: Optional[str] = None
         self._jwt_at = 0.0
-        self._failure: Optional[str] = None
+        self._failures: Dict[str, str] = {}  # kind -> the failure repeated for the rest of the process
         self.mints = 0  # tokens this object minted (tests and `token status`)
 
     # MARK: public
@@ -317,15 +343,17 @@ class AppTokens:
     def token(self, kind: str) -> str:
         """The `kind` token: cached while it has more than five minutes, else minted.
 
-        Raises AppAuthError on any failure, and repeats the first failure for the rest of
-        the process instead of asking the Keychain again. A failed mint is also remembered
+        Raises AppAuthError on any failure, and repeats it for the rest of the process
+        instead of asking the Keychain again: for both kinds when getting the key failed,
+        for this kind alone when its own mint was refused (a refused read mint must not
+        stop an ops token that works, and the reverse). A failed mint is also remembered
         for FAILURE_HOLD_SECONDS across processes (`<kind>.failed.json`), so the next
         commands refuse at once instead of prompting or stalling again.
         """
         if kind not in PERMISSIONS:
             raise ValueError(f"unknown token kind {kind!r}")
-        if self._failure is not None:
-            raise AppAuthError(self._failure)
+        if kind in self._failures:
+            raise AppAuthError(self._failures[kind])
         try:
             entry = self.cached(kind)
             if entry is None:
@@ -336,21 +364,23 @@ class AppTokens:
                         self._check_failed(kind)  # or failed meanwhile
                         entry = self._mint_remembering_failure(kind)
         except AppAuthError as error:
-            self._failure = redact(str(error))
-            raise AppAuthError(self._failure) from None
+            message = redact(str(error))
+            for failed in getattr(error, "kinds", (kind,)):
+                self._failures[failed] = message
+            raise AppAuthError(message) from None
         self._installation = entry["installation_id"]
         return entry["token"]
 
     def reject(self, kind: str, token: str, reason: str) -> None:
         """GitHub answered 401 to this kind's token (revoked, or the installation suspended):
-        drop the cached token if it is still the one that was refused, and refuse for the
-        rest of this process. The next command mints afresh (and remembers a failure)."""
+        drop the cached token if it is still the one that was refused, and refuse this kind
+        for the rest of this process. The next command mints afresh."""
         path = self.path(kind)
         entry = _read_json(path)
         if entry is not None and entry.get("token") == token:
             with contextlib.suppress(OSError):
                 os.unlink(path)
-        self._failure = redact(reason)
+        self._failures[kind] = redact(reason)
 
     def installation_id(self) -> Optional[int]:
         """The installation, from this process or any token cache entry of this config
@@ -385,9 +415,10 @@ class AppTokens:
         return out
 
     def failure(self, kind: str) -> Optional[Dict[str, Any]]:
-        """A mint failure of this kind still being held: {"at", "cause", "until"}, or None."""
+        """A mint failure of this kind, for THIS config, still being held: {"at", "cause",
+        "until"}, or None. Another config's record in a shared cache directory is ignored."""
         record = _read_json(self.failed_path(kind))
-        if not record or not isinstance(record.get("cause"), str):
+        if not record or not isinstance(record.get("cause"), str) or not self._same_config(record):
             return None
         at = record.get("at")
         now = self._clock()
@@ -417,12 +448,15 @@ class AppTokens:
             entry = self._mint(kind)
         except AppAuthError as error:
             for failed in getattr(error, "kinds", (kind,)):
-                self._write_private(self.failed_path(failed), {"at": self._clock(), "cause": redact(str(error))[:300],
-                                                               "stage": getattr(error, "stage", "mint")})
+                self._write_private(self.failed_path(failed), {
+                    "at": self._clock(), "cause": redact(str(error))[:300], "stage": getattr(error, "stage", "mint"),
+                    "client_id": self.config["client_id"], "repo": self.config["repo"]})
             raise
         for other in KINDS:
             record = _read_json(self.failed_path(other))
-            if other == kind or (record or {}).get("stage") == "key":
+            if not record or not self._same_config(record):
+                continue  # another config's hold is not ours to clear
+            if other == kind or record.get("stage") == "key":
                 with contextlib.suppress(OSError):
                     os.unlink(self.failed_path(other))  # the key works again
         return entry
@@ -510,7 +544,7 @@ class AppTokens:
 
     def _private_key(self) -> bytes:
         """The PEM from the login Keychain. Only minting calls this."""
-        binary = security_binary()
+        binary = security_binary(client_id=self.config["client_id"])
         command = [binary, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.config["client_id"], "-w"]
         try:
             result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
