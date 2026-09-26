@@ -781,11 +781,61 @@ class GuardHookTests(unittest.TestCase):
                         "grep -rn apptoken Tools/coord | grep python3", "echo apptoken; python3 -"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
+    def test_wrapped_and_redirected_stdin_scripts_are_blocked(self):
+        # Round seven of the #1046 review: round six anchored the stdin check at a stage's start
+        # and un-blocked every wrapped `python3 - <<EOF` (test_guard_differential now catches that).
+        heredoc = "<<'EOF'\nimport coordlib.apptoken\nEOF"
+        for command in ("timeout 30 python3 - " + heredoc, "( python3 - " + heredoc + "\n)",
+                        "{ python3 - " + heredoc + "\n}", "/usr/bin/env python3 - " + heredoc,
+                        "cd Tools/coord && timeout 60 python3 - <<'EOF'\nfrom coordlib.apptoken import AppTokens\nEOF",
+                        "python3 - 2>&1 " + heredoc, "python3 -X utf8 - " + heredoc, "python3 /dev/stdin " + heredoc,
+                        "echo 'import coordlib.apptoken' | python3 - 2>&1",
+                        "echo 'import coordlib.apptoken' | python3 - arg",
+                        "echo 'import coordlib.apptoken' | python3 - >out",
+                        "echo 'import coordlib.apptoken' | nice python3 -",
+                        "echo 'import coordlib.apptoken' | /usr/bin/env python3 -",
+                        "echo 'import coordlib.apptoken' | python3 -W ignore -",
+                        "echo 'import coordlib.apptoken' | python3 /dev/stdin",
+                        "echo 'import coordlib.apptoken' | (uv run python3 -)",
+                        # No dash: python after a wrapper, reading stdin.
+                        "echo 'import coordlib.apptoken' | nice -n 5 python3",
+                        "echo 'import coordlib.apptoken' | env PYTHONPATH=Tools/coord python3 2>&1",
+                        "echo 'import coordlib.apptoken' | env GREETING='hi there' python3",
+                        # A heredoc's quotes do not pair with the shell's; its lines are commands to a shell.
+                        "git commit -q -F - <<'EOF'\ndon't\nEOF\npython3 - <<'X'\nimport coordlib.apptoken\nX",
+                        "git commit -q -F - <<'EOF'\ndon't\nEOF\npython3 <<'X'\nimport coordlib.apptoken\nX",
+                        "bash <<'EOF'\necho 'import coordlib.apptoken' | python3\nEOF",
+                        # A -c script that reads its heredoc.
+                        "python3 -c 'import sys; exec(sys.stdin.read())' <<'EOF'\nimport coordlib.apptoken\nEOF",
+                        "python3 -c \"$(cat <<'EOF'\nimport coordlib.apptoken\nEOF\n)\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("gh pr view 5 --json files | python3 -m json.tool | grep apptoken",
+                        "gh pr view 5 --json files | python3 -c 'import json,sys; print(json.load(sys.stdin))' | grep apptoken",
+                        "python3 -W ignore -m unittest test_apptoken 2>&1 | tail -3",
+                        "gh pr diff 1046 | grep -n 'python3 - ' | grep -c apptoken",
+                        # The heredoc is python's script; apptoken is after it, in a git command.
+                        "python3 - <<'EOF'\nprint(1)\nEOF\ngit log -- Tools/coord/coordlib/apptoken.py"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_prose_with_an_apostrophe_is_not_python(self):
+        # Round seven (P3-b): the conductor writes commit messages and PR bodies.
+        for command in ("git commit -q -F - <<'EOF'\ncoord: don't let apptoken run from python3 stdin\nEOF",
+                        "gh pr create --title x --body-file - <<'EOF'\nThe guard's apptoken check for python3 stdin.\nEOF",
+                        "Tools/coord/coord send --on 1046 'the apptoken test'\\''s python3 run is green'",
+                        "python3 -m unittest test_apptoken && git commit -q -F - <<'EOF'\n"
+                        "coord: don't let apptoken run from python3 stdin\nEOF"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
     def test_a_very_long_command_is_refused_quickly(self):
-        # _QUOTED rescans to the end for each unclosed quote; a timeout would fail OPEN.
-        start = __import__("time").monotonic()
-        self.assertEqual(self.run_guard("Bash", {"command": 'echo "' + 'a\\"' * 8334}), 2)  # 25,003 characters
-        self.assertLess(__import__("time").monotonic() - start, 5, "refused before any slow check")
+        # _QUOTED rescans to the end for each unclosed quote: uncapped, 100,000 characters of
+        # this take ~20 s, past the hook's timeout, which lets the call through.
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": 'echo "' + 'a\\"' * 66665}, "cwd": "/tmp/home"})
+        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=3)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("longer than 20000 characters", result.stderr)
+        self.assertIn("write it to a file", result.stderr)
         self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
