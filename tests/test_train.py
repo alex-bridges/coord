@@ -347,7 +347,13 @@ class FakeGitHub:
             raise GitHubError(self.patch_error)
         issue_read = re.search(r"issues/(\d+)$", path)
         if method == "GET" and issue_read:
-            return {"state": self.issue_states.get(int(issue_read.group(1)))}
+            state = self.issue_states.get(int(issue_read.group(1)))
+            if state == "missing":
+                from coordlib.gh import NotFound
+                raise NotFound("HTTP 404")
+            if state == "open-pr":
+                return {"state": "open", "pull_request": {"url": "u"}}
+            return {"state": state}
         pull_read = re.search(r"pulls/(\d+)$", path)
         if method == "GET" and pull_read and int(pull_read.group(1)) in self.pull_bodies:
             return {"body": self.pull_bodies[int(pull_read.group(1))], "head": {"ref": "x"}}
@@ -615,6 +621,26 @@ class StepTests(unittest.TestCase):
         fake.writes.clear()
         self.step(fake).run()
         self.assertEqual(self.closed_issues(fake), ["56"])
+
+    def test_closing_is_best_effort_and_never_touches_prs_or_other_repositories(self):
+        # Substitute review of #1050: a permanent error must not stall the train; a PR number
+        # or another repository's issue must never be closed.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.nodes[0]["closingIssuesReferences"] = {"nodes": [
+            {"number": 55}, {"number": 56}, {"number": 57},
+            {"number": 58, "repository": {"nameWithOwner": "someone/else"}},
+            {"number": 59, "repository": {"nameWithOwner": "O/R"}}]}
+        fake.issue_states = {55: "missing", 56: "open-pr", 57: "open", 58: "open", 59: "open"}
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()
+        self.assertEqual(self.closed_issues(fake), ["57", "59"])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes,
+                      "a failed close does not keep the batch branch")
+        self.assertTrue(any("could not close #55" in line for line in lines), lines)
+        order = [(method, path) for method, path, _ in fake.writes if path.startswith("repos/{repo}/issues/57")]
+        self.assertEqual(order, [("PATCH", "repos/{repo}/issues/57"), ("POST", "repos/{repo}/issues/57/comments")],
+                         "closed first, then the receipt")
 
     def test_green_batch_in_dry_run_leaves_main_alone(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")

@@ -467,22 +467,38 @@ class Step:
         #929. That also left their coord claims standing on the board. An issue already
         closed (by hand, or by an earlier step that was interrupted) is left alone, so a
         repeated step closes nothing twice. `pr` is the open PR as this step read it; when
-        a later step finishes the batch the PR is already merged, so its body is read."""
-        issues = (pr or {}).get("closes")
-        if issues is None:
-            pull = self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}
-            issues = [int(n) for n in snapshot._CLOSES.findall(pull.get("body") or "")]
+        a later step finishes the batch the PR is already merged, so its body is read (that
+        path sees only `Closes #N` in the text, not issues linked in the sidebar).
+
+        Best effort (substitute review of #1050): a failure is noted and never added to the
+        batch's clean-up failures, because a permanent one (a typo'd `Fixes #9999`, a locked
+        issue) would keep the batch branch and stall the train at every step. A reference
+        to another repository, or a number that is a pull request, is never closed."""
+        refs = (pr or {}).get("closesRefs")
+        if refs is None:
+            if pr is not None and pr.get("closes") is not None:
+                refs = [{"number": n} for n in pr["closes"]]
+            else:
+                pull = self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}
+                refs = [{"number": int(n)} for n in snapshot._CLOSES.findall(pull.get("body") or "")]
+        issues = [r["number"] for r in refs if isinstance(r.get("number"), int)
+                  and (not r.get("repo") or r["repo"].lower() == self.gh.repo.lower())]
         for issue in dict.fromkeys(issues):
-            if (self.gh.rest(f"repos/{{repo}}/issues/{issue}") or {}).get("state") != "open":
-                continue
-            payload = {"kind": "train", "v": 1, "agent": self.agent, "event": "closed-issue", "pr": number,
-                       "issue": issue, "batch": batch, "mode": self.mode}
-            self.gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(
-                f"**Closed by the merge train:** #{number}, which closes this issue, merged in batch `{batch}`.",
-                payload)})
-            self.gh.rest(f"repos/{{repo}}/issues/{issue}", method="PATCH",
-                         body={"state": "closed", "state_reason": "completed"})
-            self.note(f"#{number}: closed #{issue}")
+            try:
+                current = self.gh.rest(f"repos/{{repo}}/issues/{issue}") or {}
+                if current.get("state") != "open" or current.get("pull_request"):
+                    continue
+                # Close first, then the receipt: a lost receipt is less harm than a second one.
+                self.gh.rest(f"repos/{{repo}}/issues/{issue}", method="PATCH",
+                             body={"state": "closed", "state_reason": "completed"})
+                payload = {"kind": "train", "v": 1, "agent": self.agent, "event": "closed-issue", "pr": number,
+                           "issue": issue, "batch": batch, "mode": self.mode}
+                self.gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(
+                    f"**Closed by the merge train:** #{number}, which closes this issue, merged in batch `{batch}`.",
+                    payload)})
+                self.note(f"#{number}: closed #{issue}")
+            except GitHubError as error:
+                self.note(f"#{number}: could not close #{issue} ({str(error)[:120]}); left for a person")
 
     def advance(self, name: str, tip: str, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
         base, members = train.parse_batch(
