@@ -699,6 +699,24 @@ class GuardHookTests(unittest.TestCase):
         self.assertEqual(self.run_guard("Write", {"file_path": "CLAUDE.md"}, project=None), 2,
                          "without CLAUDE_PROJECT_DIR the call's cwd is the project")
 
+    def test_coord_token_exec_is_blocked_in_every_form(self):
+        # #1035 review (P3-8): a conductor run must never get a GitHub App token in a shell.
+        for command in ("Tools/coord/coord token exec -- gh pr list",
+                        "Tools/coord/coord token exec --kind ops -- sh -c 'echo $GH_TOKEN'",
+                        "./Tools/coord/coord token exec --kind read -- env",
+                        "/Users/dev/Projects/INISA/Tools/coord/coord token exec -- true",
+                        "python3 Tools/coord/coord token exec -- true", "coord token  exec -- true",
+                        "sh -c 'Tools/coord/coord token exec --kind ops -- env'",
+                        "bash -c \"coord token exec -- gh api user\"", "eval 'coord token exec -- true'",
+                        "cd /tmp && Tools/coord/coord token exec -- true",
+                        "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("Tools/coord/coord token status", "gh pr comment 5 -b 'never run coord token exec here'",
+                        "grep -n 'token exec' Docs/agent-coordination.md"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
+                         "outside the conductor the guard is silent")
+
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
         guard = __import__("importlib.util").util.module_from_spec(spec)
