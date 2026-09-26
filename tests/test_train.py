@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
-from test_coord import BOT, NOW, REAL_FAILURE, check, codex_summary, pr_node, reaction, refused_check  # noqa: E402
+from test_coord import (BOT, NOW, REAL_FAILURE, check, codex_summary, coord_comment, pr_node, reaction,  # noqa: E402
+                        refused_check)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.
@@ -84,17 +85,54 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
-        unavailable = dict(pr, codex={"approved": False, "reviewing": False}, labels=["train", "codex-unavailable"])
-        self.assertEqual(train.eligibility(dict(unavailable, substituteReviewHead=pr["head"]))[0], train.READY)
-        verdict, reason = train.eligibility(dict(unavailable, substituteReviewHead="0" * 40))
-        self.assertEqual(verdict, train.HOLD, "a substitute review of an OLDER head does not cover a new push")
-        self.assertIn("substitute review", reason)
-        self.assertEqual(train.eligibility(unavailable)[0], train.HOLD, "the label alone is not a review")
         self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings")
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": ["Android"], "pending": [], "verdict": "failure"}))[0],
                          train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": [], "pending": ["x"], "verdict": "pending"}))[0],
                          train.READY)
+
+    def unreviewed(self, **fields):
+        """A summary with no Codex 👍, no labels but `train`, and `fields` on top."""
+        return dict(dict(self.summary(), codex={"approved": False, "reviewing": False}, labels=["train"]), **fields)
+
+    def test_a_clean_review_by_any_agent_at_the_head_counts_without_a_label(self):
+        pr = self.unreviewed()
+        self.assertEqual(train.eligibility(dict(pr, reviewedHead=pr["head"])), (train.READY, "ready"))
+
+    def test_a_clean_review_of_an_older_head_does_not_count(self):
+        pr = self.unreviewed(reviewedHead="0" * 40)
+        verdict, hold, reason = train.assess(pr)
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW), "a new push needs a new review")
+        self.assertIn("covers 000000000, an older head", reason)
+
+    def test_no_codex_thumbs_up_and_no_recorded_review_holds(self):
+        verdict, hold, reason = train.assess(self.unreviewed())
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW))
+        self.assertIn("no clean review of it recorded", reason)
+        self.assertIn("coord train review 1 --by <agent>", reason)
+        self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
+
+    def test_codex_re_reviewing_still_holds_a_recorded_review(self):
+        pr = dict(self.unreviewed(), codex={"approved": False, "reviewing": True})
+        self.assertEqual(train.eligibility(dict(pr, reviewedHead=pr["head"])), (train.HOLD, "Codex is re-reviewing it"))
+
+    def test_a_record_of_either_kind_sets_the_reviewed_head(self):
+        head = "a" * 40
+        for kind, labels in (("review-clean", ["train"]),
+                             # Recorded by `substitute-review` before 2026-09-26, with the old label.
+                             ("review-substitute", ["train", "codex-unavailable"])):
+            with self.subTest(kind=kind):
+                pr = self.unreviewed(labels=labels)
+                snapshot.attach_head_records([pr], [coord_comment(1, 1, 5, {"kind": kind, "pr": 1, "head": head})])
+                self.assertEqual(pr["reviewedHead"], head)
+                self.assertEqual(train.eligibility(pr), (train.READY, "ready"))
+
+    def test_the_newest_record_of_either_kind_wins(self):
+        pr = self.unreviewed()
+        snapshot.attach_head_records([pr], [
+            coord_comment(1, 1, 30, {"kind": "review-clean", "pr": 1, "head": pr["head"]}),
+            coord_comment(2, 1, 10, {"kind": "review-substitute", "pr": 1, "head": "0" * 40})])
+        self.assertEqual(train.eligibility(pr)[0], train.HOLD, "the newer record names an older head")
 
     def summary_with_checks(self, *checks):
         node = ready_node(1, "a" * 40, "b")
@@ -580,6 +618,36 @@ class StepTests(unittest.TestCase):
                 if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
                                                                                      "state_reason": "completed"}]
 
+    def queue_reviewed(self, head, reviewed_head):
+        """PR 1 queued at `head` with no Codex 👍 and no label but `train`, and a clean
+        review recorded by `coord train review` naming `reviewed_head`."""
+        node = ready_node(1, head, "pr1")
+        node["reactions"] = {"nodes": []}
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "body": marker.compose("reviewed", {
+            "kind": "review-clean", "v": 1, "agent": "claude@h:w", "by": "claude@h:reviewer", "pr": 1,
+            "head": reviewed_head})})
+        return fake
+
+    def test_a_recorded_clean_review_lands_without_codex_or_a_label(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = self.queue_reviewed(h1, h1)
+        lines = self.step(fake).run()
+        name, tip = self.batch_on_origin()
+        self.assertTrue(name, lines)
+        self.assertEqual([m["pr"] for m in self.members(name)], [1])
+        sh(self.clone, "fetch", "-q", "origin", "+refs/heads/train/*:refs/remotes/origin/train/*")
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()  # the final check reads the record again
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes, lines)
+
+    def test_a_recorded_clean_review_of_an_older_head_is_held(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        lines = self.step(self.queue_reviewed(h1, "0" * 40)).run()
+        self.assertEqual(self.batch_on_origin(), ("", ""), lines)
+        self.assertTrue(any("#1 held: no Codex" in line and "an older head" in line for line in lines), lines)
+
     def test_a_merged_batch_closes_the_issues_its_prs_close(self):
         # pr_node names #55 in closingIssuesReferences; GitHub does not close it for a ref update.
         h1 = self.pr_branch(1, "c.txt", "c\n")
@@ -957,6 +1025,8 @@ class StepTests(unittest.TestCase):
     def test_the_train_creates_the_carve_out_labels(self):
         self.assertIn(train.NEEDS_ALEX_LABEL, train.LABELS)
         self.assertIn(train.ALEX_APPROVED_LABEL, train.LABELS)
+        self.assertIn(train.REVIEWED_LABEL, train.LABELS)
+        self.assertNotIn("codex-unavailable", train.LABELS, "retired: the train no longer reads it")
 
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
@@ -1109,7 +1179,7 @@ class StepTests(unittest.TestCase):
                  (dict(base, labels=["train", "needs-alex"]), "needs-alex"),
                  (dict(base, codex={"reviewing": True}), "no-review"),
                  (dict(base, codex={}), "no-review"),
-                 (dict(base, codex={}, labels=["train", "codex-unavailable"]), "no-review"),
+                 (dict(base, codex={}, reviewedHead="0" * 40), "no-review"),
                  (dict(base, unansweredFindings=1), "unanswered-findings"),
                  (dict(base, ci={"failing": ["Android"]}), "ci-red")]
         for pr, hold in cases:

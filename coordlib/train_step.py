@@ -241,8 +241,8 @@ class Step:
 
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
         """The newest train-add marker on the PR (when it joined, at which head, by whom).
-        Also sets on `pr` the heads its newest review-substitute and alex-approve comments
-        name, who added it (`trainAddedBy`), the (head, hold class) of every `held`
+        Also sets on `pr` the heads its newest clean-review (review-clean, or the older
+        review-substitute) and alex-approve comments name, who added it (`trainAddedBy`), the (head, hold class) of every `held`
         notice the train has posted on it (`heldNotices`), and `overtakenBy`: the light
         batch that went ahead of it since it joined, if any."""
         number = pr["number"]
@@ -614,7 +614,7 @@ class Step:
             elif train.TRAIN_LABEL not in pr["labels"]:
                 problem = "was taken out of the train"
             else:
-                self.train_added(pr)  # refresh the substitute-review head for the final check
+                self.train_added(pr)  # refresh the recorded-review and approval heads for the final check
                 verdict, hold, reason = train.assess(pr, all_files=self.all_files(pr))
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"

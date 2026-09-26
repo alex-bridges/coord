@@ -727,12 +727,15 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
     return out
 
 
-HEAD_RECORDS = {"review-substitute": "substituteReviewHead", "alex-approve": "alexApprovedHead"}
+# Records that name one head, and the PR field each sets. `review-clean` is what
+# `coord train review` writes; `review-substitute` is what `train substitute-review`
+# wrote before 2026-09-26, and still counts for the head it names.
+HEAD_RECORDS = {"review-clean": "reviewedHead", "review-substitute": "reviewedHead", "alex-approve": "alexApprovedHead"}
 
 
-def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
-    """Set each PR's `substituteReviewHead` and `alexApprovedHead`: the head its newest
-    review-substitute / alex-approve comment names."""
+def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
+    """Set each PR's `reviewedHead` and `alexApprovedHead`: the head its newest
+    review-clean or review-substitute / alex-approve comment names."""
     latest: Dict[Tuple[int, str], str] = {}
     for comment in comments:  # oldest first
         payload = comment["payload"]
@@ -740,7 +743,7 @@ def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str
         if field and isinstance(payload.get("pr"), int):
             latest[(payload["pr"], field)] = payload.get("head")
     for pr in prs:
-        for field in HEAD_RECORDS.values():
+        for field in set(HEAD_RECORDS.values()):
             pr[field] = latest.get((pr["number"], field))
 
 
@@ -779,7 +782,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p["issue"] for p in claim_payloads if isinstance(p.get("issue"), int)],
         [p.get("branch") or "" for p in claim_payloads],
     )
-    attach_substitute_reviews(prs, comments)
+    attach_head_records(prs, comments)
     outage_windows = outage.windows(comments)
     claims = resolve_claims(comments, targets, prs, now, outage_windows)
     # A `send` message, or any other record addressed to someone (the train's held notice).

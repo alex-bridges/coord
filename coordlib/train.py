@@ -13,9 +13,9 @@ cover every branch of the state machine without GitHub.
 
 Merge rule (memory: feedback-pr-train-protocol), re-checked when a batch is built
 AND again just before main moves — the `train` label is intent, not approval:
-- Codex 👍 on the current head (review.codex_state), or, during a Codex quota
-  outage (Alex's rule), the `codex-unavailable` label PLUS a `review-substitute`
-  comment naming the current head (`coord train substitute-review`);
+- the current head is reviewed: Codex 👍 on it (review.codex_state), or a clean review
+  of it by any agent (Alex, 2026-09-26), recorded by `coord train review` in a comment
+  naming that head;
 - no unanswered Codex findings;
 - CI at the head not red (pending is fine: the batch runs the gates anyway). A check
   GitHub never started (review.NOT_RUN_PREFIX, e.g. refused by the Actions budget) is
@@ -43,7 +43,7 @@ TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
 NEEDS_ALEX_LABEL = "needs-alex"
 ALEX_APPROVED_LABEL = "alex-approved"
-CODEX_UNAVAILABLE_LABEL = "codex-unavailable"
+REVIEWED_LABEL = "reviewed"
 BATCH_PREFIX = "train/"
 BATCH_CAP = 3
 CI_WORKFLOW = "ci.yml"
@@ -71,7 +71,7 @@ READY, HOLD, DROP = "ready", "hold", "drop"
 HOLD_DRAFT = "draft"
 HOLD_PARTIAL_DATA = "partial-data"
 HOLD_NEEDS_ALEX = "needs-alex"
-HOLD_NO_REVIEW = "no-review"  # no Codex 👍 at the head, Codex re-reviewing, no substitute review of the head
+HOLD_NO_REVIEW = "no-review"  # Codex re-reviewing, or neither a Codex 👍 nor a recorded clean review at the head
 HOLD_UNANSWERED_FINDINGS = "unanswered-findings"
 HOLD_CI_RED = "ci-red"
 HOLD_HEAD_MOVED = "head-moved"  # the step's own checks, not eligibility: the head moved under a batch
@@ -92,8 +92,8 @@ HOLD_ACTIONS = {
                         "Alex decides: merge it by hand, or take it out of the train."),
     HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} --note \"…\"`, or tell an "
                       "agent to), or take it out of the train. A new push needs a new approval."),
-    HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head. If Codex is out of quota, a substitute review of this "
-                     "head, recorded with `Tools/coord/coord train substitute-review {pr} --note \"…\"`, stands in."),
+    HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head, or a clean review of this head by any agent, recorded "
+                     "with `Tools/coord/coord train review {pr} --by <agent> --note \"…\"`."),
     HOLD_UNANSWERED_FINDINGS: ("Answer every finding on the PR. If answering means a push, add the new head "
                                "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
     HOLD_CI_RED: ("Fix the failing checks, or re-run them if they flaked. A fix is a new push: add the new head "
@@ -108,7 +108,7 @@ HOLD_ACTIONS = {
 LABELS = {
     TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
     SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
-    CODEX_UNAVAILABLE_LABEL: ("d93f0b", "coord: Codex out of quota; a substitute review is recorded per head"),
+    REVIEWED_LABEL: ("c2e0c6", "coord: informational; a clean review is recorded (coord train review records which head)"),
     NEEDS_ALEX_LABEL: ("b60205", "coord: a carve-out; the train holds it until Alex approves its head"),
     ALEX_APPROVED_LABEL: ("0e8a16", "coord: Alex approved a head (coord train approve records which)"),
 }
@@ -164,14 +164,17 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     if codex.get("reviewing"):
         return HOLD, HOLD_NO_REVIEW, "Codex is re-reviewing it"
     if not codex.get("approved"):
-        if CODEX_UNAVAILABLE_LABEL not in labels:
-            return HOLD, HOLD_NO_REVIEW, "no Codex 👍 on its current head"
-        # The label persists across pushes; the substitute review covers one head only,
-        # the one its `review-substitute` comment names (Codex P1 on #989).
-        reviewed = pr.get("substituteReviewHead")
+        # A clean review by any agent counts too (Alex, 2026-09-26), for the one head its
+        # record names. No label is needed: labels persist across pushes, the record does
+        # not (Codex P1 on #989).
+        reviewed = pr.get("reviewedHead")
+        head = str(pr.get("head"))[:9]
+        if not reviewed:
+            return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head} and no clean review of it recorded "
+                                          f"(`coord train review {pr.get('number')} --by <agent>`)")
         if reviewed != pr.get("head"):
-            return HOLD, HOLD_NO_REVIEW, ("codex-unavailable is set, but no substitute review names the current head "
-                                          f"{str(pr.get('head'))[:9]} (`coord train substitute-review {pr.get('number')}`)")
+            return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head}, and the recorded clean review "
+                                          f"covers {str(reviewed)[:9]}, an older head; a new push needs a new review")
     if pr.get("unansweredFindings"):
         count = pr["unansweredFindings"]
         return HOLD, HOLD_UNANSWERED_FINDINGS, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")

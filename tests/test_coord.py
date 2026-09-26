@@ -635,14 +635,65 @@ class CodexRoundThreeTests(unittest.TestCase):
         from coordlib import cache
         self.assertNotEqual(cache._cursor_path("o/r", "codex@h:foo+bar"), cache._cursor_path("o/r", "codex@h:foo_bar"))
 
-    def test_substitute_review_heads_come_from_the_newest_comment(self):
+    def test_reviewed_heads_come_from_the_newest_comment(self):
         prs = [{"number": 7}, {"number": 8}]
         comments = [
             coord_comment(1, 7, 30, {"kind": "review-substitute", "pr": 7, "head": "old"}),
             coord_comment(2, 7, 10, {"kind": "review-substitute", "pr": 7, "head": "new"}),
         ]
-        snapshot.attach_substitute_reviews(prs, comments)
-        self.assertEqual([p["substituteReviewHead"] for p in prs], ["new", None])
+        snapshot.attach_head_records(prs, comments)
+        self.assertEqual([p["reviewedHead"] for p in prs], ["new", None])
+
+    def run_review(self, argv):
+        """Run a `train review`-style command against a fake PR whose head is `abc…`;
+        return the calls made and the posted record's payload and text."""
+        calls = []
+
+        class Fake:
+            repo, owner, name = "o/r", "o", "r"
+
+            def rest(self, path, method="GET", body=None):
+                calls.append((method, path, body))
+                return {"head": {"sha": "abc" + "0" * 37}} if method == "GET" else {"html_url": "h"}
+
+        args = cli.parser().parse_args(argv)
+        with open(os.devnull, "w") as quiet:
+            saved, sys.stdout = sys.stdout, quiet
+            try:
+                self.assertEqual(args.func(args, Fake()), 0)
+            finally:
+                sys.stdout = saved
+        [body] = [body["body"] for method, path, body in calls if path == "repos/{repo}/issues/101/comments"]
+        return calls, marker.decode(body), marker.strip(body)
+
+    def test_train_review_records_the_head_and_the_reviewing_agent(self):
+        calls, payload, text = self.run_review(["train", "review", "101", "--by", "agy@h:gemini", "--note", "all clear"])
+        self.assertEqual((payload["kind"], payload["pr"], payload["head"], payload["by"]),
+                         ("review-clean", 101, "abc" + "0" * 37, "agy@h:gemini"))
+        self.assertIn("by `agy@h:gemini`", text)
+        self.assertIn("all clear", text)
+        self.assertNotIn("quota", text)
+        comment = calls.index(("POST", "repos/{repo}/issues/101/comments",
+                               {"body": marker.compose(text, payload)}))
+        label = calls.index(("POST", "repos/{repo}/issues/101/labels", {"labels": ["reviewed"]}))
+        self.assertLess(comment, label, "the record the train reads comes before the label")
+        self.assertFalse(any("codex-unavailable" in json.dumps(body) for _, _, body in calls), "a retired label")
+
+    def test_substitute_review_is_the_same_command_by_its_old_name(self):
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--note", "reviewed by X"])
+        self.assertEqual((payload["kind"], payload["head"]), ("review-clean", "abc" + "0" * 37))
+        self.assertNotIn("by", payload, "no --by, so no reviewer is named in the record")
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--by", "codex", "--note", "n"])
+        self.assertEqual(payload["by"], "codex")
+
+    def test_train_review_needs_the_reviewing_agent(self):
+        with open(os.devnull, "w") as quiet:
+            saved, sys.stderr = sys.stderr, quiet
+            try:
+                with self.assertRaises(SystemExit):
+                    cli.parser().parse_args(["train", "review", "101", "--note", "n"])
+            finally:
+                sys.stderr = saved
 
     def test_release_refuses_when_you_hold_no_claim(self):
         posted = []

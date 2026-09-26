@@ -351,6 +351,7 @@ class HardFloorTests(BudgetTestCase):
         gh = self.silent_http()
         for argv in (["claim", "5", "--branch", "feature/x"], ["release", "5"], ["train", "add", "7"],
                      ["train", "remove", "7"], ["train", "substitute-review", "7", "--note", "n"],
+                     ["train", "review", "7", "--by", "x", "--note", "n"],
                      ["train", "approve", "7", "--note", "n"], ["ci", "mk4", "--ref", "feature/x"]):
             code, out, err = self.run_cli(argv, gh)
             self.assertEqual(code, EXIT_BUDGET, argv)

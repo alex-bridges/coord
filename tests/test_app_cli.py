@@ -119,7 +119,8 @@ class RoutingTests(AppCliTestCase):
     def test_attestations_stay_on_alex(self):
         self.keychain("key")
         for argv, label in ((["train", "approve", "101", "--note", "Alex said so"], "alex-approved"),
-                            (["train", "substitute-review", "101", "--note", "reviewed by X"], "codex-unavailable")):
+                            (["train", "review", "101", "--by", "agy@h:gemini", "--note", "n"], "reviewed"),
+                            (["train", "substitute-review", "101", "--note", "reviewed by X"], "reviewed")):
             with self.subTest(argv=argv[:2]):
                 self.runner.calls.clear()
                 code, out, err = self.main(argv)
@@ -139,8 +140,8 @@ class RoutingTests(AppCliTestCase):
 
         argvs = [["board"], ["whoami"], ["claim", "5", "--branch", "b"], ["release", "5"], ["send", "x"],
                  ["inbox"], ["ci", "mk4"], ["train", "add", "7"], ["train", "remove", "7"], ["train", "status"],
-                 ["train", "approve", "7", "--note", "n"], ["train", "substitute-review", "7", "--note", "n"],
-                 ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
+                 ["train", "approve", "7", "--note", "n"], ["train", "review", "7", "--by", "x", "--note", "n"],
+                 ["train", "substitute-review", "7", "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
                  ["conductor", "tick"], ["conductor", "status"], ["conductor", "pause", "--for", "1h"],
                  ["conductor", "resume"], ["conductor", "escalate", "x"],
                  ["token", "status"], ["token", "exec", "--", "true"]]
@@ -154,7 +155,9 @@ class RoutingTests(AppCliTestCase):
             self.assertIsNotNone(gh.app)
             cli.run(args, gh)
         self.assertEqual({name for name, on_app in seen.items() if not on_app}, set(cli.USER_IDENTITY))
-        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train substitute-review", "train step", "conductor tick"})
+        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train review", "train substitute-review", "train step",
+                                             "conductor tick"})
+        self.assertLessEqual({"train review", "train substitute-review"}, cli.ATTESTATIONS)
 
     def test_conductor_status_reads_on_the_app(self):
         self.keychain("key")
@@ -211,7 +214,8 @@ class RoutingTests(AppCliTestCase):
         code, out, _ = self.main(["whoami"])
         self.assertEqual(code, EXIT_OK)
         self.assertIn("githubIdentity: inisa-sidechain[bot] (installation not yet known)", out)
-        self.assertIn("Alex for `conductor tick`, `train approve`, `train step`, `train substitute-review`", out)
+        self.assertIn("Alex for `conductor tick`, `train approve`, `train review`, `train step`, "
+                      "`train substitute-review`", out)
         self.assertIn("apiBudget: API (app): no current reading", out)
         self.assertEqual(self.server.requests, [])
         self.assertEqual(self.security_calls(), [])
@@ -860,7 +864,8 @@ class NoLeakTests(AppCliTestCase):
             ["release", "55", "--everyone"], ["release", "57"], ["send", "hello"], ["send", "hi", "--on", "101"],
             ["inbox"], ["inbox", "--json", "--all"], ["ci", "mk4", "--ref", "feature/x"],
             ["train", "add", "101"], ["train", "remove", "101"], ["train", "status"], ["train", "status", "--json"],
-            ["train", "approve", "101", "--note", "n"], ["train", "substitute-review", "101", "--note", "n"],
+            ["train", "approve", "101", "--note", "n"], ["train", "review", "101", "--by", "x", "--note", "n"],
+            ["train", "substitute-review", "101", "--note", "n"],
             ["train", "step", "--repo-dir", self.no_repo],
             ["outage", "start", "claude", "--note", "limit"], ["outage", "end", "claude"],
             ["conductor", "tick", "--dry-run", "--no-wake"], ["conductor", "status"],
