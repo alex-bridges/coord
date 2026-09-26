@@ -72,7 +72,8 @@ MAX_ATTEMPTS = 3
 CODEX_OUT = "reached your Codex usage limits"
 CODEX_LOGINS = ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector")
 CODEX_HARNESS = "codex-review"
-KEEP = dt.timedelta(days=14)  # how long request records and reviewed heads are remembered
+KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
+FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
 # Directories never copied into the reviewer's view of the PR: Claude Code loads agents,
 # skills and commands from an --add-dir tree, and a PR could add one (review of #1049).
 STRIP = (".claude",)
@@ -285,18 +286,22 @@ def isolated_env(base: Dict[str, str], empty_dir: str) -> Dict[str, str]:
     shells out; an unauthenticated gh and git can."""
     env = {k: v for k, v in base.items()
            if k not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
-                        "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS", "GH_HOST")}
+                        "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS", "GH_HOST",
+                        # it would load CLAUDE.md and .claude/rules from the PR's added tree
+                        "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD")}
     env.update({"GH_CONFIG_DIR": empty_dir, "GH_PROMPT_DISABLED": "1", "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/false",
                 "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"})
     return env
 
 
-def pushed_at(check_suites: List[Dict[str, Any]]) -> Optional[dt.datetime]:
-    """When the head reached GitHub: its first check suite's creation (a push starts them).
-    The committer date is the author's to set and says nothing about the push (review of
-    #1049). None when there are none: then a pass does not count for the train."""
-    times = [t for t in (_time(s.get("created_at")) for s in check_suites) if t is not None]
+def pushed_at(check_suites: List[Dict[str, Any]], branch: str) -> Optional[dt.datetime]:
+    """When the head reached this PR's branch: the first check suite GitHub created for the
+    sha ON THAT BRANCH (a push starts them). Not the committer date, which the author sets,
+    and not a suite from another branch the same commit was pushed to earlier (reviews of
+    #1049). None when there is none: then a pass does not count for the train."""
+    times = [t for t in (_time(s.get("created_at")) for s in check_suites if s.get("head_branch") == branch)
+             if t is not None]
     return min(times) if times else None
 
 
@@ -319,6 +324,9 @@ class Reviews:
         read that starts at the conductor's inbox cursor, which a wake moves on; a request
         that only lived in that read would vanish (review of #1049)."""
         for request in requests(issue_comments):
+            created = _time(request.get("at"))
+            if created is None or self.w.now - created > FRESH:
+                continue  # an old request re-listed because someone edited it is not a new one
             self.state.setdefault(str(request["id"]), dict(request, status="pending", attempts=0,
                                                            seen=snapshot.iso(self.w.now)))
 
@@ -331,8 +339,9 @@ class Reviews:
     def prune(self) -> None:
         now = self.w.now
         for key in [k for k, v in self.state.items()
-                    if not isinstance(v, dict) or now - (_time(v.get("seen") or v.get("at")) or now) > KEEP]:
-            self.state.pop(key)
+                    if not isinstance(v, dict) or (v.get("status") != "pending"
+                                                   and now - (_time(v.get("at") or v.get("seen")) or now) > KEEP)]:
+            self.state.pop(key)  # a pending request is kept until it is handled, however long that takes
         for key in [k for k, v in self.done_heads.items()
                     if not isinstance(v, dict) or now - (_time(v.get("at")) or now) > KEEP]:
             self.done_heads.pop(key)
@@ -400,11 +409,29 @@ class Reviews:
                                 f"{self.done_heads[key].get('url')}. Push a new head or name another model. ({request['url']})")
             record.update(status="skipped", at=snapshot.iso(now))
             return
+        posting = record.get("posting")
+        if posting and posting.get("head") != head:
+            record.pop("posting")  # the head moved: that review is stale
+            posting = None
+        if not posting:
+            posting = self.review(request, record, pr, head, windows)
+            if posting is None:
+                return
+            # Kept before any post: if a post fails, the next tick posts this again instead of
+            # running a 45-minute review a second time (review of 58ac99de).
+            record["posting"] = posting
+        self.publish(request, record, posting, key)
+
+    def review(self, request: Dict[str, Any], record: Dict[str, Any], pr: Dict[str, Any], head: str,
+               windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Run the reviewer on `head`; the rendered review to post, or None (retry or given up)."""
+        now = self.w.now
         worktree = os.path.join(self.config.state_dir, "reviews", f"pr-{request['pr']}-{head[:10]}")
         scratch = worktree + "-scratch"
         if not self.checkout(request["pr"], head, worktree, scratch):
+            shutil.rmtree(scratch, ignore_errors=True)
             self.fail(request, record, "could not check out the PR's head on the CI box")
-            return
+            return None
         try:
             self.runs.append(snapshot.iso(now))
             completed, seconds = self.run(pr, head, request, worktree, scratch)
@@ -421,34 +448,47 @@ class Reviews:
         if result["limit"]:
             self.runs.pop()  # a refused run is not a review; the job stays for after the reset
             self.w.post_outage(result["limit"])
-            return
+            return None
         data = extract_json(text) if result["ok"] else None
         if data is None:
             self.fail(request, record, "the reviewer did not finish with its findings"
                       if result["ok"] else f"the review run failed ({_clip(result['summary'], 160)})")
-            return
+            return None
         found = normalize(data)
         outcome = verdict(found["findings"])
         suites = self.app.rest(f"repos/{{repo}}/commits/{head}/check-suites?per_page=100") or {}
-        head_time = pushed_at(suites.get("check_suites") or [])
+        head_time = pushed_at(suites.get("check_suites") or [], (pr.get("head") or {}).get("ref") or "")
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         counts = outcome == "pass" and codex_out(comments, head_time, windows, now)
         body, payload = render(request["pr"], head, request["model"], found, outcome, request, counts, run)
-        posted = self.reply(request, body, payload)
-        link = (posted or {}).get("html_url") or ""
-        if counts:
+        return {"head": head, "body": body, "payload": payload, "counts": counts, "verdict": outcome}
+
+    def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
+        """Post a finished review, and for a pass that counts, the train's record and label.
+        Each step is remembered, so a retry after a failed post repeats none that succeeded."""
+        now = self.w.now
+        head = posting["head"]
+        if not posting.get("url"):
+            posted = self.reply(request, posting["body"], posting["payload"])
+            posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"))
+        link = posting["url"]
+        if posting["counts"] and not posting.get("recorded"):
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={
                 "body": marker.compose(
                     f"**Substitute review** of head `{head[:9]}` (Codex out of quota): {link}\n\n"
                     "This stands in for Codex's 👍 on this head only; a new push needs a new review.",
                     {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
-                     "review": (posted or {}).get("id")})})
+                     "review": posting.get("id")})})
+            posting["recorded"] = True
+        if posting["counts"] and not posting.get("labelled"):
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
                           body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
+            posting["labelled"] = True
         self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
-        record.update(status="done", at=snapshot.iso(now), url=link, verdict=outcome)
-        self.w.say(f"reviewed #{request['pr']} at {head[:9]} with {request['model']}: {outcome}"
-                   + (" (counts for the train)" if counts else "") + f" {link}")
+        record.pop("posting", None)
+        record.update(status="done", at=snapshot.iso(now), url=link, verdict=posting["verdict"])
+        self.w.say(f"reviewed #{request['pr']} at {head[:9]} with {request['model']}: {posting['verdict']}"
+                   + (" (counts for the train)" if posting["counts"] else "") + f" {link}")
 
     def agent(self) -> str:
         return f"reviewer@{self.config.host}:review"
@@ -470,7 +510,7 @@ class Reviews:
             return False
         if self.w.git(["worktree", "add", "-q", "--detach", worktree, head])[0] != 0:
             return False
-        strip_agent_config(worktree)
+        strip_agent_config(worktree, os.path.join(self.config.state_dir, "reviews"))
         return True
 
     def run(self, pr: Dict[str, Any], head: str, request: Dict[str, Any], worktree: str,
@@ -499,14 +539,27 @@ class Reviews:
         return completed, int((snapshot.now_utc() - started).total_seconds())
 
 
-def strip_agent_config(tree: str) -> None:
-    """Remove every `.claude` directory from the PR's throwaway tree before the run: Claude
-    Code loads agents, skills and commands from an added directory, so a PR must not bring
-    its own. The diff still shows them (it is read from git, not the working tree)."""
-    for root, dirs, _ in os.walk(tree):
-        for name in list(dirs):
+def strip_agent_config(tree: str, reviews_root: str) -> None:
+    """Remove every `.claude` entry from the PR's throwaway tree before the run: Claude Code
+    loads agents, skills and commands from an added directory, so a PR must not bring its
+    own. A symlink named `.claude` is unlinked, not followed (rmtree refuses symlinks, and a
+    PR can commit one pointing at a directory of skills). The diff still shows them (it is
+    read from git, not the working tree).
+
+    It refuses any tree outside `reviews_root`: pointed at a real checkout it would delete
+    that checkout's tracked `.claude` files (it did, once, in a review of #1049)."""
+    root_real = os.path.realpath(reviews_root) + os.sep
+    if not os.path.realpath(tree).startswith(root_real):
+        raise ValueError(f"strip_agent_config: {tree} is not under {reviews_root}")
+    for root, dirs, files in os.walk(tree):
+        for name in list(dirs) + [f for f in files if f in STRIP]:
+            path = os.path.join(root, name)
             if name in STRIP:
-                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
-                dirs.remove(name)
+                if os.path.islink(path) or os.path.isfile(path):
+                    os.unlink(path)
+                else:
+                    shutil.rmtree(path, ignore_errors=True)
+                if name in dirs:
+                    dirs.remove(name)
             elif name in (".git", ".build", "node_modules", "DerivedData"):
                 dirs.remove(name)
