@@ -223,6 +223,40 @@ class FileFormatTests(PrincipalTestCase):
                 self.assertIsNone(self.estimate())
 
 
+class LockTests(PrincipalTestCase):
+    """record() reads, merges and writes budget.json inside cache.budget_lock, so two agents
+    recording at once cannot lose each other's window maximum (review of #1046, X14). A
+    spy, not a race: deterministic."""
+
+    def test_the_read_modify_write_happens_inside_the_lock(self):
+        import contextlib
+        events = []
+        real_load, real_store = cache.load_principal, cache.store_principal
+
+        @contextlib.contextmanager
+        def spy_lock(repo, timeout_seconds=5.0):
+            events.append("lock")
+            yield
+            events.append("unlock")
+
+        self.patch(cache, "budget_lock", spy_lock)
+        self.patch(cache, "load_principal", lambda *a: events.append("load") or real_load(*a))
+        self.patch(cache, "store_principal", lambda *a: events.append("store") or real_store(*a))
+        for principal in (APP, budget.USER):
+            with self.subTest(principal=principal):
+                events.clear()
+                self.feed(int(time.time()) + 1800, 10, principal=principal)
+                self.assertEqual(events, ["lock", "load", "store", "unlock"])
+
+    def test_the_lock_is_a_real_flock_on_a_file_in_the_cache(self):
+        import fcntl
+        with cache.budget_lock(REPO):
+            fd = os.open(os.path.join(cache.cache_dir(REPO), "budget.lock"), os.O_RDWR)
+            self.addCleanup(os.close, fd)
+            with self.assertRaises(OSError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
 class LegacyWriterTests(PrincipalTestCase):
     """The coord from before #1035 (tests/legacy_coordlib, a frozen copy) and this one on
     ONE cache directory, turn about: the file stays small and both read what they wrote."""
