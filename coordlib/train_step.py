@@ -446,6 +446,7 @@ class Step:
                                 f"the queue. Merge it the usual way.")
                     self.comment(number, text, event, batch=name, run=(run or {}).get("id"), tip=tip)
                 if self.mode == "live":
+                    self.close_issues(number, prs.get(number), name)
                     branch = (prs.get(number) or {}).get("branch") \
                         or ((self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}).get("head") or {}).get("ref")
                     if branch and not self.cancel_branch_runs(branch):
@@ -456,6 +457,32 @@ class Step:
             self.note(f"{name}: clean-up incomplete ({'; '.join(failures)}); the next step finishes it")
             return
         self.delete_branch(name)
+
+    def close_issues(self, number: int, pr: Optional[Dict[str, Any]], batch: str) -> None:
+        """Close the issues a merged PR says it closes (`Closes #N`), once each.
+
+        GitHub does not do it for a PR the train merged: main moves by a ref update, not a
+        PR merge, and auto-close fires only on the merge. Measured 2026-09-26: 13 of the 15
+        issues named by train-merged PRs were still open, while #1036, merged by hand, closed
+        #929. That also left their coord claims standing on the board. An issue already
+        closed (by hand, or by an earlier step that was interrupted) is left alone, so a
+        repeated step closes nothing twice. `pr` is the open PR as this step read it; when
+        a later step finishes the batch the PR is already merged, so its body is read."""
+        issues = (pr or {}).get("closes")
+        if issues is None:
+            pull = self.gh.rest(f"repos/{{repo}}/pulls/{number}") or {}
+            issues = [int(n) for n in snapshot._CLOSES.findall(pull.get("body") or "")]
+        for issue in dict.fromkeys(issues):
+            if (self.gh.rest(f"repos/{{repo}}/issues/{issue}") or {}).get("state") != "open":
+                continue
+            payload = {"kind": "train", "v": 1, "agent": self.agent, "event": "closed-issue", "pr": number,
+                       "issue": issue, "batch": batch, "mode": self.mode}
+            self.gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(
+                f"**Closed by the merge train:** #{number}, which closes this issue, merged in batch `{batch}`.",
+                payload)})
+            self.gh.rest(f"repos/{{repo}}/issues/{issue}", method="PATCH",
+                         body={"state": "closed", "state_reason": "completed"})
+            self.note(f"#{number}: closed #{issue}")
 
     def advance(self, name: str, tip: str, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
         base, members = train.parse_batch(
