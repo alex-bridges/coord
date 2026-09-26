@@ -760,7 +760,16 @@ class GuardHookTests(unittest.TestCase):
                         "/usr/bin/python3 -c 'import coordlib.apptoken'",
                         "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF",
                         "python3 -c 'import sys; from coordlib import apptoken'",
-                        "true && python3 -c 'from coordlib.apptoken import AppTokens'"):
+                        "true && python3 -c 'from coordlib.apptoken import AppTokens'",
+                        # Round five of the #1046 review: a script on stdin, from a pipe or a heredoc,
+                        # and quotes that do not pair.
+                        "echo 'from coordlib import apptoken' | python3 -",
+                        "printf 'import coordlib.apptoken\\n' | python3 -",
+                        "cat <<EOF | python3 -\nfrom coordlib import apptoken\nEOF",
+                        "echo 'import coordlib.apptoken' | python3", "python3 <<EOF\nimport coordlib.apptoken\nEOF",
+                        "echo 'import coordlib.apptoken' | /usr/bin/python3 -B -",
+                        "python3 -c 'print(\"it'\\''s\"); import coordlib.apptoken'",
+                        "python3 -c $'print(\\'x\\'); import coordlib.apptoken'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("python3 -m unittest discover -s Tools/coord/tests",
                         "python3 -m unittest test_apptoken", "grep -n AppTokens Tools/coord/coordlib/apptoken.py",
@@ -768,8 +777,16 @@ class GuardHookTests(unittest.TestCase):
                         # Round four of the #1046 review: both must be in ONE command segment.
                         "python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py",
                         "python3 -c 'print(1)' && grep -n AppTokens Tools/coord/coordlib/apptoken.py",
-                        "python3 -c 'print(1)' | grep -c apptoken"):
+                        "python3 -c 'print(1)' | grep -c apptoken",
+                        "grep -rn apptoken Tools/coord | grep python3", "echo apptoken; python3 -"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_a_very_long_command_is_refused_quickly(self):
+        # _QUOTED rescans to the end for each unclosed quote; a timeout would fail OPEN.
+        start = __import__("time").monotonic()
+        self.assertEqual(self.run_guard("Bash", {"command": 'echo "' + 'a\\"' * 8334}), 2)  # 25,003 characters
+        self.assertLess(__import__("time").monotonic() - start, 5, "refused before any slow check")
+        self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
         for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
