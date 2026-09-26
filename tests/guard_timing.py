@@ -64,6 +64,7 @@ def without_optional_groups(pattern: str) -> str:
 def keywords(pattern: str) -> list:
     """The literal words of a regex, in order and with repeats."""
     pattern = without_optional_groups(pattern)
+    pattern = re.sub(r"\\S\+", " x ", pattern)  # a word: `--repo(=|\s+)\S+` needs one
     pattern = re.sub(r"\[[^\]]*\][+*?]?", " ", pattern)  # character classes
     pattern = re.sub(r"\\.[+*?]?", " ", pattern)  # escapes, with their quantifier
     pattern = re.sub(r"\(\?(?:[a-zA-Z]+:|<?[=!]|:)", " ", pattern)  # group syntax: (?i: (?= (?<! (?:
@@ -87,23 +88,21 @@ def inputs(pattern: str) -> list:
 
 
 def rules(guard) -> dict:
-    """name -> (the rule's pattern text, a call that runs the rule alone over every view, whether
-    a witness must match). The helpers every verdict runs (views, script extraction, `cd`,
-    redirections, the continuation join) are timed too."""
+    """name -> (the rule's pattern text, a call that runs the rule alone on what the guard gives
+    it, whether a witness must match). Main's RULES and the write check read executable_text;
+    RAW_RULES and the apptoken check read the raw command. The helpers every verdict runs
+    (script extraction, `cd`) are timed too."""
     found = {}
-    for index, (rule, _) in enumerate(guard.RULES):
-        found[f"RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: any(rule.search(t) for t in guard._views(c)[1]),
-                                    True)
+    for index, (pattern, _) in enumerate(guard.RULES):
+        rule = re.compile(pattern)
+        found[f"RULES[{index}]"] = (pattern, lambda c, rule=rule: rule.search(guard.executable_text(c)), True)
     for index, (rule, _) in enumerate(guard.RAW_RULES):
-        found[f"RAW_RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: any(rule.search(v) for v in guard._views(c)[0]),
-                                        True)
+        found[f"RAW_RULES[{index}]"] = (rule.pattern, rule.search, True)
     found["apptoken"] = (guard._PYTHON.pattern + " apptoken test_apptoken", guard._python_apptoken, True)
-    found["writes"] = (guard._WRITES.pattern, lambda c: any(guard._WRITES.search(t) for t in guard._views(c)[1]), True)
+    found["writes"] = (guard._WRITES.pattern,
+                       lambda c: guard._WRITES.search(guard._HARMLESS_REDIRECT.sub(" ", guard.executable_text(c))), True)
     found["script"] = (guard._SCRIPT.pattern, lambda c: list(guard._SCRIPT.finditer(c)), False)
     found["cd"] = (guard._CD.pattern, guard._CD.match, False)
-    found["redirect"] = (guard._REDIRECT.pattern, guard._strip_redirections, False)
-    found["too many redirections"] = (guard._TOO_MANY_REDIRECTIONS.pattern, guard._TOO_MANY_REDIRECTIONS.search, False)
-    found["continuation"] = (guard._CONTINUATION.pattern, lambda c: guard._CONTINUATION.sub(r"\1", c), False)
     return found
 
 

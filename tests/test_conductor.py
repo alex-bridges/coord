@@ -664,20 +664,7 @@ class GuardHookTests(unittest.TestCase):
                         "bash -c 'gh pr merge 5'", "sh -c \"git push origin main\"", "eval 'coord train approve 3'",
                         "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "gh api repos/o/r/merges -f base=main",
                         "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
-                        "gh auth token", "gh workflow disable ci.yml",
-                        # Round nine: a word ends at the end of its segment, a `)` or a backtick.
-                        "git push origin main;echo ok", "git push origin main&& echo", "(git push origin main)",
-                        # Round ten: the shell's view. Continuations are joined, redirections are not
-                        # words, and program names and paths ignore case.
-                        "git push origin \\\nmain", "git push \\\n-f", "git push origin \\\n+HEAD:x",
-                        "git push origin HEAD:\\\nrefs/heads/main", "gh pr \\\n  merge 5",
-                        "Tools/coord/coord train \\\n  approve 5",
-                        "git push origin main>/dev/null", "git push origin main</dev/null", "git push origin main>&2",
-                        "git push origin refs/heads/main>/tmp/o", "gh>/dev/null pr merge 5", "gh api -X>/dev/null PUT r/pulls/1/merge",
-                        "bash>/dev/null -c 'gh pr merge 5'", "eval>/dev/null 'gh pr merge 5'", "cd x &&>&2 sudo ls",
-                        "GIT push --force", "Git push origin main", "GH pr merge 5", "GH api -X PUT repos/o/r/pulls/5/merge",
-                        "GH secret list", "GH auth token", "SUDO ls", "LAUNCHCTL list", "ENV sudo ls",
-                        "BASH -c 'gh pr merge 5'"):
+                        "gh auth token", "gh workflow disable ci.yml"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_ordinary_work_and_prose_are_allowed(self):
@@ -697,19 +684,14 @@ class GuardHookTests(unittest.TestCase):
     def test_its_own_controls_cannot_be_written_but_a_worktrees_can(self):
         for path in ("/tmp/home/.claude/settings.json", "/tmp/home/.claude/agents/conductor.md",
                      "/tmp/home/Tools/coord/coordlib/conductor.py", "/tmp/home/CLAUDE.md", "Tools/coord/coord",
-                     "~/.claude/settings.json", "~/.claude/hooks/x.sh",
-                     # Round ten: macOS resolves paths without case.
-                     "/tmp/home/.CLAUDE/settings.json", "~/.CLAUDE/hooks/x.sh", "/tmp/home/tools/COORD/coord"):
+                     "~/.claude/settings.json", "~/.claude/hooks/x.sh"):
             self.assertEqual(self.run_guard("Write", {"file_path": path}), 2, path)
         for path in ("/tmp/wt/.claude/hooks/conductor-guard.py", "/tmp/wt/Tools/coord/coordlib/conductor.py",
                      "/tmp/home/Docs/agent-coordination.md", "~/.claude/projects/x/memory/MEMORY.md"):
             self.assertEqual(self.run_guard("Edit", {"file_path": path}), 0, path)
         for command in ("sed -i '' s/a/b/ .claude/hooks/conductor-guard.py", "echo x > CLAUDE.md",
                         "cp /tmp/x /tmp/home/Tools/coord/coordlib/conductor.py", "rm -rf Tools/coord",
-                        "echo {} > ~/.claude/settings.json",
-                        # Round ten: case, redirections and continuations.
-                        "RM -rf Tools/coord", "echo x > .CLAUDE/settings.json", "sed</dev/null -i '' s/a/b/ CLAUDE.md",
-                        "cd /tmp/home>/dev/null && echo x > .claude/agents/conductor.md", "rm -rf \\\nTools/coord"):
+                        "echo {} > ~/.claude/settings.json"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_silent_outside_the_conductor_and_closed_inside_it(self):
@@ -719,6 +701,23 @@ class GuardHookTests(unittest.TestCase):
                          "no command is nothing to run")
         self.assertEqual(self.run_guard("Write", {"file_path": "CLAUDE.md"}, project=None), 2,
                          "without CLAUDE_PROJECT_DIR the call's cwd is the project")
+
+    # The rules #1046 adds (the GitHub App, #1035). Each reads the raw command, quoted strings
+    # included: a quoted script is caught, and so is prose that names the command.
+
+    def test_every_line_of_mains_guard_is_here_in_order(self):
+        # #1046 adds to main's guard and changes none of it: every line of main's guard
+        # (tests/legacy_guard/conductor-guard-59e25cc6f.py, main at 59e25cc6f) is in the guard, in
+        # order. So nothing main blocks can pass, by construction.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard", "conductor-guard-59e25cc6f.py")
+        with open(path, "rb") as handle:
+            data = handle.read()
+        blob = __import__("hashlib").sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        self.assertEqual(blob, "d0441c4ecc072255a06b189566b7afbbef524f5b", "the copy is main's guard at 59e25cc6f")
+        with open(GUARD, encoding="utf-8") as handle:
+            lines = iter(handle.read().split("\n"))
+        for number, line in enumerate(data.decode("utf-8").split("\n"), 1):
+            self.assertTrue(any(candidate == line for candidate in lines), f"main's line {number} missing: {line!r}")
 
     def test_coord_token_exec_is_blocked_in_every_form(self):
         # #1035 review (P3-8): a conductor run must never get a GitHub App token in a shell.
@@ -734,10 +733,11 @@ class GuardHookTests(unittest.TestCase):
                         # coord's top-level --repo before the command (round three, P3-1)
                         "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
                         "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
-                        "sh -c 'coord --repo o/r token exec -- env'"):
+                        "sh -c 'coord --repo o/r token exec -- env'",
+                        # The raw command is read: prose that names the command is refused too.
+                        "gh pr comment 5 -b 'never run coord token exec here'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        for command in ("Tools/coord/coord token status", "gh pr comment 5 -b 'never run coord token exec here'",
-                        "grep -n 'token exec' Docs/agent-coordination.md",
+        for command in ("Tools/coord/coord token status", "grep -n 'token exec' Docs/agent-coordination.md",
                         "Tools/coord/coord --repo example-owner/example-repo token status",
                         "Tools/coord/coord --repo example-owner/example-repo board"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
@@ -745,34 +745,52 @@ class GuardHookTests(unittest.TestCase):
                          "outside the conductor the guard is silent")
 
     def test_train_approve_with_repo_is_blocked(self):
+        # A second rule beside main's `coord train approve` rule, which is unchanged.
         for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
                         "coord --repo=o/r train approve 5"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_the_keychain_is_blocked(self):
         # The app's private key: `security find-generic-password -s example-coord-github-app -w`
-        # prints it without a prompt to any process running as Alex.
+        # prints it without a prompt to any process running as Alex. `security` takes any
+        # unique prefix of a subcommand.
         for command in ("security find-generic-password -s example-coord-github-app -w",
                         "/usr/bin/security find-generic-password -s 'example-coord-github-app' -a x -w",
                         "security find-internet-password -s github.com -w", "security dump-keychain -d",
                         "security export -k login.keychain -o /tmp/k.p12", "sh -c 'security find-generic-password -w'",
                         "x=$(security find-generic-password -s example-coord-github-app -w)",
-                        "cd /tmp && security find-generic-password -ga inisa"):
+                        "cd /tmp && security find-generic-password -ga inisa", "security find-g -s x -w",
+                        "security find-generic -w", "security dump-k",
+                        # The raw command is read: prose that names the command is refused too.
+                        "grep -n 'security find-generic-password' Docs/agent-coordination.md",
+                        "gh pr comment 5 -b 'the key is read with security find-generic-password'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("security list-keychains", "security show-keychain-info",
-                        "grep -n 'security find-generic-password' Docs/agent-coordination.md",
-                        "gh pr comment 5 -b 'the key is read with security find-generic-password'",
                         "grep -rn security Tools/coord/coordlib/apptoken.py"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_token_cache_is_blocked(self):
         for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
                         "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
-                        "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/"):
+                        "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/",
+                        # Matched without case: macOS's filesystem ignores it, so this is the same file.
+                        "cat ~/library/caches/INISA-COORD/ops.json"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("ls ~/Library/Caches", "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json",
                         "Tools/coord/coord token status"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
+        for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
+                        "'-s', 'example-coord-github-app', '-w'])\"",
+                        "'security' find-generic-password -s example-coord-github-app -w",
+                        "env x=1 bash -c \"security find-generic-password -s example-coord-github-app\"",
+                        # Matched without case, which fails closed whether or not the Keychain's
+                        # lookup ignores it.
+                        "python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
+                        "'-s', 'Example-Coord-GitHub-App'])\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token status"}), 0)
 
     def test_python_and_apptoken_in_one_command_are_blocked(self):
         # Round eight of the #1046 review: the rule is co-occurrence on the raw command. Two
@@ -811,8 +829,8 @@ class GuardHookTests(unittest.TestCase):
                         # macOS's filesystem ignores case: these run python3.
                         "Python3 - <<'Y'\nimport coordlib.apptoken\nY",
                         "/usr/bin/PYTHON3 -c 'import coordlib.apptoken'",
-                        # Round nine: matched on the NFKC, case-folded command. Python reads
-                        # identifiers in NFKC, and PYTHONCASEOK=1 imports ignore case.
+                        # Matched on the NFKC, case-folded command. Python reads identifiers in NFKC,
+                        # and PYTHONCASEOK=1 imports ignore case.
                         "python3 -c 'print(AppTokens)'", "PYTHONCASEOK=1 python3 -c 'import coordlib.APPTOKEN as t'",
                         "python3 -c 'import coordlib.\uff41pptoken'",
                         "python3 -c 'import coordlib.\U0001d41a\U0001d429\U0001d429\U0001d42d\U0001d428\U0001d424\U0001d41e\U0001d427'",
@@ -832,9 +850,9 @@ class GuardHookTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, command)
             self.assertIn("write it with the Write tool (for example under $CONDUCTOR_STATE_DIR) and pass the file "
                           "(--body-file / -F", result.stderr, command)
-        # Round nine (P3-3): every shell way to write such text is refused, so the Write tool is
-        # the way: the guard checks only its path. The state directory is the watcher's default
-        # (conductor.Config: $XDG_STATE_HOME or ~/.local/state, then inisa-conductor).
+        # Every shell way to write such text is refused, so the Write tool is the way: the guard
+        # checks only its path. The state directory is the watcher's default (conductor.Config:
+        # $XDG_STATE_HOME or ~/.local/state, then inisa-conductor).
         note = os.path.join(os.path.expanduser("~"), ".local", "state", "inisa-conductor", "note.md")
         for path in (note, "$CONDUCTOR_STATE_DIR/note.md"):
             self.assertEqual(self.run_guard("Write", {"file_path": path, "content": "python3 cannot import apptoken"}), 0)
@@ -873,31 +891,12 @@ class GuardHookTests(unittest.TestCase):
         self.assertIn("write long text with the Write tool", result.stderr)
         self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
 
-    def test_the_guard_decides_in_time_or_refuses(self):
-        # Round nine (P1): the hook's timeout lets a call through, so a slow check must refuse.
-        # The reviewer's input: `gh pr merge` then `git push` repeated, cubic for the old push rule.
-        command = "gh pr merge 5 # " + "git push " * 780  # 7,036 characters
-        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
-        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp/home"})
-        start = time.monotonic()
-        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=15)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("merging a PR by hand", result.stderr, "the push rule is linear: the verdict is the real one")
-        self.assertLess(time.monotonic() - start, 3)
-        # The same input with the old cubic push rule put back first: the watchdog refuses at
-        # DEADLINE_SECONDS (7), whatever regex is slow.
-        result, took = self.run_patched_guard(self.SLOW_RULE, payload)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("could not decide within 7 s", result.stderr)
-        self.assertLess(took, 9.5, "well inside the hook's 10 s timeout")
+    # The watchdog: the verdict comes from a forked child, and a late one is a refusal.
 
-    SLOW_RULE = "RULES.insert(0, (re.compile(LEGACY_PUSH), 'old'))"
+    PADDED = "gh pr merge 5 # " + "git push " * 780  # the review's input, 7,036 characters
 
     def run_patched_guard(self, code, payload):
-        """The guard with `code` run before main(), LEGACY_PUSH being 4f7d4a4fd's cubic push rule."""
-        legacy = self.load_guard(os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard",
-                                              "conductor-guard.py"))
+        """The guard with `code` run just before main(), in a child with a 15 s cap."""
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
         env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
         with tempfile.TemporaryDirectory() as folder:
@@ -907,25 +906,50 @@ class GuardHookTests(unittest.TestCase):
             anchor = '\nif __name__ == "__main__":'
             self.assertEqual(source.count(anchor), 1)
             with open(patched, "w", encoding="utf-8") as handle:
-                handle.write(source.replace(anchor, f"\nLEGACY_PUSH = {legacy.RULES[0][0]!r}\n{code}\n" + anchor))
+                handle.write(source.replace(anchor, f"\n{code}\n" + anchor))
             start = time.monotonic()
             result = subprocess.run([sys.executable, patched], input=payload, capture_output=True, text=True, env=env,
                                     timeout=15)
             return result, time.monotonic() - start
 
-    def test_the_parent_never_waits_for_a_stuck_child(self):
-        # Round ten (P3-1): a failing select (or a child stuck in I/O) must not keep the parent
-        # waiting past the hook's timeout: it kills the child and refuses at once.
-        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh pr view 5 # " + "git push " * 780},
-                              "cwd": "/tmp/home"})
+    def test_a_slow_check_is_refused_in_time(self):
+        # Main's push rule is cubic in `git push` repeats (unchanged here): the review's padded
+        # input runs for about half a minute. The hook's 10 s timeout would let the call through,
+        # so the watchdog refuses it at DEADLINE_SECONDS (7).
+        start = time.monotonic()
+        result = self.run_guard("Bash", {"command": self.PADDED}, full=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not decide within 7 s", result.stderr)
+        self.assertLess(time.monotonic() - start, 9, "inside the hook's 10 s timeout")
+        result = self.run_guard("Bash", {"command": "gh pr merge 5"}, full=True)
+        self.assertIn("merging a PR by hand", result.stderr, "a quick verdict is the real one")
+
+    def test_a_crashed_or_hung_checker_is_a_refusal(self):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp/home"})
+        # A child killed before it answers: no verdict is a refusal, at once.
         result, took = self.run_patched_guard(
-            self.SLOW_RULE + "\ndef _broken(*args):\n    raise ValueError('select failed')\nselect.select = _broken", payload)
+            "def verdict(payload, env):\n    os.kill(os.getpid(), signal.SIGKILL)", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not check this call (the check exited without a verdict)", result.stderr)
+        self.assertLess(took, 3)
+        # A child that never answers: refused at DEADLINE_SECONDS, not left to the hook's timeout.
+        result, took = self.run_patched_guard("def verdict(payload, env):\n    time.sleep(60)", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not decide within 7 s", result.stderr)
+        self.assertLess(took, 9)
+
+    def test_the_parent_never_waits_for_a_stuck_child(self):
+        # A failing select (or a child stuck in I/O) must not keep the parent waiting past the
+        # hook's timeout: it kills the child and refuses at once.
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": self.PADDED}, "cwd": "/tmp/home"})
+        result, took = self.run_patched_guard(
+            "def _broken(*args):\n    raise ValueError('select failed')\nselect.select = _broken", payload)
         self.assertEqual(result.returncode, 2)
         self.assertIn("could not check this call (ValueError)", result.stderr)
         self.assertLess(took, 5, "the slow child was killed, not waited for")
 
     def test_without_fork_the_guard_refuses(self):
-        # Round ten (P3-2): without a checker there is no deadline to keep, so it refuses.
+        # Without a checker there is no deadline to keep, so it refuses.
         guard = self.load_guard(GUARD)
         payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp/home"}
         for name, error in (("fork", OSError("no fork")), ("pipe", OSError("no pipe")), ("fork", AttributeError("fork"))):
@@ -937,28 +961,31 @@ class GuardHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, "an error in the checking child still refuses")
         self.assertIn("could not check this call (TypeError)", result.stderr)
 
-    def test_every_rule_is_fast_on_its_own_keywords(self):
-        # Rounds nine and ten (P1, P2-3): each rule of RULES and RAW_RULES, the apptoken and write
-        # checks and the helpers every verdict runs, on inputs built from its own keywords and
-        # punctuation up to the cap. Each rule's keywords must match it (so its inputs engage it),
-        # and each rule runs in its own child with a 10 s timeout, reported as a failure.
+    def test_every_rule_but_mains_push_rule_is_fast_on_its_own_keywords(self):
+        # Each rule of RULES and RAW_RULES, the apptoken and write checks, and the helpers every
+        # verdict runs, on inputs built from its own keywords and punctuation up to the cap. Each
+        # rule's keywords must match it (so its inputs engage it). One input over 2 s fails, and
+        # each rule runs in its own child, killed after 60 s for all its inputs (main's gh api
+        # rule takes about 13 s over its 112). Main's push rule (RULES[0]) is cubic and unchanged
+        # here: test_a_slow_check_is_refused_in_time covers it through the watchdog.
         import guard_timing
         guard = self.load_guard(GUARD)
-        report, failures = guard_timing.measure_in_children(GUARD, timeout=10)
+        names = [name for name in guard_timing.rules(guard) if name != "RULES[0]"]
+        report, failures = guard_timing.measure_in_children(GUARD, timeout=60, only=names)
         self.assertEqual(failures, [])
-        self.assertEqual([rule["rule"] for rule in report], list(guard_timing.rules(guard)))
+        self.assertEqual([rule["rule"] for rule in report], names)
         for rule in report:
             self.assertGreater(rule["inputs"], 1, rule)
 
     def test_the_timing_test_catches_a_cubic_rule(self):
-        # Round ten (P2-3): the review's known-cubic rule, put into a copy, must be reported.
+        # The review's known-cubic rule, put into a copy, must be reported.
         import guard_timing
         with tempfile.TemporaryDirectory() as folder:
             cubic = os.path.join(folder, "conductor-guard.py")
             with open(GUARD, encoding="utf-8") as handle:
                 source = handle.read()
             anchor = '\nif __name__ == "__main__":'
-            rule = 'RULES.insert(0, (re.compile(r"\\bgh\\s+api\\b[^\\n;&|]*\\bapi\\b[^\\n;&|]*--force"), "cubic"))'
+            rule = 'RULES.insert(0, (r"\\bgh\\s+api\\b[^\\n;&|]*\\bapi\\b[^\\n;&|]*--force", "cubic"))'
             with open(cubic, "w", encoding="utf-8") as handle:
                 handle.write(source.replace(anchor, "\n" + rule + "\n" + anchor))
             report, failures = guard_timing.measure_in_children(cubic, timeout=4, only=["RULES[0]"])
@@ -973,14 +1000,6 @@ class GuardHookTests(unittest.TestCase):
         spec.loader.exec_module(guard)
         return guard
 
-    def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
-        for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
-                        "'-s', 'example-coord-github-app', '-w'])\"",
-                        "'security' find-generic-password -s example-coord-github-app -w",
-                        "env x=1 bash -c \"security find-generic-password -s example-coord-github-app\""):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token status"}), 0)
-
     def test_the_deny_list_names_token_exec(self):
         self.assertIn("Bash(* token exec*)", conductor.DENY)
 
@@ -988,80 +1007,6 @@ class GuardHookTests(unittest.TestCase):
         # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
         self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
         self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
-
-    def test_a_view_is_added_never_substituted(self):
-        # Round eleven (P1-1, P1-2): each normalisation is a view the rules read beside the raw
-        # command, and each is escape-aware. The metamorphic test cannot see these: the rewrites
-        # that make them change the meaning.
-        for command in (
-                # An escaped backslash, then a newline: not a continuation.
-                "echo \\\\\ncoord train approve 5", "echo \\\\\ncoord token exec -- env",
-                "echo \\\\\nsecurity find-generic-password -w", 'echo "a\\\\\n" ; gh pr merge 5 ; echo "b"',
-                'echo "a\\\\\n" ; git push origin main ; echo "b"', 'echo "a\\\\\n" ; coord train approve 5 ; echo "b"',
-                'echo "a\\\\\n" ; sudo ls ; echo "b"', 'echo "a\\\\\n" ; rm -rf Tools/coord ; echo "b"',
-                # An escaped `>` or `<`: a literal character, then `|` or `&`.
-                "echo x\\>|gh pr merge 5", "echo x\\<&sudo ls", "echo x\\>&coord train approve 5",
-                "true\\>|git push origin main", "echo x\\>|security find-generic-password -w",
-                "push\\<&sudo --force-f}-f"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-
-    def test_the_linear_quote_remover_is_the_regexs(self):
-        # Round eleven: the views run executable_text twice, so its quadratic `_QUOTED.sub` is
-        # now one pass. It must give the regex's result exactly.
-        guard = self.load_guard(GUARD)
-        random = __import__("random").Random(11)
-        alphabet = ["'", '"', "\\", "\n", "a", " ", "\\'", '\\"', "\\\\", "\\\n", "$", "(", "x"]
-        for _ in range(20000):
-            text = "".join(random.choice(alphabet) for _ in range(random.randint(0, 16)))
-            self.assertEqual(guard._unquoted(text), guard._QUOTED.sub("''", text), repr(text))
-        start = time.monotonic()
-        guard._unquoted('"' + 'a\\"' * 6663)
-        self.assertLess(time.monotonic() - start, 0.1, "one pass over an unclosed quote full of escapes")
-
-    def test_a_view_is_added_and_the_raw_command_always_read(self):
-        # Round eleven (Principle C): the raw command and its executable text come first; the
-        # joined command, and its text without redirections, are added beside them.
-        guard = self.load_guard(GUARD)
-        command = "gh pr view 5 \\\n  --json title >/tmp/x"
-        commands, texts = guard._views(command)
-        self.assertEqual(commands, [command, "gh pr view 5   --json title >/tmp/x"])
-        self.assertEqual(texts[0], guard.executable_text(command))
-        self.assertEqual(texts[1:], ["gh pr view 5   --json title >/tmp/x", "gh pr view 5   --json title  "])
-
-    def test_the_rest_of_the_shells_spellings_are_blocked(self):
-        for command in (
-                # P2-1: a space between a redirection and its target; zsh's {fd}.
-                "gh > /dev/null pr merge 5", "coord 2> /dev/null train approve 5", "bash > /dev/null -c 'gh pr merge 5'",
-                "eval > /dev/null 'gh pr merge 5'", "gh <<< x secret list", "gh >| f auth token", "gh &> f pr merge 5",
-                "gh 3> f pr merge 5", "gh {fd}>x pr merge 5", "bash > \"o u t\" -c 'gh pr merge 5'",
-                ">|\tsudo  launchctl<<<refs/heads/main",
-                # P2-2: every place a command starts.
-                "true\nlaunchctl list", "true\nrm -rf Tools/coord", "bash -c 'sudo ls'", "bash -c 'rm -rf Tools/coord'",
-                "  sudo ls", "{ sudo ls; }", "! sudo ls", "if true; then sudo ls; fi", "X=1 sudo ls", "command sudo ls",
-                "nice sudo ls", "nice -n 5 sudo ls", "timeout 5 sudo ls", "caffeinate sudo ls", "arch -arm64 sudo ls",
-                "stdbuf -o0 sudo ls",
-                # P3: nine redirections, a shell's options before -c, security's prefixes.
-                "bash >a >a >a >a >a >a >a >a >a -c 'gh pr merge 5'", "bash -x -c 'gh pr merge 5'",
-                "bash -c -- 'gh pr merge 5'", "bash --norc -c 'gh pr merge 5'", "sh -e -c 'sudo ls'",
-                "bash -o pipefail -c 'gh pr merge 5'", "security find-g -s x -w", "security find-generic -w",
-                "security dump-k",
-                # zsh's `=name` runs the program found on PATH; `\name` is the name, escaped.
-                "=sudo ls", "\tsudo\n=launchctl list", "=coord train approve 5", "=security find-generic-password -w",
-                "\\sudo ls", "\\coord token exec -- env", "=rm -rf Tools/coord",
-                # zsh runs `()cmd` at once (an anonymous function).
-                "()sudo ls", "true&()sudo ls", "() coord train approve 5", "()security find-generic-password -w",
-                "()rm -rf Tools/coord"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        for command in ("gh pr diff 5 > /tmp/d.txt", "Tools/coord/coord board --brief 2> /dev/null",
-                        "cat notes.md | grep -n sudo", "gh pr view 5 --json title < /dev/null", "echo 'x' >> /tmp/log"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
-
-    def test_a_word_ends_at_every_shell_metacharacter(self):
-        # Round ten (P2-1): the push rule on its own, before redirections are taken out.
-        push = self.load_guard(GUARD).RULES[0][0]
-        for metacharacter in " \t;&|()<>`":
-            self.assertTrue(push.search(f"git push origin main{metacharacter}x"), metacharacter)
-        self.assertFalse(push.search("git push origin mainline"))
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)

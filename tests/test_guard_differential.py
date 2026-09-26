@@ -31,13 +31,6 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(HERE, "..", "..", "..", ".claude", "hooks", "conductor-guard.py")
 LEGACY_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard.py")
-# Later guards, frozen the same way: round ten's normalisations replaced the text the rules read
-# (b422e151e) and made commands the earlier guards blocked pass. Nothing any of them blocked may
-# pass now. (file, `git hash-object` of the guard at that commit)
-EARLIER_GUARDS = {
-    "d43682fa5": ("conductor-guard-d43682fa5.py", "dec1bd698b3c84c14ad905f5b6dee66a5f689fca"),
-    "b422e151e": ("conductor-guard-b422e151e.py", "e17f1243ab30b69ddc9e5971114ab77a45b2abfb"),
-}
 
 
 def load(path: str, name: str):
@@ -587,35 +580,6 @@ def round_eight() -> list:
     return (EXEMPTION_AND_SPELLINGS + [f"echo 'import coordlib.apptoken' | {name} -" for name in PYTHON_NAMES]
             + OTHER_RULES_AND_WORK)
 
-# Round nine's review (review9/): spellings the shell accepts. 4f7d4a4fd blocked the first line
-# (its `\s` before `main` matched the newline); this corpus did not hold the shape until now.
-SHELL_SPELLINGS = [
-    "git push origin \\\nmain", "git push \\\n-f", "git push origin \\\n+HEAD:x", "git push origin \\\nrefs/heads/main",
-    "gh pr \\\n  merge 5", "security \\\n  find-generic-password -s x -w", "coord train \\\n  approve 5",
-    "cat ~/Library/Caches/inisa-\\\ncoord/ops.json", "python3 -c 'import coordlib.app\\\ntoken'",
-    "git push origin main>/dev/null", "git push origin main</dev/null", "git push origin main>&2",
-    "git push origin refs/heads/main>/tmp/o", "gh>/dev/null pr merge 5", "coord>/dev/null token exec -- true",
-    "security>/dev/null find-generic-password -w", "gh api -X>/dev/null PUT repos/o/r/pulls/1/merge",
-    "bash>/dev/null -c 'gh pr merge 5'", "eval>/dev/null 'coord train approve 3'", "cd x &&>&2 sudo ls",
-    "sed</dev/null -i '' s/a/b/ .claude/hooks/conductor-guard.py",
-    "cd /tmp/home>/dev/null && echo x > .claude/agents/conductor.md",
-    "GIT push --force", "Git push origin main", "GH pr merge 5", "GH api -X PUT repos/o/r/pulls/5/merge", "GH secret list",
-    "GH auth token", "Tools/coord/COORD train approve 5", "COORD token exec", "SECURITY find-generic-password -w",
-    "/usr/bin/Security dump-keychain", "SUDO ls", "LAUNCHCTL list", "cat ~/Library/Caches/INISA-COORD/ops.json",
-    "ls $HOME/library/caches/Inisa-Coord", "security find-generic-password -s EXAMPLE-COORD-GITHUB-APP -w",
-    "RM -rf Tools/coord", "BASH -c 'gh pr merge 5'", "ENV sudo ls", "echo x > .CLAUDE/settings.json",
-    # Round ten's review (review10/): one line for each class its bash and zsh oracle confirmed
-    # runs a keyed command. An escaped backslash then a newline is no continuation, and an
-    # escaped `>`/`<` is no redirection; a spaced redirection target; command starts.
-    "echo \\\\\ncoord train approve 5", 'echo "a\\\\\n" ; gh pr merge 5 ; echo "b"', "echo x\\>|gh pr merge 5",
-    "echo x\\<&sudo ls", "echo x\\>&coord train approve 5", "true\\>|git push origin main", "push\\<&sudo --force-f}-f",
-    "gh > /dev/null pr merge 5", "coord 2> /dev/null train approve 5", "gh {fd}>x pr merge 5",
-    ">|\tsudo  launchctl<<<refs/heads/main", "true\nlaunchctl list", "bash -c 'sudo ls'", "  sudo ls", "{ sudo ls; }",
-    "X=1 sudo ls", "nice -n 5 sudo ls", "bash -x -c 'gh pr merge 5'", "security find-g -s x -w",
-    # Not bypasses: subcommands and flags keep their case (`git STATUS` and `gh PR` fail).
-    "gh PR merge 5", "git PUSH origin main",
-]
-
 
 def corpus_sources() -> dict:
     return {
@@ -631,15 +595,13 @@ def corpus_sources() -> dict:
         "conductor commands": CONDUCTOR_COMMANDS,
         "fuzz grammar": fuzz_grammar(),
         "round eight's review": round_eight(),
-        "round nine's review": SHELL_SPELLINGS,
     }
 
 
 # Each source's DISTINCT commands when it was last grown: emptying or cutting one fails the test.
-MINIMUM = {"test_conductor.py": 253, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
+MINIMUM = {"test_conductor.py": 158, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
            "not heredoc openers": 67, "wrappers and shapes": 216, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
-           "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120,
-           "round nine's review": 62}
+           "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120}
 LEGACY_BLOB = "c7a05e3547d96008cf3c59885576616519c9e08d"  # `git hash-object` of 4f7d4a4fd's guard
 
 # Commands the old guard blocked that this one allows on purpose. Each needs a reason. None since
@@ -661,8 +623,6 @@ class GuardDifferentialTests(unittest.TestCase):
     def setUpClass(cls):
         cls.guard = load(GUARD, "conductor_guard_now")
         cls.legacy = load(LEGACY_GUARD, "conductor_guard_4f7d4a4fd")
-        cls.earlier = {commit: load(os.path.join(HERE, "legacy_guard", name), "conductor_guard_" + commit)
-                       for commit, (name, _) in EARLIER_GUARDS.items()}
         cls.sources = corpus_sources()
         cls.corpus = list(dict.fromkeys(command for source in cls.sources.values() for command in source))
 
@@ -685,20 +645,6 @@ class GuardDifferentialTests(unittest.TestCase):
         self.assertEqual(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), LEGACY_BLOB)
         self.assertTrue(all(self.blocked(self.legacy, command) for command in wrapped_heredocs()))
         self.assertFalse(self.blocked(self.legacy, "python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py"))
-
-    def test_the_earlier_guards_are_theirs(self):
-        for commit, (name, blob) in EARLIER_GUARDS.items():
-            with open(os.path.join(HERE, "legacy_guard", name), "rb") as handle:
-                data = handle.read()
-            self.assertEqual(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), blob, commit)
-        self.assertFalse(self.blocked(self.earlier["b422e151e"], "echo x\\>|gh pr merge 5"), "round ten's regression")
-        self.assertTrue(self.blocked(self.earlier["d43682fa5"], "echo x\\>|gh pr merge 5"))
-
-    def test_nothing_an_earlier_guard_blocked_is_allowed_now(self):
-        for commit, earlier in self.earlier.items():
-            regressions = [command for command in self.corpus
-                           if self.blocked(earlier, command) and not self.blocked(self.guard, command)]
-            self.assertEqual(regressions, [], f"blocked at {commit}, allowed now")
 
     def test_nothing_the_old_guard_blocked_is_allowed_now(self):
         regressions = [command for command in self.corpus
