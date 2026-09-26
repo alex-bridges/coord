@@ -307,7 +307,9 @@ class ReadFloorTests(BudgetTestCase):
         code, out, err = self.run_cli(["board"], self.silent_http())
         self.assertEqual(code, EXIT_OK)
         self.assertIn("showing the snapshot from 60m ago", err)
-        self.assertIn("cached 3600s", out.splitlines()[0], "its age from its own timestamp, not the aged file")
+        # 3600 s, or 3601 s when a second boundary falls between seeding and printing: the snapshot's
+        # generatedAt is whole seconds. The invalidated file's mtime would read far older.
+        self.assertRegex(out.splitlines()[0], r"cached 360[01]s", "its age from its own timestamp, not the aged file")
 
     def test_above_the_floor_nothing_is_held_back(self):
         self.seed(budget.READ_FLOOR_DEFAULT)
