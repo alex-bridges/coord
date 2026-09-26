@@ -185,6 +185,20 @@ class MintTests(AppTestCase):
         self.assertEqual(read_json(os.path.join(self.token_dir, "read.json"))["installation_id"], 999)
         self.assertEqual(self.server.discoveries, 1, "found once")
 
+    def test_a_cache_file_that_is_not_private_names_no_installation(self):
+        # Codex on fb63aef6e (P2): installation_id() read a file cached() refuses, so a copied
+        # 0644 cache naming an old installation drove the budget gate and the mint.
+        for kind, installation, mode in (("read", 111, 0o644), ("ops", 222, 0o600)):
+            self.seed_token(kind, mode=mode)
+            path = os.path.join(self.token_dir, f"{kind}.json")
+            entry = read_json(path)
+            entry["installation_id"] = installation
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(entry, handle)
+        self.assertEqual(self.tokens().installation_id(), 222, "the private ops.json, not the 0644 read.json")
+        os.remove(os.path.join(self.token_dir, "ops.json"))
+        self.assertIsNone(self.tokens().installation_id(), "only the 0644 file: no cached installation")
+
     def test_a_reinstall_leaves_another_configs_hold_alone(self):
         self.seed_token("ops")
         held = self.hold("ops", client_id="Iv23another")

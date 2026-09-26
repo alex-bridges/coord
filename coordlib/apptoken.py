@@ -445,7 +445,8 @@ class AppTokens:
             return self._installation
         for kind in KINDS:
             entry = _read_json(self.path(kind))
-            if entry and self._same_config(entry) and _is_int(entry.get("installation_id")):
+            if entry and self._same_config(entry) and _is_int(entry.get("installation_id")) \
+                    and self._private_file(self.path(kind)):  # a file cached() refuses names nothing
                 return entry["installation_id"]
         return None
 
