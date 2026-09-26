@@ -70,7 +70,7 @@ AT_SKEW_SECONDS = 300  # how far in the future a reading's `at` may be (clock sk
 MAX_APP_WINDOWS = 8  # two were measured; more than a few live at once is a malformed file
 
 USER = cache.USER
-APP_PREFIX = cache.APP_PREFIX  # budget.json: Alex's readings at the top level, each app under "app:<id>"
+APP_PREFIX = cache.APP_PREFIX  # budget-app.json: each app principal under "app:<id>" (Alex's are in budget.json)
 
 # Command classes. Reads degrade to the cached snapshot below the read floor; `ci`
 # is a read whose one write (the dispatch) still needs the hard floor, and so is
@@ -175,7 +175,7 @@ def record(repo: str, headers: Mapping[str, str], default_resource: str = "core"
     if found is None or os.environ.get("GITHUB_ACTIONS") == "true":
         return None
     resource, reading = found
-    with cache.budget_lock(repo):
+    with cache.budget_lock(repo, principal=principal):
         data = cache.load_principal(repo, principal)
         if is_app(principal):
             data[resource] = merge_window(data.get(resource), reading, reading["at"])

@@ -159,16 +159,20 @@ class UserPrincipalTests(PrincipalTestCase):
 
 
 class FileFormatTests(PrincipalTestCase):
-    def write_raw(self, data):
-        os.makedirs(os.path.dirname(cache.budget_path(REPO)), exist_ok=True)
-        with open(cache.budget_path(REPO), "w", encoding="utf-8") as handle:
+    def write_raw(self, data, path=None):
+        path = path or cache.budget_path(REPO)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
 
-    def read_raw(self):
-        with open(cache.budget_path(REPO), encoding="utf-8") as handle:
+    def read_raw(self, path=None):
+        with open(path or cache.budget_path(REPO), encoding="utf-8") as handle:
             return json.load(handle)
 
-    def test_alex_stays_at_the_top_level_and_the_app_under_one_key(self):
+    def test_alex_in_budget_json_as_1033_writes_it_and_the_app_in_a_file_of_its_own(self):
+        # Codex on 2d13f6b1e (P2): a coord from before #1035 replaces budget.json without a
+        # lock, so the app's readings there could be lost or rolled back. They live in
+        # budget-app.json, which that coord never opens.
         now = int(time.time())
         old = {"core": {"remaining": 1234, "limit": 5000, "used": 3766, "reset": now + 1800, "at": now}}
         self.write_raw(old)  # a file #1033 wrote
@@ -176,14 +180,27 @@ class FileFormatTests(PrincipalTestCase):
         self.assertEqual(budget.left(budget.current(REPO)), 1234)
         self.assertEqual(cache.load_principal(REPO, APP), {})
         self.feed(now + 1800, 40)
-        raw = self.read_raw()
-        self.assertEqual(set(raw), {"core", APP}, "no version marker, no nesting")
-        self.assertEqual(raw["core"], old["core"])
-        self.assertEqual(raw[APP]["core"]["windows"][0]["used"], 40)
-        self.assertEqual(budget.left(budget.current(REPO)), 1234)
+        self.assertEqual(self.read_raw(), old, "an app reading never touches budget.json")
+        app = self.read_raw(cache.app_budget_path(REPO))
+        self.assertEqual(set(app), {APP})
+        self.assertEqual(app[APP]["core"]["windows"][0]["used"], 40)
         self.feed(now + 1800, 100, principal=budget.USER)
-        self.assertEqual(set(self.read_raw()), {"core", APP})
+        self.assertEqual(set(self.read_raw()), {"core"}, "Alex's file holds only his resources")
         self.assertEqual(self.estimate()["used"], 40, "writing Alex's reading keeps the app's")
+        self.feed(now + 1800, 7, principal=budget.app_principal(999))  # after a reinstall
+        self.assertEqual(set(self.read_raw(cache.app_budget_path(REPO))), {APP, budget.app_principal(999)})
+        self.assertEqual(self.estimate()["used"], 40, "each app principal keeps its own")
+
+    def test_app_keys_an_earlier_head_left_in_budget_json_are_ignored_and_dropped(self):
+        # Earlier heads of #1046 kept the app under "app:<id>" in budget.json. No merged coord
+        # did: they are ignored (not moved), and the next write of Alex's readings drops them.
+        now = int(time.time())
+        reading = {"remaining": 900, "limit": 5000, "used": 4100, "reset": now + 1800, "at": now}
+        self.write_raw({"core": reading, APP: {"core": {"windows": [{"used": 4000, "reset": now + 1800, "at": now}]}}})
+        self.assertIsNone(self.estimate(), "not the app's reading any more")
+        self.assertEqual(cache.load_budget(REPO), {"core": reading})
+        self.feed(now + 1800, 101, principal=budget.USER)
+        self.assertEqual(set(self.read_raw()), {"core"})
 
     def test_the_first_drafts_nested_file_heals(self):
         now = int(time.time())
@@ -193,8 +210,8 @@ class FileFormatTests(PrincipalTestCase):
             nested = {"user": nested, "version": 2, "core": dict(reading), APP: {"core": {"windows": []}}}
         self.write_raw(nested)
         self.assertEqual(budget.current(REPO)["used"], 4100)
-        self.feed(now + 1800, 7)
-        self.assertEqual(set(self.read_raw()), {"core", APP})
+        self.feed(now + 1800, 4200, principal=budget.USER)
+        self.assertEqual(set(self.read_raw()), {"core"})
         self.assertLess(os.path.getsize(cache.budget_path(REPO)), 1024)
 
     def test_a_file_too_deep_to_parse_fails_open_and_is_replaced(self):
@@ -217,10 +234,11 @@ class FileFormatTests(PrincipalTestCase):
 
     def test_a_malformed_file_fails_open(self):
         for data in ({"version": 2, "user": "x"}, {APP: [1]}, {APP: {"core": "x"}}, {"core": 3}, [1], "x"):
-            with self.subTest(data=data):
-                self.write_raw(data)
-                self.assertIsNone(budget.current(REPO))
-                self.assertIsNone(self.estimate())
+            for path in (cache.budget_path(REPO), cache.app_budget_path(REPO)):
+                with self.subTest(data=data, path=os.path.basename(path)):
+                    self.write_raw(data, path)
+                    self.assertIsNone(budget.current(REPO))
+                    self.assertIsNone(self.estimate())
 
 
 class LockTests(PrincipalTestCase):
@@ -234,8 +252,8 @@ class LockTests(PrincipalTestCase):
         real_load, real_store = cache.load_principal, cache.store_principal
 
         @contextlib.contextmanager
-        def spy_lock(repo, timeout_seconds=5.0):
-            events.append("lock")
+        def spy_lock(repo, timeout_seconds=5.0, principal=budget.USER):
+            events.append(f"lock {principal}")
             yield
             events.append("unlock")
 
@@ -246,15 +264,16 @@ class LockTests(PrincipalTestCase):
             with self.subTest(principal=principal):
                 events.clear()
                 self.feed(int(time.time()) + 1800, 10, principal=principal)
-                self.assertEqual(events, ["lock", "load", "store", "unlock"])
+                self.assertEqual(events, [f"lock {principal}", "load", "store", "unlock"])
 
     def test_the_lock_is_a_real_flock_on_a_file_in_the_cache(self):
         import fcntl
-        with cache.budget_lock(REPO):
-            fd = os.open(os.path.join(cache.cache_dir(REPO), "budget.lock"), os.O_RDWR)
-            self.addCleanup(os.close, fd)
-            with self.assertRaises(OSError):
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for principal, name in ((budget.USER, "budget.lock"), (APP, "budget-app.lock")):
+            with self.subTest(principal=principal), cache.budget_lock(REPO, principal=principal):
+                fd = os.open(os.path.join(cache.cache_dir(REPO), name), os.O_RDWR)
+                self.addCleanup(os.close, fd)
+                with self.assertRaises(OSError):
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 class LegacyWriterTests(PrincipalTestCase):
@@ -278,9 +297,23 @@ class LegacyWriterTests(PrincipalTestCase):
             self.assertEqual(budget.current(REPO, "graphql")["used"], user_used + 2, turn)
             self.assertEqual(self.estimate()["used"], (20 + turn) + (19 + turn if turn else 0), turn)
         self.assertLess(max(sizes), 2048, "the file does not grow with alternation")
-        self.assertEqual(set(old_cache.load_budget(REPO)), {"core", "graphql", APP},
-                         "the old reader sees the app's key as one more resource and writes it back")
-        self.assertIsNone(old_budget.current(REPO, APP), "and never gates on it")
+        self.assertEqual(set(old_cache.load_budget(REPO)), {"core", "graphql"}, "budget.json is #1033's")
+
+    def test_a_legacy_writer_that_replaces_budget_json_cannot_touch_the_apps_readings(self):
+        # Codex on 2d13f6b1e (P2): a coord from before #1035 takes no lock. It loads
+        # budget.json, the app records a reading, then it writes what it loaded back.
+        from legacy_coordlib import budget as old_budget
+        from legacy_coordlib import cache as old_cache
+        now = int(time.time())
+        old_budget.record(REPO, rate_headers(1000, now + 1800, "core"), "core")
+        self.feed(now + 1800, 30)
+        loaded = old_cache.load_budget(REPO)
+        self.feed(now + 1800, 60)  # the app records between the legacy load and store
+        loaded["core"] = dict(loaded["core"], used=1001)
+        old_cache.store_budget(REPO, loaded)
+        self.assertEqual(self.estimate()["used"], 60, "not lost, not rolled back to 30")
+        os.remove(cache.budget_path(REPO))  # or the file is deleted, or replaced by anything
+        self.assertEqual(self.estimate()["used"], 60)
 
 
 class FakeApp:

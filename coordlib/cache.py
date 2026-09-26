@@ -91,54 +91,55 @@ def invalidate_snapshot(repo: str) -> None:
 
 
 def budget_path(repo: str) -> str:
+    """Alex's readings, as #1033 writes them. Every coord on the machine shares it."""
     return os.path.join(cache_dir(repo), "budget.json")
+
+
+def app_budget_path(repo: str) -> str:
+    """The app principals' readings, in a file of their own: a coord from before #1035
+    replaces budget.json without a lock, so anything else kept there could be lost or
+    rolled back between its read and its write (Codex on #1046)."""
+    return os.path.join(cache_dir(repo), "budget-app.json")
 
 
 USER = "user"
 APP_PREFIX = "app:"
-# Keys an early draft of #1035 wrote ({"version": 2, "user": {…}}). A coord from before
-# #1035 keeps any dict it finds and adds its own top-level readings, so alternating the
-# two nested the file one level per write. They are dropped on read and never written.
+# Keys that are not Alex's readings but may be in budget.json: an early draft of #1035
+# wrote {"version": 2, "user": {…}}, and earlier heads of #1046 kept each app principal
+# there as "app:<installation>". No merged coord wrote either. They are ignored on read
+# and dropped by the next write of Alex's readings; the app's readings are not moved to
+# budget-app.json (its windows last an hour, so at most one hour's estimate starts afresh).
 _DRAFT_KEYS = ("version", "user")
 
 
-def _budget_file(repo: str) -> Dict[str, Any]:
-    """budget.json's top level, only the dict-valued keys a reader may use.
-
-    The format is the one #1033 wrote, so every coord on the machine can share the file:
-    Alex's readings (the `user` principal) at the TOP level, one key per resource
-    ({"core": {…}, "graphql": {…}}), and each app principal under ONE key of its own,
-    {"app:<installation>": {"core": {"windows": […]}, …}}. A coord from before #1035 reads
-    the app's key as a resource it does not know, gates only on "core", and writes the key
-    back untouched, so the file never grows with alternation.
-    """
-    data = _read(budget_path(repo))
-    if not isinstance(data, dict):
-        return {}  # a file of the wrong shape is no reading (budget.valid checks each one's fields)
-    return {key: value for key, value in data.items() if key not in _DRAFT_KEYS and isinstance(value, dict)}
-
-
 def load_principal(repo: str, principal: str) -> Dict[str, Any]:
-    """One principal's last readings per resource, shared by every agent on the machine."""
-    data = _budget_file(repo)
+    """One principal's last readings per resource, shared by every agent on the machine:
+    Alex's from budget.json ({"core": {…}, "graphql": {…}}), an app principal's from
+    budget-app.json ({"app:<installation>": {"core": {"windows": […]}, …}})."""
     if principal == USER:
-        readings = {key: value for key, value in data.items() if not key.startswith(APP_PREFIX)}
+        data = _read(budget_path(repo))
+        readings = {key: value for key, value in data.items()
+                    if not str(key).startswith(APP_PREFIX) and key not in _DRAFT_KEYS} if isinstance(data, dict) else {}
     else:
-        readings = data.get(principal) or {}
+        data = _read(app_budget_path(repo))
+        readings = data.get(principal) if isinstance(data, dict) else None
+    if not isinstance(readings, dict):
+        return {}  # a file of the wrong shape is no reading (budget.valid checks each one's fields)
     return {resource: reading for resource, reading in readings.items() if isinstance(reading, dict)}
 
 
 def store_principal(repo: str, principal: str, readings: Dict[str, Any]) -> None:
-    """Replace one principal's readings and keep every other principal's as they are."""
-    data = _budget_file(repo)
+    """Replace one principal's readings. Alex's go to budget.json exactly as #1033 writes
+    them; an app principal's to budget-app.json, keeping every other app principal's."""
     if principal == USER:
-        out = {key: value for key, value in data.items() if key.startswith(APP_PREFIX)}
-        out.update({resource: reading for resource, reading in readings.items()
-                    if not str(resource).startswith(APP_PREFIX)})
-    else:
-        out = dict(data)
-        out[principal] = readings
-    _write(budget_path(repo), out)
+        _write(budget_path(repo), {resource: reading for resource, reading in readings.items()
+                                   if not str(resource).startswith(APP_PREFIX) and resource not in _DRAFT_KEYS})
+        return
+    data = _read(app_budget_path(repo))
+    out = {key: value for key, value in data.items()
+           if str(key).startswith(APP_PREFIX) and isinstance(value, dict)} if isinstance(data, dict) else {}
+    out[principal] = readings
+    _write(app_budget_path(repo), out)
 
 
 def load_budget(repo: str) -> Dict[str, Any]:
@@ -152,14 +153,16 @@ def store_budget(repo: str, readings: Dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def budget_lock(repo: str, timeout_seconds: float = 5.0) -> Iterator[None]:
-    """Serialize read-modify-writes of budget.json between processes, so one agent's
-    reading cannot overwrite another's (the app principal keeps a maximum per window).
-    Best effort: a lock that cannot be had within the timeout is skipped, not waited on."""
+def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) -> Iterator[None]:
+    """Serialize read-modify-writes of one principal's file between processes, so one
+    agent's reading cannot overwrite another's (the app principal keeps a maximum per
+    window): budget.lock for Alex's, budget-app.lock for the app's. Best effort: a lock
+    that cannot be had within the timeout is skipped, not waited on."""
+    name = "budget.lock" if principal == USER else "budget-app.lock"
     fd = None
     try:
         os.makedirs(cache_dir(repo), exist_ok=True)
-        fd = os.open(os.path.join(cache_dir(repo), "budget.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fd = os.open(os.path.join(cache_dir(repo), name), os.O_RDWR | os.O_CREAT, 0o600)
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
