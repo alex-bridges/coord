@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -663,7 +664,9 @@ class GuardHookTests(unittest.TestCase):
                         "bash -c 'gh pr merge 5'", "sh -c \"git push origin main\"", "eval 'coord train approve 3'",
                         "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "gh api repos/o/r/merges -f base=main",
                         "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
-                        "gh auth token", "gh workflow disable ci.yml"):
+                        "gh auth token", "gh workflow disable ci.yml",
+                        # Round nine: a word ends at the end of its segment, a `)` or a backtick.
+                        "git push origin main;echo ok", "git push origin main&& echo", "(git push origin main)"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_ordinary_work_and_prose_are_allowed(self):
@@ -838,6 +841,72 @@ class GuardHookTests(unittest.TestCase):
         self.assertIn("longer than 20000 characters", result.stderr)
         self.assertIn("write it to a file", result.stderr)
         self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
+
+    def test_the_guard_decides_in_time_or_refuses(self):
+        # Round nine (P1): the hook's timeout lets a call through, so a slow check must refuse.
+        # The reviewer's input: `gh pr merge` then `git push` repeated, cubic for the old push rule.
+        command = "gh pr merge 5 # " + "git push " * 780  # 7,036 characters
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp/home"})
+        start = time.monotonic()
+        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("merging a PR by hand", result.stderr, "the push rule is linear: the verdict is the real one")
+        self.assertLess(time.monotonic() - start, 3)
+        # The same input with the old cubic push rule put back first: the watchdog refuses at
+        # DEADLINE_SECONDS (7), whatever regex is slow.
+        legacy = self.load_guard(os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard",
+                                              "conductor-guard.py"))
+        with tempfile.TemporaryDirectory() as folder:
+            slow = os.path.join(folder, "conductor-guard.py")
+            with open(GUARD, encoding="utf-8") as handle:
+                source = handle.read()
+            anchor = '\nif __name__ == "__main__":'
+            self.assertEqual(source.count(anchor), 1)
+            with open(slow, "w", encoding="utf-8") as handle:
+                handle.write(source.replace(anchor, f"\nRULES.insert(0, (re.compile({legacy.RULES[0][0]!r}), 'old'))" + anchor))
+            start = time.monotonic()
+            result = subprocess.run([sys.executable, slow], input=payload, capture_output=True, text=True, env=env,
+                                    timeout=15)
+            took = time.monotonic() - start
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not decide within 7 s", result.stderr)
+        self.assertLess(took, 9.5, "well inside the hook's 10 s timeout")
+
+    def test_without_fork_the_guard_decides_inline(self):
+        guard = self.load_guard(GUARD)
+        payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 5"}, "cwd": "/tmp/home"}
+        with mock.patch.object(guard.os, "fork", side_effect=OSError("no fork")):
+            self.assertIn("merging a PR by hand", guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"}))
+        with mock.patch.object(guard.os, "pipe", side_effect=OSError("no pipe")):
+            self.assertIn("merging a PR by hand", guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"}))
+        result = self.run_guard("Bash", {}, raw=json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": 5}),
+                                full=True)
+        self.assertEqual(result.returncode, 2, "an error in the checking child still refuses")
+        self.assertIn("could not check this call (TypeError)", result.stderr)
+
+    def test_every_rule_is_fast_on_its_own_keywords(self):
+        # Round nine (P1): each rule of RULES and RAW_RULES (and the apptoken and write checks),
+        # on inputs built from its own keywords and punctuation up to the cap, in a child process
+        # so a slow rule fails here instead of hanging the suite. The watchdog is the backstop.
+        timing = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard_timing.py")
+        result = subprocess.run([sys.executable, timing, GUARD], capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        report = json.loads(result.stdout)
+        guard = self.load_guard(GUARD)
+        self.assertEqual(report["rules"], len(guard.RULES) + len(guard.RAW_RULES))
+        self.assertEqual(len(report["measured"]), report["rules"] + 2, "every rule, plus apptoken and writes")
+        for rule in report["measured"]:
+            self.assertGreater(rule["inputs"], 1, rule)
+            self.assertLess(max(rule["verdict"], rule["alone"]), 2, rule)
+
+    @staticmethod
+    def load_guard(path):
+        spec = __import__("importlib.util").util.spec_from_file_location("guard_" + str(abs(hash(path))), path)
+        guard = __import__("importlib.util").util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        return guard
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
         for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
