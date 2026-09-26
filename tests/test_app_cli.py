@@ -527,6 +527,14 @@ class TokenStatusTests(AppCliTestCase):
         self.assertIsNone(tokens.cached("ops"))
         self.keychain("key")
         self.assertTrue(tokens.token("read").startswith("ghs_"), "a miss: minted afresh")
+        # Python 3.14's parser takes 10,000 levels; a million is too deep for every version.
+        deep = "[" * 1_000_000 + "]" * 1_000_000
+        with self.assertRaises(RecursionError, msg="the fixture must really be too deep to parse"):
+            json.loads(deep)
+        with open(os.path.join(self.token_dir, "ops.json"), "w", encoding="utf-8") as handle:
+            handle.write(deep)
+        self.assertIsNone(tokens.cached("ops"))
+        self.assertEqual(self.main(["token", "status"])[0], EXIT_OK)
 
     def test_status_with_app_mode_off(self):
         os.environ["COORD_APP"] = "off"
