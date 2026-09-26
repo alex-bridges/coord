@@ -641,7 +641,7 @@ class TokenStatusTests(AppCliTestCase):
         # The review of 2d13f6b1e..752135947 (P2): review.parse_time calls .strip(), so an
         # `expires_at` of 1 or true raised AttributeError out of token status, cached() and token().
         self.keychain("key")
-        for value in (1, True, []):
+        for value in (1, True, [1]):
             with self.subTest(expires_at=value):
                 for kind in apptoken.KINDS:
                     self.seed_token(kind)
