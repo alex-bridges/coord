@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apptestkit import (API, CLIENT_ID, INSTALLATION, OPENSSLS, PEM, PEM_B64, PUBLIC_PEM, REPO,  # noqa: E402
                         AppTestCase, file_mode, jwt_parts, read_json)
-from coordlib import apptoken  # noqa: E402
+from coordlib import apptoken, budget  # noqa: E402
 from coordlib.gh import AppAuthError  # noqa: E402
 
 
@@ -154,6 +154,45 @@ class MintTests(AppTestCase):
         self.tokens().token("read")
         self.assertEqual(self.server.discoveries, 1)
         self.assertEqual(self.tokens().installation_id(), 999)
+
+    def hold(self, kind, client_id=CLIENT_ID):
+        path = os.path.join(self.token_dir, f"{kind}.failed.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"at": time.time(), "cause": "fake refusal", "stage": "mint", "client_id": client_id,
+                       "repo": REPO}, handle)
+        os.chmod(path, 0o600)
+        return path
+
+    def test_after_a_reinstall_both_kinds_converge_on_the_new_installation(self):
+        # Codex on 2d13f6b1e (P2): the ops mint found the new installation, and read.json kept
+        # the old one, which installation_id() (the budget principal) read first. The other
+        # kind's entry of the old installation, and its hold, go when a mint finds a new one.
+        old_read = self.seed_token("read")  # the old installation, still unexpired
+        self.seed_token("ops", expires_in=-10)
+        held = self.hold("read")
+        self.server.installation = 999  # the app was reinstalled
+        tokens = self.tokens()
+        tokens.token("ops")
+        self.assertEqual(self.server.discoveries, 1, "the old installation answered 404, the new one was found")
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.json")), "the old installation's token")
+        self.assertFalse(os.path.exists(held), "and its hold")
+        self.assertEqual(read_json(os.path.join(self.token_dir, "ops.json"))["installation_id"], 999)
+        self.assertEqual(tokens.installation_id(), 999)
+        self.assertEqual(self.tokens().installation_id(), 999, "a new process keys the budget on the new one")
+        self.assertEqual(budget.app_principal(self.tokens().installation_id()), budget.app_principal(999))
+        new_read = self.tokens().token("read")
+        self.assertNotEqual(new_read, old_read)
+        self.assertEqual(read_json(os.path.join(self.token_dir, "read.json"))["installation_id"], 999)
+        self.assertEqual(self.server.discoveries, 1, "found once")
+
+    def test_a_reinstall_leaves_another_configs_hold_alone(self):
+        self.seed_token("ops")
+        held = self.hold("ops", client_id="Iv23another")
+        self.seed_token("read", expires_in=-10)
+        self.server.installation = 999
+        self.tokens().token("read")
+        self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.json")))
+        self.assertTrue(os.path.exists(held), "another config's hold is not ours to clear")
 
     def test_a_cached_token_whose_permissions_differ_is_never_used(self):
         wrong = {"read": dict(apptoken.READ_PERMISSIONS, issues="write"), "ops": apptoken.READ_PERMISSIONS}

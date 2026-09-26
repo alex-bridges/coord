@@ -692,8 +692,25 @@ class AppTokens:
         if expiry_epoch(entry) is None:
             raise AppAuthError(f"POST {path} answered no usable expires_at")
         self._store(kind, entry)
+        self._forget_other_installations(kind, installation)
         self.mints += 1
         return entry
+
+    def _forget_other_installations(self, kind: str, installation: int) -> None:
+        """After a reinstall the installation id changes. The other kind's cached token (and
+        any hold on it) for this config belongs to the old installation: drop them, so both
+        kinds, and the budget principal (`installation_id`), converge on the new one."""
+        for other in KINDS:
+            entry = _read_json(self.path(other)) if other != kind else None
+            if not entry or not self._same_config(entry) or not _is_int(entry.get("installation_id")) \
+                    or entry["installation_id"] == installation:
+                continue
+            with contextlib.suppress(OSError):
+                os.unlink(self.path(other))
+            record = _read_json(self.failed_path(other))
+            if record and self._same_config(record):  # another config's hold is not ours to clear
+                with contextlib.suppress(OSError):
+                    os.unlink(self.failed_path(other))
 
 
 def _staged(error: Exception, stage: str, kinds: Sequence[str]) -> AppAuthError:
