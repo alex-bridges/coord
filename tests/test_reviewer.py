@@ -717,6 +717,71 @@ class CodexRound2Tests(ReviewFlowTests):
         self.assertEqual(leftovers, [])
 
 
+class CodexRound3Tests(ReviewFlowTests):
+    """Codex's review of 62bc2324 (#1049)."""
+
+    def test_e1_the_withdrawal_is_posted_before_the_blocking_review(self):
+        self.app.pr_comments = [
+            {"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-30)),
+             "body": marker.compose("Substitute review", {"kind": "review-substitute", "v": 1, "pr": 7, "head": HEAD})}]
+        self.tick(0)
+        self.ask(1, "@inisa-sidechain review sonnet")
+        self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
+        self.app.fail_posts = 0
+        real = self.app.rest
+        calls = []
+
+        def failing_second(path, method="GET", body=None):
+            if method == "POST" and path.endswith("/comments"):
+                calls.append(body["body"])
+                if len(calls) == 2:
+                    raise reviewer.GitHubError("HTTP 502")
+            return real(path, method, body)
+        self.app.rest = failing_second
+        self.tick(5)
+        kinds = [(marker.decode(b) or {}).get("kind") for b in self.app.posts]
+        self.assertEqual(kinds, ["review-substitute"], "withdrawn first; the review post failed after it")
+        self.tick(10)
+        kinds = [(marker.decode(b) or {}).get("kind") for b in self.app.posts]
+        self.assertEqual(kinds, ["review-substitute", "review"], "not withdrawn twice, and posted on retry")
+        self.assertEqual(len(self.reviews()), 1)
+
+    def test_e2_the_cap_never_holds_a_finished_review(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        with mock.patch.object(reviewer.Reviews, "runs_today", return_value=99):
+            lines = self.tick(10)
+        self.assertEqual(len(self.app.markers("review")), 1, "posted though the cap is reached")
+        self.assertFalse(any("the cap" in line for line in lines))
+
+    def test_e3_a_sidechain_block_holds_the_head_even_with_codex_approval(self):
+        comments = [{"payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus",
+                                 "verdict": "changes"}},
+                    {"payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "pass"}},
+                    {"payload": {"kind": "review", "v": 1, "pr": 7, "request": 3, "verdict": "none"}}]
+        pr = {"number": 7, "head": HEAD, "base": "main", "state": "OPEN", "labels": [], "codex": {"approved": True},
+              "ci": {"failing": []}, "mergeable": "MERGEABLE"}
+        snapshot.attach_substitute_reviews([pr], comments)
+        self.assertEqual(pr["sidechainBlockedHeads"], [HEAD])
+        decision = train.eligibility(pr)
+        self.assertEqual(decision[0], train.HOLD)
+        self.assertIn("inisa-sidechain", decision[1])
+        pr["head"] = "n" * 40
+        self.assertEqual(train.eligibility(pr)[0], train.READY, "a new push answers it")
+
+    def test_e4_a_notice_between_two_pushes_of_the_same_head_does_not_count(self):
+        suites = [{"created_at": snapshot.iso(at(-300)), "head_branch": "b"},
+                  {"created_at": snapshot.iso(at(-10)), "head_branch": "b"}]
+        self.assertEqual(reviewer.pushed_at(suites, "b"), at(-10))
+        notice = {"user": {"login": "chatgpt-codex-connector[bot]"}, "body": CODEX_NOTICE,
+                  "created_at": snapshot.iso(at(-100))}
+        self.assertFalse(reviewer.codex_out([notice], reviewer.pushed_at(suites, "b"), [], at(0)))
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

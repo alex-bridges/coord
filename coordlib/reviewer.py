@@ -397,13 +397,16 @@ def run_settings(home: str, deny: List[str]) -> Dict[str, Any]:
 
 
 def pushed_at(check_suites: List[Dict[str, Any]], branch: str) -> Optional[dt.datetime]:
-    """When the head reached this PR's branch: the first check suite GitHub created for the
-    sha ON THAT BRANCH (a push starts them). Not the committer date, which the author sets,
+    """When the head last reached this PR's branch: the latest check suite GitHub created
+    for the sha ON THAT BRANCH (a push starts them). Not the committer date, which the author sets,
     and not a suite from another branch the same commit was pushed to earlier (reviews of
     #1049). None when there is none: then a pass does not count for the train."""
     times = [t for t in (_time(s.get("created_at")) for s in check_suites if s.get("head_branch") == branch)
              if t is not None]
-    return min(times) if times else None
+    # The latest, not the first: a head pushed, replaced and pushed again keeps its old suite,
+    # and a quota notice from between the two pushes must not count (Codex on #1049). A later
+    # suite from a dispatch only makes a notice count less, never more.
+    return max(times) if times else None
 
 
 # MARK: - The job (run by the watcher)
@@ -475,7 +478,10 @@ class Reviews:
                        "(reviews are posted by the app only)")
             return
         cap = self.config.max_reviews_per_day
-        if self.runs_today(now) >= cap:
+        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished")]
+        if continuing:
+            jobs = continuing  # no model run needed: never held by the cap (Codex on #1049)
+        elif self.runs_today(now) >= cap:
             self.w.say(f"{len(jobs)} review request(s) waiting: {cap} reviews in 24 h, the cap")
             return
         request = jobs[0]
@@ -615,6 +621,17 @@ class Reviews:
         Each step is remembered, so a retry after a failed post repeats none that succeeded."""
         now = self.w.now
         head = posting["head"]
+        if posting.get("revoke") and not posting.get("revoked"):
+            # Before the review is visible: a blocking verdict must never be out while the old
+            # substitute still stands (Codex on #1049). The train also holds a head any
+            # sidechain review blocked (snapshot.attach_substitute_reviews).
+            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={
+                "body": marker.compose(
+                    f"**Substitute review withdrawn** for head `{head[:9]}`: a later review found blocking "
+                    "findings (posted next). The train holds this head until a new push is reviewed.",
+                    {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
+                     "revokes": head})})
+            posting["revoked"] = True
         if not posting.get("url"):
             posted = self.reply(request, posting["body"], posting["payload"])
             posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"))
@@ -631,14 +648,6 @@ class Reviews:
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
                           body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
             posting["labelled"] = True
-        if posting.get("revoke") and not posting.get("revoked"):
-            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={
-                "body": marker.compose(
-                    f"**Substitute review withdrawn** for head `{head[:9]}`: a later review found blocking "
-                    f"findings ({link}). The train holds this head until a new substitute review or Codex's 👍.",
-                    {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
-                     "revokes": head, "review": posting.get("id")})})
-            posting["revoked"] = True
         self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
         record.pop("posting", None)
         record.update(status="done", at=snapshot.iso(now), url=link, verdict=posting["verdict"])

@@ -739,9 +739,18 @@ def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str
         field = HEAD_RECORDS.get(payload.get("kind"))
         if field and isinstance(payload.get("pr"), int):
             latest[(payload["pr"], field)] = payload.get("head")
+    blocked: Dict[int, set] = {}
+    for comment in comments:
+        payload = comment["payload"]
+        # A sidechain review that requested changes holds its head whatever else is said of
+        # it (Codex's 👍 included); only a new head answers it (Codex on #1049).
+        if payload.get("kind") == "review" and payload.get("verdict") == "changes" \
+                and isinstance(payload.get("pr"), int) and isinstance(payload.get("head"), str):
+            blocked.setdefault(payload["pr"], set()).add(payload["head"])
     for pr in prs:
         for field in HEAD_RECORDS.values():
             pr[field] = latest.get((pr["number"], field))
+        pr["sidechainBlockedHeads"] = sorted(blocked.get(pr["number"], ()))
 
 
 def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
