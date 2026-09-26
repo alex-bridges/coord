@@ -1,8 +1,10 @@
 """Time every rule of .claude/hooks/conductor-guard.py on adversarial inputs built from its own
 literal keywords and punctuation, repeated to just under the length cap.
 
-Each rule runs in its own child process with a timeout, so a slow rule is a reported failure,
-not a hang. The keywords come from the rule's pattern with optional groups, character classes
+Each rule runs in its own child process, one at a time, and is judged on the CPU time it used
+(time.process_time in the child), not on the wall clock: on a loaded or single-core runner the
+wall clock measures the machine, not the rule. A generous wall-clock timeout only kills a
+child that hangs, so a slow rule is a reported failure, not a hang. The keywords come from the rule's pattern with optional groups, character classes
 and escapes (with their quantifiers: `\\s+` is not `+`) taken out, in order and with repeats;
 all of them joined is the rule's witness, which the rule must match, so a harness that builds
 inputs the rule never engages fails too.
@@ -19,7 +21,8 @@ import sys
 import time
 
 LENGTH = 19900  # just under the guard's 20,000-character cap
-BUDGET = 2.0  # seconds, for one whole verdict or one rule on one input
+BUDGET = 2.0  # CPU seconds, for one whole verdict or one rule on one input
+BACKSTOP = 300.0  # wall-clock seconds before a child is killed as hung (all of one rule's inputs)
 
 
 def load(path: str):
@@ -119,20 +122,21 @@ def measure(guard, name: str) -> dict:
     commands = inputs(pattern)
     slowest_verdict = slowest_alone = 0.0
     for command in commands:
-        start = time.monotonic()
+        start = time.process_time()
         guard.bash_verdict(command, "/tmp/home", "/tmp/home")
-        slowest_verdict = max(slowest_verdict, time.monotonic() - start)
-        start = time.monotonic()
+        slowest_verdict = max(slowest_verdict, time.process_time() - start)
+        start = time.process_time()
         alone(command)
-        slowest_alone = max(slowest_alone, time.monotonic() - start)
+        slowest_alone = max(slowest_alone, time.process_time() - start)
     return {"rule": name, "inputs": len(commands), "witness": witness,
             "witness matches": bool(alone(witness)) if needs_witness else None,
             "verdict": round(slowest_verdict, 3), "alone": round(slowest_alone, 3)}
 
 
-def measure_in_children(guard_path: str, timeout: float = 10.0, only=None, parallel: int = 4) -> tuple:
-    """(the measurement of each rule, the failures): each rule in its own child, `parallel` at a
-    time; a child still running after `timeout` seconds is killed and reported as too slow."""
+def measure_in_children(guard_path: str, timeout: float = BACKSTOP, only=None, parallel: int = 1) -> tuple:
+    """(the measurement of each rule, the failures): each rule in its own child, one at a time
+    unless `parallel` says otherwise, judged on CPU time against BUDGET; a child still running
+    after `timeout` wall-clock seconds is killed and reported as too slow."""
     names = only or json.loads(subprocess.run([sys.executable, __file__, guard_path], capture_output=True,
                                               text=True, check=True, timeout=60).stdout)
     pending, running, results, failures = list(names), {}, {}, []
@@ -158,7 +162,7 @@ def measure_in_children(guard_path: str, timeout: float = 10.0, only=None, paral
             if rule["witness matches"] is False:
                 failures.append(f"{name}: its keywords ({rule['witness']!r}) do not match it, so its inputs miss it")
             if max(rule["verdict"], rule["alone"]) >= BUDGET:
-                failures.append(f"{name}: {max(rule['verdict'], rule['alone'])} s, over the {BUDGET:g} s budget")
+                failures.append(f"{name}: {max(rule['verdict'], rule['alone'])} CPU s, over the {BUDGET:g} s budget")
         time.sleep(0.02)
     return [results[name] for name in names if name in results], failures
 

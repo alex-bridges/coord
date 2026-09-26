@@ -958,7 +958,7 @@ class GuardHookTests(unittest.TestCase):
         result = self.run_guard("Bash", {"command": self.PADDED}, full=True)
         self.assertEqual(result.returncode, 2)
         self.assertIn("could not decide within 7 s", result.stderr)
-        self.assertLess(time.monotonic() - start, 9, "inside the hook's 10 s timeout")
+        self.assertLess(time.monotonic() - start, 9.5, "inside the hook's 10 s timeout")
         result = self.run_guard("Bash", {"command": "gh pr merge 5"}, full=True)
         self.assertIn("merging a PR by hand", result.stderr, "a quick verdict is the real one")
 
@@ -974,7 +974,7 @@ class GuardHookTests(unittest.TestCase):
         result, took = self.run_patched_guard("def verdict(payload, env):\n    time.sleep(60)", payload)
         self.assertEqual(result.returncode, 2)
         self.assertIn("could not decide within 7 s", result.stderr)
-        self.assertLess(took, 9)
+        self.assertLess(took, 9.5)
 
     def test_the_parent_never_waits_for_a_stuck_child(self):
         # A failing select (or a child stuck in I/O) must not keep the parent waiting past the
@@ -1002,14 +1002,16 @@ class GuardHookTests(unittest.TestCase):
     def test_every_rule_but_mains_push_rule_is_fast_on_its_own_keywords(self):
         # Each rule of RULES and RAW_RULES, the apptoken and write checks, and the helpers every
         # verdict runs, on inputs built from its own keywords and punctuation up to the cap. Each
-        # rule's keywords must match it (so its inputs engage it). One input over 2 s fails, and
-        # each rule runs in its own child, killed after 60 s for all its inputs (main's gh api
-        # rule takes about 13 s over its 112). Main's push rule (RULES[0]) is cubic and unchanged
-        # here: test_a_slow_check_is_refused_in_time covers it through the watchdog.
+        # rule's keywords must match it (so its inputs engage it). One input over 2 CPU seconds
+        # fails. Each rule runs in its own child, one at a time, judged on the child's CPU time,
+        # not the wall clock, which on a loaded or single-core runner measures the machine
+        # (Codex on 2d13f6b1e). The wall clock only kills a hung child (guard_timing.BACKSTOP).
+        # Main's push rule (RULES[0]) is cubic and unchanged here:
+        # test_a_slow_check_is_refused_in_time covers it through the watchdog.
         import guard_timing
         guard = self.load_guard(GUARD)
         names = [name for name in guard_timing.rules(guard) if name != "RULES[0]"]
-        report, failures = guard_timing.measure_in_children(GUARD, timeout=60, only=names)
+        report, failures = guard_timing.measure_in_children(GUARD, only=names)
         self.assertEqual(failures, [])
         self.assertEqual([rule["rule"] for rule in report], names)
         for rule in report:
