@@ -685,8 +685,10 @@ class RedirectTests(unittest.TestCase):
 
 class SecurityOverrideTests(AppTestCase):
     """COORD_SECURITY_BIN reaches the `coord` script in a subprocess, which module patches
-    cannot. It is refused for the default config by ANY spelling of its path, and for any
-    config carrying the default config's client id (review of #1046, P3-3)."""
+    cannot. It is refused for a default config by ANY spelling of its path (under $HOME or
+    under the real home), and for any config carrying the real app's client id; a refused
+    override RAISES and never falls back to /usr/bin/security (reviews of #1046, P3-3 and
+    round three's P2-1)."""
 
     REAL_ID = "Iv23realdefault"
 
@@ -694,14 +696,24 @@ class SecurityOverrideTests(AppTestCase):
         super().setUp()
         self.patch(apptoken, "SECURITY", "/usr/bin/security")
         self.fake = os.path.join(self.root, "bin", "security")
-        # This test's stand-in for ~/.config/inisa-coord/github-app.json, holding "the real"
-        # client id (never the real file: the test must mean the same on every machine).
-        home = os.path.join(self.root, "Home")
-        self.default = os.path.join(home, ".config", "inisa-coord", "github-app.json")
-        os.makedirs(os.path.dirname(self.default))
-        with open(self.default, "w", encoding="utf-8") as handle:
-            json.dump({"client_id": self.REAL_ID, "repo": REPO}, handle)
+        # This test's stand-ins for ~/.config/inisa-coord/github-app.json under $HOME and
+        # under the real home (never the real file: the test must mean the same on every
+        # machine). Both hold "the real" client id.
+        self.home = os.path.join(self.root, "Home")
+        self.default = os.path.join(self.home, ".config", "inisa-coord", "github-app.json")
+        self.write(self.default, self.REAL_ID)
         self.patch(apptoken, "default_config_path", lambda: self.default)
+        self.patch(apptoken, "real_home", lambda: self.home)
+        # Nothing here may run a Keychain command.
+        self.patch(apptoken.subprocess, "run", self.no_subprocess)
+
+    def no_subprocess(self, *args, **kwargs):
+        raise AssertionError(f"a refused override reached a subprocess: {args[0] if args else kwargs}")
+
+    def write(self, path, client_id):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"client_id": client_id, "repo": REPO}, handle)
 
     def binary(self, configured, client_id=CLIENT_ID):
         env = {"COORD_SECURITY_BIN": self.fake}
@@ -709,21 +721,34 @@ class SecurityOverrideTests(AppTestCase):
             env["COORD_APP_CONFIG"] = configured
         return apptoken.security_binary(env, client_id)
 
+    def assert_refused(self, configured, client_id=CLIENT_ID, words=""):
+        with self.assertRaises(AppAuthError) as caught:
+            self.binary(configured, client_id)
+        self.assertIn("COORD_SECURITY_BIN is set but refused for this config", str(caught.exception))
+        self.assertIn(words, str(caught.exception))
+
     def test_a_test_config_with_a_test_client_id_may_use_the_override(self):
         self.assertEqual(self.binary(self.config_path), self.fake)
 
-    def test_no_config_named_means_the_default(self):
-        self.assertEqual(self.binary(None), "/usr/bin/security")
+    def test_without_the_override_it_is_the_keychain(self):
+        self.assertEqual(apptoken.security_binary({"COORD_APP_CONFIG": self.config_path}, CLIENT_ID),
+                         "/usr/bin/security")
+
+    def test_no_config_named_means_the_default_and_is_refused(self):
+        self.assert_refused(None, words="COORD_APP_CONFIG is not set")
 
     def test_every_spelling_of_the_default_path_is_refused(self):
         folder = os.path.dirname(self.default)
         link = os.path.join(self.root, "link.json")
         os.symlink(self.default, link)
+        hard = os.path.join(self.root, "hard.json")
+        os.link(self.default, hard)
         linked_dir = os.path.join(self.root, "linked-dir")
         os.symlink(folder, linked_dir)
         spellings = {
             "itself": self.default,
             "a symlink to the file": link,
+            "a hard link to the file": hard,
             "through a symlinked folder": os.path.join(linked_dir, "github-app.json"),
             "with ..": os.path.join(folder, "..", "inisa-coord", "github-app.json"),
             "with ./": os.path.join(folder, ".", "github-app.json"),
@@ -731,21 +756,51 @@ class SecurityOverrideTests(AppTestCase):
         }
         for name, path in spellings.items():
             with self.subTest(spelling=name):
-                self.assertEqual(self.binary(path), "/usr/bin/security")
+                self.assert_refused(path, words="is the default app config")
 
-    def test_the_default_client_id_is_refused_from_any_config(self):
+    def test_the_real_client_id_is_refused_from_any_config(self):
         copy = os.path.join(self.root, "copy.json")
-        with open(copy, "w", encoding="utf-8") as handle:
-            json.dump({"client_id": self.REAL_ID, "repo": REPO}, handle)
-        self.assertEqual(self.binary(copy, client_id=self.REAL_ID), "/usr/bin/security")
-        self.assertEqual(self.binary(self.config_path, client_id=None), "/usr/bin/security",
-                         "no client id named: no override")
+        self.write(copy, self.REAL_ID)
+        self.assert_refused(copy, client_id=self.REAL_ID, words="is the real app's")
+        self.assert_refused(self.config_path, client_id=None, words="no client id")
+
+    def test_moving_home_does_not_hide_the_real_config(self):
+        # HOME points somewhere else, so default_config_path() names an empty place; the
+        # real home (from the password database) still holds the real config.
+        moved = os.path.join(self.root, "moved-home", ".config", "inisa-coord", "github-app.json")
+        self.patch(apptoken, "default_config_path", lambda: moved)
+        self.assert_refused(self.default, words="is the default app config")
+        copy = os.path.join(self.root, "copy.json")
+        self.write(copy, self.REAL_ID)
+        self.assert_refused(copy, client_id=self.REAL_ID, words="is the real app's")
+        self.assertEqual(self.binary(self.config_path), self.fake, "a test config still may")
+
+    def test_the_real_home_is_the_password_databases_not_HOME(self):
+        import pwd
+        self.patch(apptoken, "real_home", self.real_home_unpatched)
+        os.environ["HOME"] = os.path.join(self.root, "elsewhere")
+        self.addCleanup(os.environ.__setitem__, "HOME", pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertEqual(apptoken.real_home(), pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertNotEqual(apptoken.real_default_config_path(), apptoken.config_path({}),
+                            "with HOME moved, the two defaults differ, and both are checked")
+
+    real_home_unpatched = staticmethod(apptoken.real_home)
+
+    def test_a_refused_override_stops_the_mint_before_any_keychain_command(self):
+        os.environ["COORD_SECURITY_BIN"] = self.fake
+        self.write(self.config_path, self.REAL_ID)  # a test config that names the real app
+        self.keychain("key")
+        with self.assertRaises(AppAuthError) as caught:
+            self.tokens().token("read")
+        self.assertIn("COORD_SECURITY_BIN is set but refused", str(caught.exception))
+        self.assertEqual(self.server.requests, [], "nothing minted")
 
     def test_the_mint_passes_its_client_id(self):
         seen = []
         self.patch(apptoken, "security_binary", lambda env=None, client_id=None: seen.append(client_id) or self.fake)
-        with self.assertRaises(AppAuthError):
-            self.tokens().token("read")  # the fake trips (tripwire mode); the argument is what matters
+        with self.assertRaises(AppAuthError) as caught:  # no_subprocess tripped: it got as far as running it
+            self.tokens().token("read")
+        self.assertIn("reached a subprocess", str(caught.exception))
         self.assertEqual(seen, [CLIENT_ID])
 
 

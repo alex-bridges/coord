@@ -52,6 +52,7 @@ import fcntl
 import http.client
 import json
 import os
+import pwd
 import re
 import subprocess
 import tempfile
@@ -73,9 +74,10 @@ KEYCHAIN_SERVICE = "example-coord-github-app"
 # Absolute paths, never looked up on PATH. The PEM goes INTO openssl, so whoever could
 # choose that binary could read the key: OPENSSL is never taken from the environment.
 # `security` only hands a key OUT, so a test that runs the script as a subprocess may
-# replace it (security_binary): only with an app config that is not the default one by
-# any spelling, and only for a client id that is not the default config's. Tests in this
-# process replace the module attributes.
+# replace it (security_binary): only with an app config that is not a default one by any
+# spelling (under $HOME or the real home), and only for a client id that is not the real
+# app's. A refused replacement raises; it never falls back to /usr/bin/security. Tests in
+# this process replace the module attributes.
 SECURITY = "/usr/bin/security"
 OPENSSL = "/usr/bin/openssl"
 
@@ -137,41 +139,77 @@ def config_path(env: Optional[Dict[str, str]] = None) -> str:
     return env.get(CONFIG_ENV) or default_config_path()
 
 
+def real_home() -> str:
+    """The invoking user's home from the password database, not $HOME: a test or a probe
+    that moves HOME must not stop the real config from being recognised as the real one."""
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        return os.path.expanduser("~")
+
+
+def real_default_config_path() -> str:
+    return os.path.join(real_home(), ".config", "inisa-coord", "github-app.json")
+
+
+def _default_configs() -> Sequence[str]:
+    """The default config under $HOME and under the real home (the same path unless HOME moved)."""
+    return tuple(dict.fromkeys((default_config_path(), real_default_config_path())))
+
+
 def _is_default_config(path: str) -> bool:
-    """Whether `path` names the default config, however it is spelled: through a symlink,
-    with `..`, or in other letter case (macOS volumes are case-insensitive by default, so
-    the comparison is too; being wrong that way only refuses an override)."""
-    default = default_config_path()
-    try:
-        if os.path.samefile(path, default):
+    """Whether `path` names a default config, however it is spelled: a symlink, a hard link,
+    `..`, or other letter case (macOS volumes are case-insensitive by default, so the
+    comparison is too; being wrong that way only refuses an override)."""
+    for default in _default_configs():
+        try:
+            if os.path.samefile(path, default):
+                return True
+        except OSError:
+            pass
+        if os.path.realpath(path).lower() == os.path.realpath(default).lower():
             return True
-    except OSError:
-        pass
-    return os.path.realpath(path).lower() == os.path.realpath(default).lower()
+    return False
 
 
-def _default_client_id() -> Optional[str]:
-    try:
-        return load_config(default_config_path())["client_id"]
-    except AppAuthError:
-        return None
+def _default_client_ids() -> Sequence[str]:
+    """The client ids of the default configs that exist (the real app's, on the Mac)."""
+    ids = []
+    for path in _default_configs():
+        try:
+            ids.append(load_config(path)["client_id"])
+        except AppAuthError:
+            pass
+    return ids
 
 
 def security_binary(env: Optional[Dict[str, str]] = None, client_id: Optional[str] = None) -> str:
     """SECURITY, or COORD_SECURITY_BIN for tests that run the `coord` script as a
-    subprocess (which module patches cannot reach). The override is refused, and
-    /usr/bin/security used, unless COORD_APP_CONFIG names a config that is NOT the default
-    one by any spelling (`_is_default_config`) AND whose client id (`client_id`, the one
-    about to be looked up) is not the default config's client id. So the Keychain item of
-    the app's real client id can never be fetched through the override."""
+    subprocess (which module patches cannot reach).
+
+    With COORD_SECURITY_BIN unset, SECURITY. With it set, it is used only when
+    COORD_APP_CONFIG names a config that is not a default config by any spelling
+    (`_is_default_config`) and the client id about to be looked up is not a default
+    config's (the real app's). Otherwise it raises AppAuthError: a refused override never
+    falls back to /usr/bin/security, so a test or probe that set a fake binary can never
+    read the real key and mint live instead.
+    """
     env = os.environ if env is None else env
     override, configured = env.get(SECURITY_ENV), env.get(CONFIG_ENV)
-    if not override or not configured or _is_default_config(configured):
+    if not override:
         return SECURITY
-    real = _default_client_id()
-    if client_id is None or (real is not None and client_id == real):
-        return SECURITY
-    return override
+    if not configured:
+        refused = "COORD_APP_CONFIG is not set, so the default (real) app config is in use"
+    elif _is_default_config(configured):
+        refused = f"{configured} is the default app config"
+    elif client_id is None:
+        refused = "no client id was named"
+    elif client_id in _default_client_ids():
+        refused = f"client id {client_id} is the real app's"
+    else:
+        return override
+    raise AppAuthError(f"COORD_SECURITY_BIN is set but refused for this config: {refused}; "
+                       "it never falls back to /usr/bin/security (unset it to use the Keychain)")
 
 
 def token_cache_dir(env: Optional[Dict[str, str]] = None) -> str:
