@@ -507,6 +507,27 @@ class EchoedSecretTests(AppCliTestCase):
 
 
 class TokenStatusTests(AppCliTestCase):
+    def test_a_deeply_nested_cache_document_is_a_miss(self):
+        # Codex on 141d38f62 (P2): 10,000 levels of nesting raised RecursionError out of the
+        # token cache's reader and took coord down. The token file and the failure record are
+        # misses now, and the next call mints.
+        os.makedirs(self.token_dir, exist_ok=True)
+        for name, key in (("read.json", "permissions"), ("read.failed.json", "cause"), ("ops.json", "permissions"),
+                          ("ops.failed.json", "cause")):
+            path = os.path.join(self.token_dir, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f'{{"{key}":' * 10000 + "{}" + "}" * 10000)
+            os.chmod(path, 0o600)
+        code, out, err = self.main(["token", "status"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("read token: ", out)
+        self.assertNotIn("Traceback", err)
+        tokens = self.tokens()
+        self.assertIsNone(tokens.failure("read"))
+        self.assertIsNone(tokens.cached("ops"))
+        self.keychain("key")
+        self.assertTrue(tokens.token("read").startswith("ghs_"), "a miss: minted afresh")
+
     def test_status_with_app_mode_off(self):
         os.environ["COORD_APP"] = "off"
         code, out, _ = self.main(["token", "status"])

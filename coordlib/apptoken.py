@@ -343,10 +343,13 @@ def make_jwt(client_id: str, pem: bytes, now: float, openssl: Optional[str] = No
 
 
 def _read_json(path: str) -> Optional[Dict[str, Any]]:
+    """A token cache entry or failure record, or None. Anything a corrupt, truncated or
+    absurdly deep file can raise (ValueError, RecursionError, MemoryError, …) is a miss, as
+    in cache.py: a cache file must never take a command down."""
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError):
+    except Exception:  # noqa: BLE001
         return None
     return data if isinstance(data, dict) else None
 
