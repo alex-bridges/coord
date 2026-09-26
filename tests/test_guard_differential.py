@@ -25,6 +25,7 @@ import importlib.util
 import itertools
 import os
 import re
+import unicodedata
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -491,7 +492,9 @@ FUZZ_SOURCES = ["heredoc'", "heredoc", "heredoc-", "pipe", "herestr"]
 FUZZ_MODES = [" -", " - 2>&1", " - arg", " /dev/stdin", "", " -c 'import sys; exec(sys.stdin.read())'"]
 FUZZ_PYTHONS = ["python3", "/usr/bin/python3", "python3.14", "python"]
 FUZZ_OPTIONS = ["", " -B", " -u", " -X utf8", " -W ignore", " -I", " -E -s"]
-FUZZ_PAYLOADS = ["import coordlib.apptoken", "from coordlib.apptoken import AppTokens", "from coordlib import apptoken"]
+# The last payload names only `AppTokens`, never a lowercase `apptoken` (round eight's blind spot).
+FUZZ_PAYLOADS = ["import coordlib.apptoken", "from coordlib.apptoken import AppTokens", "from coordlib import apptoken",
+                 "from coordlib.cli import AppTokens"]
 FUZZ_AFTER = ["", " | tail -3", " && echo ok", "; echo done", " >/tmp/o"]
 
 
@@ -500,7 +503,7 @@ def fuzz_grammar() -> list:
     for i, (prefix, source, mode, python) in enumerate(itertools.product(FUZZ_PREFIXES, FUZZ_SOURCES, FUZZ_MODES,
                                                                           FUZZ_PYTHONS)):
         run = python + FUZZ_OPTIONS[i % 7] + mode
-        payload, after = FUZZ_PAYLOADS[(i // 7) % 3], FUZZ_AFTER[(i // 3) % 5]
+        payload, after = FUZZ_PAYLOADS[(i // 7) % len(FUZZ_PAYLOADS)], FUZZ_AFTER[(i // 3) % 5]
         if source == "pipe":
             command = prefix + f"echo '{payload}' | " + run + after
         elif source == "herestr":
@@ -511,6 +514,71 @@ def fuzz_grammar() -> list:
             command = prefix + run + " " + opener + after + "\n" + tab + payload + "\n" + tab + "EOF"
         commands.append(command + {"(": "\n)", "{ ": "\n}"}.get(prefix, ""))
     return commands
+
+# Round eight's review (review8/probe_rule.py, probe_other.py): the exemption, python's names,
+# apptoken's spellings (AppTokens, PYTHONCASEOK, NFKC), the other rules, and ordinary work.
+EXEMPTION_AND_SPELLINGS = [
+    'python3 -m unittest test_apptokenX', 'python3 -m unittest xtest_apptoken', "python3 -c 'import test_apptoken.apptoken'",
+    'python3 -m unittest test_apptoken; python3 - <<Y\napptoken\nY',
+    "python3 -m unittest test_apptoken; python3 - <<'Y'\nimport coordlib.apptoken\nY",
+    "python3 -c 'import coordlib.apptest_apptokentoken'", "python3 -c 'import coordlib.apptoken' # test_apptoken",
+    'python3 -m test_apptoken', "python3 -c 'from test_apptoken import *'",
+    "python3 -c 'import test_apptoken as t; print(t.AppTokens)'",
+    "python3 -c 'print(AppTokens)'", "python3 -c 'from coordlib.cli import *; print(AppTokens)'",
+    "python3 -c 'import coordlib.Apptoken'", "PYTHONCASEOK=1 python3 -c 'import coordlib.APPTOKEN as t'",
+    "python3 -c 'import coordlib.ａpptoken'",
+    "python3 -c 'import coordlib.\U0001d41a\U0001d429\U0001d429\U0001d42d\U0001d428\U0001d424\U0001d41e\U0001d427'",
+    'python3 Tools/coord/coordlib/app*.py', "python3 -c 'import coordlib.app\\\ntoken'",
+    "python3 -c 'import coordlib.xtest_apptoken'",
+    'git push origin main;echo ok', 'git push origin main&& echo', '(git push origin main)',
+]
+PYTHON_NAMES = ["python", "python3", "python3.14", "/usr/bin/python3", "Python3", "PYTHON", "python3t", "python3.14t",
+                "pythonw", "pythonw3", "ipython", "py", "python3-intel64", "python3.14-intel64", "python_3", "python3_14",
+                "/opt/x/bin/Python3", "PyThOn3", "python3.", "python-3", "python3-config", "cpython3", "./python3",
+                "~/.venv/bin/python", "$HOME/.pyenv/shims/python3", "Python", "python3m", "python3.9m", "python3dm",
+                "python2", "python310"]
+OTHER_RULES_AND_WORK = [
+    'Tools/coord/coord token exec -- gh api user', 'coord --repo o/r token exec -- env', 'x; Tools/coord/coord token exec -- sh',
+    'security find-generic-password -s x -w', '(security dump-keychain)', 'cat ~/Library/Caches/inisa-coord/t.json',
+    'ls $HOME/Library/Caches/inisa-coord',
+    'python3 -c "import subprocess; subprocess.run([\'security\',\'find-generic-password\',\'-s\',\'example-coord-github-app\'])"',
+    'Tools/coord/coord train approve 5', './Tools/coord/coord --repo o/r train approve 5',
+    "bash -c 'Tools/coord/coord train approve 5'", 'git push origin --force HEAD', 'git push -f', 'git push origin +HEAD:x',
+    'git push origin HEAD:main', 'git push origin main', 'gh pr merge 5 --squash', 'gh api -X PUT repos/o/r/pulls/5/merge',
+    'gh api --method POST repos/o/r/git/refs -f ref=x', 'gh secret list', 'gh variable set X', 'gh auth token', 'sudo ls',
+    'launchctl list', "eval 'gh pr merge 5'", 'echo x > .claude/settings.json', 'rm -rf Tools/coord',
+    "sed -i '' s/a/b/ CLAUDE.md", 'cp x .claude/hooks/conductor-guard.py',
+    'cd /tmp/home && echo x > .claude/agents/conductor.md', 'tee ~/.claude/settings.json < x',
+    'python3 -m unittest test_apptoken; gh pr merge 5', 'echo test_apptoken; security find-generic-password -s a',
+    'Tools/coord/coord send --on 1046 "$(cat /tmp/note.txt)"',
+    'Tools/coord/coord send --on 1046 "$(cat "$CONDUCTOR_STATE_DIR/note.md")"',
+    'Tools/coord/coord send --on 1046 "$(< /tmp/note.txt)"', 'gh pr create --title x --body-file /tmp/body.md',
+    'gh pr comment 5 -F /tmp/b.md', 'git commit -q -F /tmp/message.txt', 'gh pr edit 5 --body-file /tmp/b.md',
+    'gh issue comment 5 --body-file "$CONDUCTOR_STATE_DIR/b.md"', 'Tools/coord/coord conductor escalate "$(cat /tmp/e.txt)"',
+    'cd Tools/coord && python3 -m unittest discover -s tests 2>&1 | tail -3',
+    '/usr/bin/python3 -m unittest discover -s Tools/coord/tests',
+    'cd Tools/coord/tests && python3 -m unittest test_apptoken test_conductor -v 2>&1 | tail -5',
+    'python3 -m unittest tests.test_apptoken.JWTTests', 'python3 Tools/coord/tests/test_apptoken.py',
+    'git log --oneline -5 -- Tools/coord', "git grep -n 'def token' -- Tools/coord", 'grep -rn apptoken Tools/coord/coordlib',
+    'git log -p -- Tools/coord/coordlib/apptoken.py | head -80', 'Tools/coord/coord board', 'Tools/coord/coord inbox',
+    'Tools/coord/coord train status', "Tools/coord/coord send --on 1046 'apptoken retry landed'",
+    "Tools/coord/coord send --to all 'python3.14 lane is red'",
+    "Tools/coord/coord board --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'",
+    "gh pr view 1046 --json files -q '.files[].path' | grep apptoken", 'Tools/coord/coord token status',
+    'cd Tools/coord && python3 -m unittest discover -s tests && git add coordlib/apptoken.py && git commit -q -F /tmp/m.txt',
+    'python3 -m unittest discover -s Tools/coord/tests 2>&1 | tail -3; git diff --stat -- Tools/coord/coordlib/apptoken.py',
+    'git log --oneline --grep apptoken | head; python3 --version',
+    'gh pr view 1046 --json body | python3 -c \'import json,sys; print(json.load(sys.stdin)["body"])\' | grep -n apptoken',
+    "cat > /tmp/body.md <<'EOF'\nThe apptoken fix; python3 tests pass.\nEOF",
+    "printf '%s\\n' 'apptoken retry: python3 tests green' > /tmp/body.md",
+    "Tools/coord/coord send --on 1046 'apptoken ok on Python 3.9'",
+    'ls ~/.pyenv/versions/3.14/lib/python3.14/site-packages | grep apptoken',
+]
+
+
+def round_eight() -> list:
+    return (EXEMPTION_AND_SPELLINGS + [f"echo 'import coordlib.apptoken' | {name} -" for name in PYTHON_NAMES]
+            + OTHER_RULES_AND_WORK)
 
 
 def corpus_sources() -> dict:
@@ -526,13 +594,14 @@ def corpus_sources() -> dict:
         "heredoc shapes": HEREDOC_SHAPES,
         "conductor commands": CONDUCTOR_COMMANDS,
         "fuzz grammar": fuzz_grammar(),
+        "round eight's review": round_eight(),
     }
 
 
-# Each source's size when it was added: emptying or cutting one fails the test.
-MINIMUM = {"test_conductor.py": 150, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
-           "not heredoc openers": 67, "wrappers and shapes": 219, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
-           "conductor commands": 45, "fuzz grammar": 2520}
+# Each source's DISTINCT commands when it was last grown: emptying or cutting one fails the test.
+MINIMUM = {"test_conductor.py": 156, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
+           "not heredoc openers": 67, "wrappers and shapes": 216, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
+           "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120}
 LEGACY_BLOB = "c7a05e3547d96008cf3c59885576616519c9e08d"  # `git hash-object` of 4f7d4a4fd's guard
 
 # Commands the old guard blocked that this one allows on purpose. Each needs a reason. None since
@@ -541,9 +610,12 @@ INTENDED_UNBLOCKS = {}
 
 
 def names_python_and_apptoken(command: str) -> bool:
-    """Round eight's rule, restated here so the guard is checked against it, not against itself."""
-    return (bool(re.search(r"\bpython[0-9.]*\b|/python", command, re.IGNORECASE))
-            and "apptoken" in command.replace("test_apptoken", ""))
+    """The apptoken rule, restated here so the guard is checked against it, not against itself:
+    on the command's NFKC case-folded form, a python token and `apptoken`, the test module's
+    name (with no word character before it) aside."""
+    folded = unicodedata.normalize("NFKC", command).casefold()
+    return (bool(re.search(r"\bpython[0-9.]*\b|/python", folded))
+            and "apptoken" in re.sub(r"(?<!\w)test_apptoken", "", folded))
 
 
 class GuardDifferentialTests(unittest.TestCase):
@@ -562,7 +634,10 @@ class GuardDifferentialTests(unittest.TestCase):
     def test_every_source_is_there(self):
         self.assertEqual(set(self.sources), set(MINIMUM))
         for name, commands in self.sources.items():
-            self.assertGreaterEqual(len(commands), MINIMUM[name], name)
+            self.assertGreaterEqual(len(set(commands)), MINIMUM[name], name)
+        # Round eight's blind spot: fuzz payloads that name only `AppTokens`.
+        self.assertTrue(any("AppTokens" in command and "apptoken" not in command
+                            for command in self.sources["fuzz grammar"]))
 
     def test_the_old_guard_is_4f7d4a4fds(self):
         with open(LEGACY_GUARD, "rb") as handle:

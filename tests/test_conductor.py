@@ -794,7 +794,14 @@ class GuardHookTests(unittest.TestCase):
                         "echo 'import coordlib.apptoken' | /opt/homebrew/bin/python3t -",
                         # macOS's filesystem ignores case: these run python3.
                         "Python3 - <<'Y'\nimport coordlib.apptoken\nY",
-                        "/usr/bin/PYTHON3 -c 'import coordlib.apptoken'"):
+                        "/usr/bin/PYTHON3 -c 'import coordlib.apptoken'",
+                        # Round nine: matched on the NFKC, case-folded command. Python reads
+                        # identifiers in NFKC, and PYTHONCASEOK=1 imports ignore case.
+                        "python3 -c 'print(AppTokens)'", "PYTHONCASEOK=1 python3 -c 'import coordlib.APPTOKEN as t'",
+                        "python3 -c 'import coordlib.\uff41pptoken'",
+                        "python3 -c 'import coordlib.\U0001d41a\U0001d429\U0001d429\U0001d42d\U0001d428\U0001d424\U0001d41e\U0001d427'",
+                        # The exemption is the test module's name only.
+                        "python3 -c 'import coordlib.xtest_apptoken'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_prose_that_names_python_and_apptoken_is_refused_with_the_way_out(self):
@@ -807,9 +814,17 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord send --on 1046 'the apptoken test'\\''s python3 run is green'"):
             result = self.run_guard("Bash", {"command": command}, full=True)
             self.assertEqual(result.returncode, 2, command)
-            self.assertIn("put it in a file and pass the file (--body-file / -F", result.stderr, command)
-        for command in ("gh pr create --title x --body-file /tmp/body.md", "git commit -q -F /tmp/message.txt",
-                        "Tools/coord/coord send --on 1046 \"$(cat /tmp/note.txt)\""):
+            self.assertIn("write it with the Write tool (for example under $CONDUCTOR_STATE_DIR) and pass the file "
+                          "(--body-file / -F", result.stderr, command)
+        # Round nine (P3-3): every shell way to write such text is refused, so the Write tool is
+        # the way: the guard checks only its path. The state directory is the watcher's default
+        # (conductor.Config: $XDG_STATE_HOME or ~/.local/state, then inisa-conductor).
+        note = os.path.join(os.path.expanduser("~"), ".local", "state", "inisa-conductor", "note.md")
+        for path in (note, "$CONDUCTOR_STATE_DIR/note.md"):
+            self.assertEqual(self.run_guard("Write", {"file_path": path, "content": "python3 cannot import apptoken"}), 0)
+        for command in (f"gh pr create --title x --body-file {note}", f"git commit -q -F {note}",
+                        f"Tools/coord/coord send --on 1046 \"$(cat {note})\"",
+                        "gh pr create --title x --body-file \"$CONDUCTOR_STATE_DIR/note.md\""):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_test_runner_and_the_conductors_own_commands_are_allowed(self):
