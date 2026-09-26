@@ -27,7 +27,7 @@ PREFIX = "<!-- coord:v1 "
 SUFFIX = " -->"
 
 KINDS = ("claim", "release", "msg", "train-add", "train-remove", "train", "review-substitute", "alex-approve",
-         "outage", "conductor")
+         "outage", "conductor", "review")
 
 
 def encode(payload: Dict[str, Any]) -> str:

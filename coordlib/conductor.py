@@ -135,6 +135,8 @@ class Config:
     disk_path: str = "/"
     disk_low_gb: float = DISK_LOW_GB
     update_checkout: bool = True
+    max_reviews_per_day: int = 8        # reviewer.MAX_REVIEWS_PER_DAY
+    review_timeout: int = 45 * 60       # reviewer.REVIEW_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Config":
@@ -166,6 +168,8 @@ class Config:
             disk_path=env.get("CONDUCTOR_DISK_PATH") or (data_volume if os.path.isdir(data_volume) else "/"),
             disk_low_gb=number("CONDUCTOR_DISK_LOW_GB", DISK_LOW_GB),
             update_checkout=env.get("CONDUCTOR_UPDATE_CHECKOUT", "1") != "0",
+            max_reviews_per_day=int(number("CONDUCTOR_MAX_REVIEWS_PER_DAY", 8)),
+            review_timeout=int(number("CONDUCTOR_REVIEW_TIMEOUT", 45 * 60)),
         )
 
 
@@ -196,9 +200,16 @@ def append_wake(config: Config, record: Dict[str, Any]) -> None:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def read_wakes(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
+def append_review(config: Config, record: Dict[str, Any]) -> None:
+    """One line per review run (reviewer.py), like wakes.jsonl for conductor wakes."""
+    os.makedirs(config.state_dir, exist_ok=True)
+    with open(os.path.join(config.state_dir, "reviews.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def read_wakes(config: Config, limit: int = 200, name: str = "wakes.jsonl") -> List[Dict[str, Any]]:
     try:
-        with open(os.path.join(config.state_dir, "wakes.jsonl"), encoding="utf-8") as handle:
+        with open(os.path.join(config.state_dir, name), encoding="utf-8") as handle:
             lines = handle.readlines()[-limit:]
     except OSError:
         return []
@@ -509,6 +520,8 @@ class Watcher:
         self.lock = threading.Lock()
         self.state: Dict[str, Any] = {}
         self.dry_run = False
+        self.issue_comments: Optional[List[Dict[str, Any]]] = None
+        self.app_gh_factory: Callable[[], Optional[GitHub]] = self.default_app_gh
 
     def say(self, text: str) -> None:
         self.lines.append(text)
@@ -619,6 +632,7 @@ class Watcher:
         items = cli.inbox_items(issue_comments, review_comments, snap, me, since, "",
                                 cache.load_seen_ids(self.gh.repo, me))
         payloads = {c.get("id"): marker.decode(c.get("body")) for c in issue_comments}
+        self.issue_comments = issue_comments  # reviewer.py finds `@inisa-sidechain review` here
         reasons += message_reasons(items, payloads)
         if slow:
             reasons += stuck_reasons(snap, self.now)
@@ -697,6 +711,11 @@ class Watcher:
         for item in todo:
             self.say(f"  {'*' if item['wake'] else ' '} [{item['kind']}] {_clip(item['summary'], 140)}")
         if dry_run:
+            from . import reviewer
+            asked = [r for r in reviewer.requests(self.issue_comments or [])
+                     if (self.state.get("reviews") or {}).get(str(r["id"]), {}).get("status") not in ("done", "skipped", "failed")]
+            for request in asked:
+                self.say(f"  review requested on #{request['pr']} ({request['model'] or request['error']}) {request['url']}")
             return
 
         extra: Dict[str, Any] = {"pending": len(todo), "disk": None if free is None else round(free),
@@ -716,6 +735,7 @@ class Watcher:
                    else f"{wakes_today} wakes in 24 h, the cap is {self.config.max_wakes_per_day}"
                    if wakes_today >= self.config.max_wakes_per_day
                    else "API budget too low for a run" if not can_read else "")
+        woke = False
         if wakeable and blocked:
             self.say(f"not waking: {blocked}")
             if tampered and github_ok and self.state.get("tamperEscalated") != tampered:
@@ -730,6 +750,7 @@ class Watcher:
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
         elif wakeable:
+            woke = True
             self.state.pop("capEscalated", None)
             self.state.pop("tamperEscalated", None)
             ended = self.previous_outage(windows)
@@ -739,11 +760,37 @@ class Watcher:
                 self.post_outage(result["limit"])
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
+        if leader and github_ok and can_read and self.issue_comments is not None and not woke:
+            self.review_step(windows, down, pause, wake)
         if github_ok and can_write:
             try:
                 self.beat(leader, extra)
             except GitHubError as error:
                 self.say(f"heartbeat failed: {_clip(str(error), 120)}")
+
+    def default_app_gh(self) -> Optional[GitHub]:
+        """A GitHub on the inisa-sidechain app for posting reviews, or None when app mode is
+        off on this machine (reviews are then held; they are never posted as Alex)."""
+        from . import cli
+        app_gh = GitHub(self.gh.repo)
+        cli.attach_app(app_gh)
+        return app_gh if app_gh.app is not None else None
+
+    def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
+                    pause: Optional[Dict[str, Any]], wake: bool) -> None:
+        """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
+        from . import reviewer
+        blocked = ("waking is off (--no-wake)" if not wake
+                   else f"Claude is down until {iso(down['end'])}" if down
+                   else f"paused until {pause['until']}" if pause else "")
+        if not blocked and reviewer.requests(self.issue_comments or []):
+            tampered = self.tampered()
+            blocked = f"the conductor's own controls are modified in its checkout: {tampered}" if tampered else ""
+        jobs = reviewer.Reviews(self, None)
+        if not jobs.pending(self.issue_comments or []):
+            return
+        jobs.app = None if blocked else self.app_gh_factory()
+        jobs.step(self.issue_comments or [], windows, blocked)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The most recent claude outage when it has run out and nobody has posted its

@@ -863,6 +863,12 @@ def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
                          f"{wake.get('seconds')}s: {render._clip(wake.get('summary') or '', 90)}")
     else:
         lines += ["", f"THIS MACHINE ({config.agent}): no wakes recorded in {config.state_dir}"]
+    reviews = conductor.read_wakes(config, name="reviews.jsonl")
+    if reviews:
+        lines += ["", "REVIEWS (@inisa-sidechain review; newest last)"]
+        for entry in reviews[-args.last:]:
+            lines.append(f"  {entry.get('at')} #{entry.get('pr')} {str(entry.get('head') or '')[:9]} {entry.get('model')} "
+                         f"{'ok' if entry.get('ok') else 'FAILED'} {entry.get('seconds')}s")
     print("\n".join(lines))
     return EXIT_OK
 
