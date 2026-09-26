@@ -674,9 +674,11 @@ class CodexRoundThreeTests(unittest.TestCase):
         [comment] = snapshot.fetch_coord_comments(Fake(), NOW)
         self.assertEqual(comment["author"], {"login": "inisa-sidechain[bot]", "type": "Bot"})
 
-    def run_review(self, argv):
-        """Run a `train review`-style command against a fake PR whose head is `abc…`;
-        return the calls made and the posted record's payload and text."""
+    HEAD = "abc" + "0" * 37  # the fake PR's current head
+
+    def run_attestation(self, argv):
+        """Run an attestation command against a fake PR whose head is HEAD; return
+        (exit code, the calls made, stderr)."""
         calls = []
 
         class Fake:
@@ -684,20 +686,65 @@ class CodexRoundThreeTests(unittest.TestCase):
 
             def rest(self, path, method="GET", body=None):
                 calls.append((method, path, body))
-                return {"head": {"sha": "abc" + "0" * 37}} if method == "GET" else {"html_url": "h"}
+                return {"head": {"sha": CodexRoundThreeTests.HEAD}} if method == "GET" else {"html_url": "h"}
 
         args = cli.parser().parse_args(argv)
-        with open(os.devnull, "w") as quiet:
-            saved, sys.stdout = sys.stdout, quiet
-            try:
-                self.assertEqual(args.func(args, Fake()), 0)
-            finally:
-                sys.stdout = saved
+        out, err = io.StringIO(), io.StringIO()
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            code = args.func(args, Fake())
+        finally:
+            sys.stdout, sys.stderr = saved
+        return code, calls, err.getvalue()
+
+    def run_review(self, argv):
+        """Run an attestation that must succeed; return the calls made and the posted
+        record's payload and text."""
+        code, calls, err = self.run_attestation(argv)
+        self.assertEqual(code, 0, err)
         [body] = [body["body"] for method, path, body in calls if path == "repos/{repo}/issues/101/comments"]
         return calls, marker.decode(body), marker.strip(body)
 
+    def test_every_attestation_records_the_full_head_it_names(self):
+        for argv, kind in ((["train", "review", "101", "--by", "x", "--note", "n"], "review-clean"),
+                           (["train", "substitute-review", "101", "--note", "n"], "review-clean"),
+                           (["train", "approve", "101", "--note", "n"], "alex-approve")):
+            for given in ("abc0000", self.HEAD, "ABC0000000"):
+                with self.subTest(command=argv[1], head=given):
+                    _, payload, _ = self.run_review(argv[:3] + ["--head", given] + argv[3:])
+                    self.assertEqual((payload["kind"], payload["head"]), (kind, self.HEAD))
+
+    def test_every_attestation_refuses_a_head_the_pr_has_moved_past(self):
+        for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
+                     ["train", "substitute-review", "101", "--note", "n"],
+                     ["train", "approve", "101", "--note", "n"]):
+            with self.subTest(command=argv[1]):
+                code, calls, err = self.run_attestation(argv[:3] + ["--head", "def1234"] + argv[3:])
+                self.assertEqual(code, cli.EXIT_CONFLICT)
+                self.assertEqual([c for c in calls if c[0] != "GET"], [], "nothing posted, no label")
+                self.assertIn(self.HEAD, err)
+                self.assertIn("def1234", err)
+
+    def test_every_attestation_needs_a_head(self):
+        for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
+                     ["train", "substitute-review", "101", "--note", "n"],
+                     ["train", "approve", "101", "--note", "n"],
+                     ["train", "approve", "101", "--head", "abc12", "--note", "n"],       # too short
+                     ["train", "approve", "101", "--head", "not-a-sha", "--note", "n"]):
+            with self.subTest(argv=argv):
+                with open(os.devnull, "w") as quiet:
+                    saved, sys.stderr = sys.stderr, quiet
+                    try:
+                        with self.assertRaises(SystemExit) as raised:
+                            cli.parser().parse_args(argv)
+                    finally:
+                        sys.stderr = saved
+                self.assertEqual(raised.exception.code, cli.EXIT_USAGE)
+
     def test_train_review_records_the_head_and_the_reviewing_agent(self):
-        calls, payload, text = self.run_review(["train", "review", "101", "--by", "agy@h:gemini", "--note", "all clear"])
+        calls, payload, text = self.run_review(["train", "review", "101", "--head", "abc0000", "--by", "agy@h:gemini",
+                                                "--note", "all clear"])
         self.assertEqual((payload["kind"], payload["pr"], payload["head"], payload["by"]),
                          ("review-clean", 101, "abc" + "0" * 37, "agy@h:gemini"))
         self.assertIn("by `agy@h:gemini`", text)
@@ -710,10 +757,11 @@ class CodexRoundThreeTests(unittest.TestCase):
         self.assertFalse(any("codex-unavailable" in json.dumps(body) for _, _, body in calls), "a retired label")
 
     def test_substitute_review_is_the_same_command_by_its_old_name(self):
-        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--note", "reviewed by X"])
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", "abc0000", "--note", "by X"])
         self.assertEqual((payload["kind"], payload["head"]), ("review-clean", "abc" + "0" * 37))
         self.assertNotIn("by", payload, "no --by, so no reviewer is named in the record")
-        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--by", "codex", "--note", "n"])
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", "abc0000", "--by", "codex",
+                                         "--note", "n"])
         self.assertEqual(payload["by"], "codex")
 
     def test_train_review_needs_the_reviewing_agent(self):
@@ -721,7 +769,7 @@ class CodexRoundThreeTests(unittest.TestCase):
             saved, sys.stderr = sys.stderr, quiet
             try:
                 with self.assertRaises(SystemExit):
-                    cli.parser().parse_args(["train", "review", "101", "--note", "n"])
+                    cli.parser().parse_args(["train", "review", "101", "--head", "abc0000", "--note", "n"])
             finally:
                 sys.stderr = saved
 

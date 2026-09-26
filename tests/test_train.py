@@ -116,7 +116,7 @@ class EligibilityTests(unittest.TestCase):
         verdict, hold, reason = train.assess(self.unreviewed())
         self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW))
         self.assertIn("no clean review of it recorded", reason)
-        self.assertIn("coord train review 1 --by <agent>", reason)
+        self.assertIn("coord train review 1 --head aaaaaaaaa --by <agent>", reason)
         self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
 
     def test_codex_re_reviewing_still_holds_a_recorded_review(self):
@@ -155,6 +155,19 @@ class EligibilityTests(unittest.TestCase):
                     1, 1, 5, {"kind": "alex-approve", "pr": 1, "head": head}, author)], REPO)
                 self.assertEqual(train.assess(approval)[:2], (train.READY, "") if counts else
                                  (train.HOLD, train.HOLD_NEEDS_ALEX))
+
+    def test_a_record_counts_only_on_the_pr_it_names(self):
+        # A trusted record posted on #5 that names #7 is not a record on #7 (the step
+        # reads only #7's own comments, so the snapshot must agree).
+        for kind, labels in (("review-clean", ["train"]), ("alex-approve", ["train", "needs-alex", "alex-approved"])):
+            with self.subTest(kind=kind):
+                pr = self.unreviewed(number=7, labels=labels)
+                if kind == "alex-approve":
+                    pr["codex"] = {"approved": True}
+                snapshot.attach_head_records([pr], [coord_comment(
+                    1, 5, 5, {"kind": kind, "pr": 7, "head": pr["head"]})], REPO)
+                self.assertEqual((pr["reviewedHead"], pr["alexApprovedHead"]), (None, None))
+                self.assertEqual(train.eligibility(pr)[0], train.HOLD)
 
     def test_an_untrusted_record_never_displaces_a_trusted_one(self):
         pr = self.unreviewed()
@@ -1169,7 +1182,7 @@ class StepTests(unittest.TestCase):
         self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
         self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
         self.assertIn("waits for Alex", text, "the reason")
-        self.assertIn("coord train approve 1", text, "the action that clears it")
+        self.assertIn(f"coord train approve 1 --head {self.H1[:9]}", text, "the action that clears it, at this head")
         [(payload, _)] = self.held(fake, 2)
         self.assertEqual(payload["to"], ["conductor@*"], "no agent on record: the conductor still hears")
 

@@ -350,9 +350,9 @@ class HardFloorTests(BudgetTestCase):
     def test_writes_are_refused(self):
         gh = self.silent_http()
         for argv in (["claim", "5", "--branch", "feature/x"], ["release", "5"], ["train", "add", "7"],
-                     ["train", "remove", "7"], ["train", "substitute-review", "7", "--note", "n"],
-                     ["train", "review", "7", "--by", "x", "--note", "n"],
-                     ["train", "approve", "7", "--note", "n"], ["ci", "mk4", "--ref", "feature/x"]):
+                     ["train", "remove", "7"], ["train", "substitute-review", "7", "--head", "aaaaaaa", "--note", "n"],
+                     ["train", "review", "7", "--head", "aaaaaaa", "--by", "x", "--note", "n"],
+                     ["train", "approve", "7", "--head", "aaaaaaa", "--note", "n"], ["ci", "mk4", "--ref", "feature/x"]):
             code, out, err = self.run_cli(argv, gh)
             self.assertEqual(code, EXIT_BUDGET, argv)
             self.assertIn(f"GitHub API budget low: 100 left until {budget.clock(BILLING_RESET)}; not running", err)

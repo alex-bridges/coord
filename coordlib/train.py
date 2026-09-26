@@ -91,10 +91,10 @@ HOLD_ACTIONS = {
     HOLD_DRAFT: "Mark it ready for review, or take it out with `Tools/coord/coord train remove {pr}`.",
     HOLD_PARTIAL_DATA: ("The train never merges a PR it cannot read whole, so this one stays held at this head. "
                         "Alex decides: merge it by hand, or take it out of the train."),
-    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} --note \"…\"`, or tell an "
-                      "agent to), or take it out of the train. A new push needs a new approval."),
+    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} --head {head} --note \"…\"`, "
+                      "or tell an agent to), or take it out of the train. A new push needs a new approval."),
     HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head, or a clean review of this head by any agent, recorded "
-                     "with `Tools/coord/coord train review {pr} --by <agent> --note \"…\"`."),
+                     "with `Tools/coord/coord train review {pr} --head {head} --by <agent> --note \"…\"`."),
     HOLD_UNANSWERED_FINDINGS: ("Answer every finding on the PR. If answering means a push, add the new head "
                                "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
     HOLD_CI_RED: ("Fix the failing checks, or re-run them if they flaked. A fix is a new push: add the new head "
@@ -172,7 +172,7 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         head = str(pr.get("head"))[:9]
         if not reviewed:
             return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head} and no clean review of it recorded "
-                                          f"(`coord train review {pr.get('number')} --by <agent>`)")
+                                          f"(`coord train review {pr.get('number')} --head {head} --by <agent>`)")
         if reviewed != pr.get("head"):
             return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head}, and the recorded clean review "
                                           f"covers {str(reviewed)[:9]}, an older head; a new push needs a new review")

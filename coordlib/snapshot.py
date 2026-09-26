@@ -765,12 +765,14 @@ def trusted_attestation(author: Optional[Dict[str, Any]], repo: str) -> bool:
 def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]], repo: str) -> None:
     """Set each PR's `reviewedHead` and `alexApprovedHead`: the head its newest
     review-clean or review-substitute / alex-approve comment names, counting only
-    comments a trusted user posted (trusted_attestation)."""
+    comments a trusted user posted (trusted_attestation) on the PR the record names,
+    as train_step.train_added does."""
     latest: Dict[Tuple[int, str], str] = {}
     for comment in comments:  # oldest first
         payload = comment["payload"]
         field = HEAD_RECORDS.get(payload.get("kind"))
-        if field and isinstance(payload.get("pr"), int) and trusted_attestation(comment.get("author"), repo):
+        on_its_pr = isinstance(payload.get("pr"), int) and comment.get("on") == payload["pr"]
+        if field and on_its_pr and trusted_attestation(comment.get("author"), repo):
             latest[(payload["pr"], field)] = payload.get("head")
     for pr in prs:
         for field in set(HEAD_RECORDS.values()):
