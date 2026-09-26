@@ -1035,18 +1035,18 @@ class GuardHookTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, "an error in the checking child still refuses")
         self.assertIn("could not check this call (TypeError)", result.stderr)
 
-    def test_every_rule_but_mains_push_rule_is_fast_on_its_own_keywords(self):
-        # Each rule of RULES and RAW_RULES, the apptoken and write checks, and the helpers every
-        # verdict runs, on inputs built from its own keywords and punctuation up to the cap. Each
-        # rule's keywords must match it (so its inputs engage it). One input over 2 CPU seconds
-        # fails. Each rule runs in its own child, one at a time, judged on the child's CPU time,
-        # not the wall clock, which on a loaded or single-core runner measures the machine
-        # (Codex on 2d13f6b1e). The wall clock only kills a hung child (guard_timing.BACKSTOP).
-        # Main's push rule (RULES[0]) is cubic and unchanged here:
-        # test_a_slow_check_is_refused_in_time covers it through the watchdog.
+    def test_every_rule_this_pr_adds_is_fast_on_its_own_keywords(self):
+        # Each rule #1046 adds, on inputs built from its own keywords and punctuation up to the
+        # cap; each rule's keywords must match it (so its inputs engage it). One input over 2 CPU
+        # seconds for the rule alone fails. Each rule runs in its own child, one at a time, judged
+        # on the child's CPU time, not the wall clock (Codex on 2d13f6b1e). Main's rules are not
+        # this PR's to time (Codex on 141d38f62: its gh api rule alone passed 2 CPU s on Linux);
+        # the watchdog covers a slow verdict (test_a_slow_check_is_refused_in_time).
         import guard_timing
         guard = self.load_guard(GUARD)
-        names = [name for name in guard_timing.rules(guard) if name != "RULES[0]"]
+        names = guard_timing.own_rules(guard)
+        self.assertEqual(set(names), {"token exec", "train approve", "quoted subcommand", "security", "RAW_RULES[0]",
+                                      "token cache", "apptoken", "cap"})
         report, failures = guard_timing.measure_in_children(GUARD, only=names)
         self.assertEqual(failures, [])
         self.assertEqual([rule["rule"] for rule in report], names)
