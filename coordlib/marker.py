@@ -1,7 +1,8 @@
 """The machine marker that makes a GitHub comment a coord record.
 
-Every agent posts as the same login (alex-bridges), so the comment author says
-nothing about which agent wrote it. The marker does:
+Every agent posts as the same login: Alex's (alex-bridges), or in app mode the GitHub
+App's (inisa-sidechain[bot], gh.py). Either way the comment author says nothing about
+which agent wrote it. The marker does:
 
     <!-- coord:v1 {"agent":"claude@Eidolon:agent-coord","issue":980,"kind":"claim",...} -->
 

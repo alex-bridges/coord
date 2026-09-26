@@ -34,7 +34,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
 from . import marker, snapshot, train
-from .gh import GitHub, GitHubError, NotFound
+from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
 # The Actions train's agent id (COORD_AGENT in merge-train.yml). A step run by hand
@@ -271,8 +271,9 @@ class Step:
         """Whether a `kind: train` record counts as already said (a held notice, a receipt).
 
         (a) The Actions train's record: the marker names TRAIN_AGENT AND GitHub lists
-            github-actions[bot] as its author. Every agent posts as alex-bridges and can
-            write any marker, so neither half alone proves anything (review of #1037).
+            github-actions[bot] as its author. Every agent posts as alex-bridges (or, in
+            app mode, as the GitHub App) and can write any marker, so neither half alone
+            proves anything (review of #1037).
         (b) On a hand run only (this step's agent is not TRAIN_AGENT): the run's own
             earlier records, by marker agent, so hand runs repeat nothing either.
             Never on the Actions train, where it would let a `train@actions` marker from
@@ -736,5 +737,7 @@ def ensure_labels(gh: GitHub) -> None:
     for name, (color, description) in train.LABELS.items():
         try:
             gh.rest("repos/{repo}/labels", method="POST", body={"name": name, "color": color, "description": description})
+        except AppAuthError:
+            raise  # no app token is not "the label exists"
         except GitHubError:
             pass  # exists

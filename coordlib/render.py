@@ -24,6 +24,13 @@ def ago(value: Optional[str], now: dt.datetime) -> str:
     return f"{hours // 24}d"
 
 
+def stale_words(snapshot: Dict[str, Any]) -> str:
+    """A cached board served because nothing fresher could be read (cli.snapshot_despite_budget):
+    `STALE: snapshot from 3h ago; GitHub App token unavailable: …`."""
+    stale = snapshot.get("stale") or {}
+    return f"STALE: snapshot from {stale.get('ago', '?')} ago; {stale.get('reason', '')}".rstrip("; ")
+
+
 def _clip(text: str, width: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= width else text[: width - 1] + "…"
@@ -160,6 +167,7 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
         f"{snapshot['repo']} board · main {snapshot['main'].get('sha', '')[:9]} · "
         f"{snapshot['generatedAt']} · {snapshot.get('apiCalls', '?')} API calls{cache}"
         + (f" · {budget}" if budget else "")
+        + (f" · {stale_words(snapshot)}" if snapshot.get("stale") else "")
     )
     lines.append(f"you: {me}")
     for window in active_outages(snapshot, now):
@@ -237,7 +245,7 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     now = review.parse_time(snapshot["generatedAt"]) or dt.datetime.now(dt.timezone.utc)
     runs = snapshot["runs"]
     open_claims = [c for c in snapshot["claims"] if c["pr"] is None]
-    parts = [
+    parts = ([stale_words(snapshot)] if snapshot.get("stale") else []) + [
         f"{len(snapshot['prs'])} open PR" + ("s" if len(snapshot["prs"]) != 1 else ""),
         f"{len(open_claims)} claim" + ("s" if len(open_claims) != 1 else "") + " without a PR",
         f"workflow runs {len(runs['running'])} running / {len(runs['queued'])} queued",

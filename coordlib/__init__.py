@@ -3,7 +3,8 @@
 Everything here reads GitHub state and computes a picture from it. The only
 writes are ordinary GitHub comments carrying a machine marker (see marker.py):
 claims, releases and messages. Nothing is locked and nothing is stored outside
-GitHub except a short-lived local cache.
+GitHub except a short-lived local cache (and, in app mode, the GitHub App's tokens:
+apptoken.py).
 """
 
 EXIT_OK = 0

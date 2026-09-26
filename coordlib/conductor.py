@@ -45,7 +45,7 @@ import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import budget, cache, identity, lease, marker, outage, review, snapshot, train
-from .gh import GitHub, GitHubError
+from .gh import AppAuthError, GitHub, GitHubError
 
 TRIAGE_MODEL = "sonnet"
 REPAIR_MODEL = "opus"
@@ -75,6 +75,12 @@ DENY = [
     # Mid-command forms; prefix rules alone missed `git push origin --force` and an API
     # merge (substitute review of #1043). .claude/hooks/conductor-guard.py is the backstop.
     "Bash(git push * --force*)", "Bash(git push * -f*)", "Bash(gh api * pulls/*/merge*)", "Bash(* train approve*)",
+    # A GitHub App token in a shell (#1035); the guard also blocks the Keychain item, the
+    # token cache and apptoken one-liners. The guard sees Bash; these Read rules keep the
+    # Read tool out of the token cache (`~/` is home in Claude Code's Read rules, `//` is an
+    # absolute path, so the second holds whatever HOME the run has).
+    "Bash(* token exec*)",
+    "Read(~/Library/Caches/inisa-coord/**)", "Read(//Users/*/Library/Caches/inisa-coord/**)",
 ]
 FAILED = ("failure", "timed_out", "startup_failure")
 
@@ -453,6 +459,8 @@ def conductor_issue(gh: GitHub, create: bool = True) -> Optional[int]:
     try:
         gh.rest("repos/{repo}/labels", method="POST", body={
             "name": lease.CONDUCTOR_LABEL, "color": "0e8a16", "description": "coord: the conductor's records"})
+    except AppAuthError:
+        raise  # `coord outage` runs on the app: no token is not "the label exists"
     except GitHubError:
         pass  # already exists
     issue = gh.rest("repos/{repo}/issues", method="POST",

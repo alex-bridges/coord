@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -643,7 +644,8 @@ GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..
 class GuardHookTests(unittest.TestCase):
     """.claude/hooks/conductor-guard.py: the substitute reviews of 7afafab1 and 4d3b200b."""
 
-    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None):
+    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None,
+                  full=False):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE", "CLAUDE_PROJECT_DIR")}
         env["HOME"] = os.path.expanduser("~")
         if project:
@@ -651,7 +653,8 @@ class GuardHookTests(unittest.TestCase):
         if agent:
             env["COORD_AGENT"] = agent
         payload = raw if raw is not None else json.dumps({"tool_name": tool, "tool_input": data, "cwd": cwd})
-        return subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env).returncode
+        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env)
+        return result if full else result.returncode
 
     def test_moving_main_merging_and_approving_are_blocked(self):
         for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
@@ -698,6 +701,405 @@ class GuardHookTests(unittest.TestCase):
                          "no command is nothing to run")
         self.assertEqual(self.run_guard("Write", {"file_path": "CLAUDE.md"}, project=None), 2,
                          "without CLAUDE_PROJECT_DIR the call's cwd is the project")
+
+    # The rules #1046 adds (the GitHub App, #1035). Each reads the raw command, quoted strings
+    # included: a quoted script is caught, and so is prose that names the command.
+
+    def test_every_line_of_mains_guard_is_here_in_order(self):
+        # #1046 adds to main's guard and changes none of it: every line of main's guard
+        # (tests/legacy_guard/conductor-guard-59e25cc6f.py, main at 59e25cc6f) is in the guard, in
+        # order. Main's lines are pinned here; test_guard_differential's
+        # test_nothing_mains_guard_blocks_is_allowed_now shows, over its corpus, that the
+        # additions only add refusals (an inserted line could still allow).
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard", "conductor-guard-59e25cc6f.py")
+        with open(path, "rb") as handle:
+            data = handle.read()
+        blob = __import__("hashlib").sha1(b"blob %d\0" % len(data) + data).hexdigest()
+        self.assertEqual(blob, "d0441c4ecc072255a06b189566b7afbbef524f5b", "the copy is main's guard at 59e25cc6f")
+        with open(GUARD, encoding="utf-8") as handle:
+            lines = iter(handle.read().split("\n"))
+        for number, line in enumerate(data.decode("utf-8").split("\n"), 1):
+            self.assertTrue(any(candidate == line for candidate in lines), f"main's line {number} missing: {line!r}")
+
+    def test_coord_token_exec_is_blocked_in_every_form(self):
+        # #1035 review (P3-8): a conductor run must never get a GitHub App token in a shell.
+        for command in ("Tools/coord/coord token exec -- gh pr list",
+                        "Tools/coord/coord token exec --kind ops -- sh -c 'echo $GH_TOKEN'",
+                        "./Tools/coord/coord token exec --kind read -- env",
+                        "/Users/dev/Projects/INISA/Tools/coord/coord token exec -- true",
+                        "python3 Tools/coord/coord token exec -- true", "coord token  exec -- true",
+                        "sh -c 'Tools/coord/coord token exec --kind ops -- env'",
+                        "bash -c \"coord token exec -- gh api user\"", "eval 'coord token exec -- true'",
+                        "cd /tmp && Tools/coord/coord token exec -- true",
+                        "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true",
+                        # coord's top-level --repo before the command (round three, P3-1)
+                        "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
+                        "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
+                        "sh -c 'coord --repo o/r token exec -- env'",
+                        # Round twelve's review (P3-1): every spelling of coord's options that
+                        # argparse takes, before the command and between its two words.
+                        "Tools/coord/coord --rep o/r token exec -- env", "Tools/coord/coord --re=o/r token exec -- env",
+                        "Tools/coord/coord --r o/r token exec -- env",
+                        "Tools/coord/coord --repo a/b --repo o/r token exec -- env",
+                        "Tools/coord/coord --repo= token exec -- env", "Tools/coord/coord -- token exec -- env",
+                        "Tools/coord/coord token -- exec -- env", "Tools/coord/coord --repo o/r -- token -- exec -- env",
+                        # The delta review of 2d13f6b1e (P2-A): argparse runs a quoted or escaped
+                        # subcommand word as the word, so any such spelling is refused.
+                        "coord 'token' exec -- env", 'coord "token" exec -- env', "coord t''oken exec -- env",
+                        "coord tok\\en exec -- env", "coord token 'exec' -- env", "coord $'token' exec -- env",
+                        "sh -c 'coord \"token\" exec'",
+                        # The raw command is read: prose that names the command is refused too.
+                        "gh pr comment 5 -b 'never run coord token exec here'"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("Tools/coord/coord token status", "grep -n 'token exec' Docs/agent-coordination.md",
+                        "Tools/coord/coord --repo example-owner/example-repo token status",
+                        "Tools/coord/coord --repo example-owner/example-repo board", "Tools/coord/coord --rep o/r board",
+                        "Tools/coord/coord -- token status", "Tools/coord/coord send --on 1 'the token exec docs'"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
+                         "outside the conductor the guard is silent")
+
+    def test_train_approve_with_repo_is_blocked(self):
+        # A second rule beside main's `coord train approve` rule, which is unchanged: the same
+        # command with at least one of coord's options in it, in any spelling argparse takes.
+        for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
+                        "coord --repo=o/r train approve 5", "Tools/coord/coord --rep o/r train approve 5 --note x",
+                        "Tools/coord/coord --re=o/r train approve 5 --note x",
+                        "Tools/coord/coord --r o/r train approve 5 --note x",
+                        "Tools/coord/coord --repo a/b --repo o/r train approve 5 --note x",
+                        "Tools/coord/coord --repo= train approve 5 --note x",
+                        "Tools/coord/coord -- train approve 5 --note x", "Tools/coord/coord train -- approve 5 --note x",
+                        "Tools/coord/coord --repo o/r 'train' approve 5 --note x",
+                        "Tools/coord/coord --repo o/r train 'approve' 5 --note x", "coord 'train' approve 5"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("Tools/coord/coord --repo o/r train status", "Tools/coord/coord --rep o/r train add 5",
+                        "Tools/coord/coord -- train status"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_a_quoted_or_escaped_coord_subcommand_is_refused(self):
+        # The shell's quoting is not decoded; no real command quotes its subcommand. The quotes
+        # of a later argument are not the subcommand's.
+        for command in ("coord 'board'", "coord --repo 'o/r' board", "coord $CMD", "coord train \"status\"",
+                        "coord \\\n'token' exec"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("a coord subcommand spelled with quotes or escapes", result.stderr, command)
+        for command in ("coord send 'a quoted message'", 'coord send --on 5 "x"',
+                        "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'",
+                        "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
+                        "Tools/coord/coord claim 991 --note 'on it'", "Tools/coord/coord --repo o/r board",
+                        # A newline ends the coord command; the next line's quotes are its own.
+                        "Tools/coord/coord board\n\"$CONDUCTOR_STATE_DIR/run.sh\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_keychain_is_blocked(self):
+        # The app's private key: `security find-generic-password -s example-coord-github-app -w`
+        # prints it without a prompt to any process running as Alex. `security` runs the FIRST
+        # command in its table that its word is a prefix of (`security help` lists the table):
+        # `f` is find-generic-password, `find-i` find-internet-password (before find-identity),
+        # `du` dump-keychain, `e` export. -i and -p read commands from stdin.
+        for command in ("security find-generic-password -s example-coord-github-app -w",
+                        "/usr/bin/security find-generic-password -s 'example-coord-github-app' -a x -w",
+                        "security find-internet-password -s github.com -w", "security dump-keychain -d",
+                        "security export -k login.keychain -o /tmp/k.p12", "sh -c 'security find-generic-password -w'",
+                        "x=$(security find-generic-password -s example-coord-github-app -w)",
+                        "cd /tmp && security find-generic-password -ga inisa", "security find-g -s x -w",
+                        "security find-generic -w", "security dump-k",
+                        # Round twelve's review (P2-1): any prefix, and interactive mode.
+                        "security f -s x -w", "security fi -s x -w", "security find -s x -w", "security find- -s x -w",
+                        "security du -d", "security dump -d", "security dump- -d",
+                        "security e -k login.keychain -t privKeys -o /tmp/k", "security expor -t privKeys",
+                        "security find-i -w", "security find-k", "security export-smartcard",
+                        "/usr/bin/security f -a client-id -w", "security -i", "security -q -i", "security -p 'k> '",
+                        "printf 'find-generic-password -w\\n' | security -i", "security -v find-g -s x",
+                        "security -- find-generic-password -w",
+                        # The command word is found past redirections and quotes; one built at run
+                        # time is refused.
+                        "security 2>/dev/null f -w", "security > /dev/null find-generic-password -w",
+                        "security &>/dev/null f -w", "security f>/tmp/o -w", "security 'f' -w", "security \"find\" -w",
+                        "security $CMD -w", "security $(echo f) -w", "security `echo f` -w", "security f* -w",
+                        "security {find-generic-password,x}", "(security f -w)", "true && security du -d",
+                        # The delta review of 2d13f6b1e (P2-B): escapes are not decoded, so `$` or a
+                        # backslash in a word up to the command word is refused.
+                        "security $'\\x64ump-keychain' -d", "security $'\\x66ind-generic-password' -w",
+                        "security $'\\145xport' -k login.keychain -t privKeys -o /tmp/k", "security -$X",
+                        "security \\-i", "security fin\\d -w",
+                        # The raw command is read: prose that names the command is refused too.
+                        "grep -n 'security find-generic-password' Docs/agent-coordination.md",
+                        "gh pr comment 5 -b 'the key is read with security find-generic-password'"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("security list-keychains", "security show-keychain-info",
+                        "grep -rn security Tools/coord/coordlib/apptoken.py", "security find-certificate -a",
+                        "security find-identity -v -p codesigning", "security verify-cert -c x.pem", "security help",
+                        "security -h", "security dump-trust-settings", "gh pr comment 5 -b 'the security fix landed'",
+                        "echo securityexport"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_a_security_the_shell_assembles_is_refused(self):
+        # Codex on a774ba186 (P1), the third review in a row whose P1 is a shell spelling: with
+        # every quote, backslash and `$` deleted, the command names `security` more often than
+        # it does as written, so the shell assembles the program name. Refused whatever follows.
+        for command in ('"security" dump-keychain -d', "secu\\rity dump-keychain", "'security' du", 's"ec"urity f -w',
+                        '/usr/bin/"security" e', "sec$'u'rity dump-keychain", "\\security dump-keychain",
+                        "\"security\" $'\\x64ump-keychain'", "'security' list-keychains",
+                        # The cost: prose that quotes the name.
+                        "git commit -q -m 'fix the \"security\" wording'"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("`security` spelled with quotes or escapes", result.stderr, command)
+            self.assertIn("write such text with the Write tool", result.stderr, command)
+        for command in ("security list-keychains", "grep -rn security Tools/coord/coordlib/apptoken.py",
+                        "gh pr comment 5 -b 'the security fix landed'", "echo securityexport"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_token_cache_is_blocked(self):
+        # Codex on 141d38f62 (P1): a path has spellings no pattern keeps up with, so the rule is
+        # co-occurrence, like apptoken's: `inisa` and `cache` anywhere in the case-folded command.
+        for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
+                        "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
+                        "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/",
+                        "cat ~/library/caches/INISA-COORD/ops.json", "cat ~/Library//Caches/inisa-coord/read.json",
+                        "cat ~/Library/Caches/./inisa-coord/ops.json", "cat ~/Library/Caches/inisa*/ops.json",
+                        "cat ~/Library/Caches/INISA-COORD/ops.json", "cd ~/Library/Caches && cat inisa-coord/ops.json",
+                        # The cost, as for apptoken: any command that names both, the budget cache and
+                        # prose included. The way out is the Write tool.
+                        "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("`inisa` and `cache` in one command", result.stderr, command)
+            self.assertIn("write such text with the Write tool", result.stderr, command)
+        for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
+        for command in ("python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
+                        "'-s', 'example-coord-github-app', '-w'])\"",
+                        "'security' find-generic-password -s example-coord-github-app -w",
+                        "env x=1 bash -c \"security find-generic-password -s example-coord-github-app\"",
+                        # Matched without case, which fails closed whether or not the Keychain's
+                        # lookup ignores it.
+                        "python3 -c \"import subprocess; subprocess.run(['security', 'find-generic-password', "
+                        "'-s', 'Example-Coord-GitHub-App'])\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token status"}), 0)
+
+    def test_python_and_apptoken_in_one_command_are_blocked(self):
+        # Round eight of the #1046 review: the rule is co-occurrence on the raw command. Two
+        # rounds of parsing pipelines and heredocs failed open, so nothing is parsed.
+        heredoc = "<<'EOF'\nimport coordlib.apptoken\nEOF"
+        for command in ("python3 -c 'from coordlib import apptoken; print(apptoken.AppTokens)'",
+                        "cd Tools/coord && python3 -c \"import coordlib.apptoken as a\"",
+                        "python3 -B -c 'from coordlib.apptoken import AppTokens'",
+                        "/usr/bin/python3 -c 'import coordlib.apptoken'",
+                        "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF",
+                        "python3 -c 'import sys; from coordlib import apptoken'",
+                        "true && python3 -c 'from coordlib.apptoken import AppTokens'",
+                        "echo 'from coordlib import apptoken' | python3 -",
+                        "printf 'import coordlib.apptoken\\n' | python3 -",
+                        "cat <<EOF | python3 -\nfrom coordlib import apptoken\nEOF",
+                        "echo 'import coordlib.apptoken' | python3", "python3 <<EOF\nimport coordlib.apptoken\nEOF",
+                        "echo 'import coordlib.apptoken' | /usr/bin/python3 -B -",
+                        "python3 -c 'print(\"it'\\''s\"); import coordlib.apptoken'",
+                        "python3 -c $'print(\\'x\\'); import coordlib.apptoken'",
+                        "timeout 30 python3 - " + heredoc, "( python3 - " + heredoc + "\n)",
+                        "{ python3 - " + heredoc + "\n}", "/usr/bin/env python3 - " + heredoc,
+                        "cd Tools/coord && timeout 60 python3 - <<'EOF'\nfrom coordlib.apptoken import AppTokens\nEOF",
+                        "python3 - 2>&1 " + heredoc, "python3 -X utf8 - " + heredoc, "python3 /dev/stdin " + heredoc,
+                        "echo 'import coordlib.apptoken' | python3 - 2>&1",
+                        "echo 'import coordlib.apptoken' | nice -n 5 python3",
+                        "echo 'import coordlib.apptoken' | env GREETING='hi there' python3",
+                        "bash <<'X'\npython3 - <<'Y'\nimport coordlib.apptoken\nY\nX",
+                        "python3 -c 'import sys; exec(sys.stdin.read())' " + heredoc,
+                        # Round seven's parser took these `<<`s for heredocs, and missed what followed.
+                        "echo \"<<X\"\npython3 - " + heredoc, "true # <<X\npython3 - " + heredoc,
+                        "echo $((1<<2))\npython3 - " + heredoc, "cat <<$'Z'\nhi\nZ\npython3 - " + heredoc,
+                        "python3 - <<'EOF'\r\nimport coordlib.apptoken\r\nEOF\r\n",
+                        # The test module's name is exempt, nothing else in the command is.
+                        "python3 -m unittest test_apptoken; python3 - <<'Y'\nimport coordlib.apptoken\nY",
+                        "echo 'import coordlib.apptoken' | /opt/homebrew/bin/python3t -",
+                        # macOS's filesystem ignores case: these run python3.
+                        "Python3 - <<'Y'\nimport coordlib.apptoken\nY",
+                        "/usr/bin/PYTHON3 -c 'import coordlib.apptoken'",
+                        # Matched on the NFKC, case-folded command. Python reads identifiers in NFKC,
+                        # and PYTHONCASEOK=1 imports ignore case.
+                        "python3 -c 'print(AppTokens)'", "PYTHONCASEOK=1 python3 -c 'import coordlib.APPTOKEN as t'",
+                        "python3 -c 'import coordlib.\uff41pptoken'",
+                        "python3 -c 'import coordlib.\U0001d41a\U0001d429\U0001d429\U0001d42d\U0001d428\U0001d424\U0001d41e\U0001d427'",
+                        # The exemption is the test module's name only.
+                        "python3 -c 'import coordlib.xtest_apptoken'"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+
+    def test_prose_that_names_python_and_apptoken_is_refused_with_the_way_out(self):
+        # The cost of not parsing, accepted in round eight: it fails closed, and says what to do.
+        for command in ("python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py",
+                        "python3 -c 'print(1)' | grep -c apptoken", "grep -rn apptoken Tools/coord | grep python3",
+                        "gh pr view 5 --json files | python3 -m json.tool | grep apptoken",
+                        "git commit -q -F - <<'EOF'\ncoord: don't let apptoken run from python3 stdin\nEOF",
+                        "gh pr create --title x --body-file - <<'EOF'\nThe guard's apptoken check for python3 stdin.\nEOF",
+                        "Tools/coord/coord send --on 1046 'the apptoken test'\\''s python3 run is green'"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("write it with the Write tool (for example under $CONDUCTOR_STATE_DIR) and pass the file "
+                          "(--body-file / -F", result.stderr, command)
+        # Every shell way to write such text is refused, so the Write tool is the way: the guard
+        # checks only its path. The state directory is the watcher's default (conductor.Config:
+        # $XDG_STATE_HOME or ~/.local/state, then inisa-conductor).
+        note = os.path.join(os.path.expanduser("~"), ".local", "state", "inisa-conductor", "note.md")
+        for path in (note, "$CONDUCTOR_STATE_DIR/note.md"):
+            self.assertEqual(self.run_guard("Write", {"file_path": path, "content": "python3 cannot import apptoken"}), 0)
+        for command in (f"gh pr create --title x --body-file {note}", f"git commit -q -F {note}",
+                        f"Tools/coord/coord send --on 1046 \"$(cat {note})\"",
+                        "gh pr create --title x --body-file \"$CONDUCTOR_STATE_DIR/note.md\""):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_test_runner_and_the_conductors_own_commands_are_allowed(self):
+        for command in ("python3 -m unittest test_apptoken", "python3 -m unittest discover -s Tools/coord/tests",
+                        "cd Tools/coord/tests && python3 -W ignore -m unittest test_apptoken 2>&1 | tail -3",
+                        "grep -rn apptoken Tools/coord", "Tools/coord/coord send --on 1 'the apptoken test passed'",
+                        "grep -n AppTokens Tools/coord/coordlib/apptoken.py", "python3 -c 'print(1)'",
+                        "git log --oneline -- Tools/coord/coordlib/apptoken.py",
+                        # .claude/agents/conductor.md
+                        "cat \"$CONDUCTOR_STATE_DIR/notes.md\"", "Tools/coord/coord inbox", "Tools/coord/coord board",
+                        "Tools/coord/coord board --json | python3 -m json.tool | head -50",
+                        "Tools/coord/coord send --on 1046 'the train is moving again'",
+                        "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'", "Tools/coord/coord claim 991",
+                        "Tools/coord/coord train add 1046", "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
+                        "Tools/coord/coord conductor pause --for 2h", "gh run view 123456 --log-failed | tail -80",
+                        "tail -50 ~/Library/Logs/inisa/ci-health.log", "du -xhd1 /Users/dev 2>/dev/null | sort -h",
+                        "git worktree add -b conductor/fix-x ../conductor-fix-x origin/main",
+                        "gh pr diff 1046 -- Tools/coord/coordlib/apptoken.py | head -100"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_a_very_long_command_is_refused_quickly(self):
+        # _QUOTED rescans to the end for each unclosed quote: uncapped, 100,000 characters of
+        # this take ~20 s, past the hook's timeout, which lets the call through.
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": 'echo "' + 'a\\"' * 66665}, "cwd": "/tmp/home"})
+        result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=3)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("longer than 20000 characters", result.stderr)
+        self.assertIn("write long text with the Write tool", result.stderr)
+        self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
+
+    # The watchdog: the verdict comes from a forked child, and a late one is a refusal.
+
+    PADDED = "gh pr merge 5 # " + "git push " * 780  # the review's input, 7,036 characters
+
+    def run_patched_guard(self, code, payload):
+        """The guard with `code` run just before main(), in a child with a 15 s cap."""
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        with tempfile.TemporaryDirectory() as folder:
+            patched = os.path.join(folder, "conductor-guard.py")
+            with open(GUARD, encoding="utf-8") as handle:
+                source = handle.read()
+            anchor = '\nif __name__ == "__main__":'
+            self.assertEqual(source.count(anchor), 1)
+            with open(patched, "w", encoding="utf-8") as handle:
+                handle.write(source.replace(anchor, f"\n{code}\n" + anchor))
+            start = time.monotonic()
+            result = subprocess.run([sys.executable, patched], input=payload, capture_output=True, text=True, env=env,
+                                    timeout=15)
+            return result, time.monotonic() - start
+
+    def test_a_slow_check_is_refused_in_time(self):
+        # Main's push rule is cubic in `git push` repeats (unchanged here): the review's padded
+        # input runs for about half a minute. The hook's 10 s timeout would let the call through,
+        # so the watchdog refuses it at DEADLINE_SECONDS (7).
+        start = time.monotonic()
+        result = self.run_guard("Bash", {"command": self.PADDED}, full=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not decide within 7 s", result.stderr)
+        self.assertLess(time.monotonic() - start, 9.5, "inside the hook's 10 s timeout")
+        result = self.run_guard("Bash", {"command": "gh pr merge 5"}, full=True)
+        self.assertIn("merging a PR by hand", result.stderr, "a quick verdict is the real one")
+
+    def test_a_crashed_or_hung_checker_is_a_refusal(self):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp/home"})
+        # A child killed before it answers: no verdict is a refusal, at once.
+        result, took = self.run_patched_guard(
+            "def verdict(payload, env):\n    os.kill(os.getpid(), signal.SIGKILL)", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not check this call (the check exited without a verdict)", result.stderr)
+        self.assertLess(took, 3)
+        # A child that never answers: refused at DEADLINE_SECONDS, not left to the hook's timeout.
+        result, took = self.run_patched_guard("def verdict(payload, env):\n    time.sleep(60)", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not decide within 7 s", result.stderr)
+        self.assertLess(took, 9.5)
+
+    def test_the_parent_never_waits_for_a_stuck_child(self):
+        # A failing select (or a child stuck in I/O) must not keep the parent waiting past the
+        # hook's timeout: it kills the child and refuses at once.
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": self.PADDED}, "cwd": "/tmp/home"})
+        result, took = self.run_patched_guard(
+            "def _broken(*args):\n    raise ValueError('select failed')\nselect.select = _broken", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not check this call (ValueError)", result.stderr)
+        self.assertLess(took, 5, "the slow child was killed, not waited for")
+
+    def test_without_fork_the_guard_refuses(self):
+        # Without a checker there is no deadline to keep, so it refuses.
+        guard = self.load_guard(GUARD)
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp/home"}
+        for name, error in (("fork", OSError("no fork")), ("pipe", OSError("no pipe")), ("fork", AttributeError("fork"))):
+            with mock.patch.object(guard.os, name, side_effect=error):
+                why = guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"})
+            self.assertIn(f"could not start its checker ({error.__class__.__name__})", why)
+        result = self.run_guard("Bash", {}, raw=json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": 5}),
+                                full=True)
+        self.assertEqual(result.returncode, 2, "an error in the checking child still refuses")
+        self.assertIn("could not check this call (TypeError)", result.stderr)
+
+    def test_every_rule_this_pr_adds_is_fast_on_its_own_keywords(self):
+        # Each rule #1046 adds, on inputs built from its own keywords and punctuation up to the
+        # cap; each rule's keywords must match it (so its inputs engage it). One input over 2 CPU
+        # seconds for the rule alone fails. Each rule runs in its own child, one at a time, judged
+        # on the child's CPU time, not the wall clock (Codex on 2d13f6b1e). Main's rules are not
+        # this PR's to time (Codex on 141d38f62: its gh api rule alone passed 2 CPU s on Linux);
+        # the watchdog covers a slow verdict (test_a_slow_check_is_refused_in_time).
+        import guard_timing
+        guard = self.load_guard(GUARD)
+        names = guard_timing.own_rules(guard)
+        self.assertEqual(set(names), {"token exec", "train approve", "quoted subcommand", "security", "RAW_RULES[0]",
+                                      "assembled security", "token cache", "apptoken", "cap"})
+        report, failures = guard_timing.measure_in_children(GUARD, only=names)
+        self.assertEqual(failures, [])
+        self.assertEqual([rule["rule"] for rule in report], names)
+        for rule in report:
+            self.assertGreater(rule["inputs"], 1, rule)
+
+    def test_the_timing_test_catches_a_cubic_rule(self):
+        # The review's known-cubic rule, put into a copy, must be reported.
+        import guard_timing
+        with tempfile.TemporaryDirectory() as folder:
+            cubic = os.path.join(folder, "conductor-guard.py")
+            with open(GUARD, encoding="utf-8") as handle:
+                source = handle.read()
+            anchor = '\nif __name__ == "__main__":'
+            rule = 'RULES.insert(0, (r"\\bgh\\s+api\\b[^\\n;&|]*\\bapi\\b[^\\n;&|]*--force", "cubic"))'
+            with open(cubic, "w", encoding="utf-8") as handle:
+                handle.write(source.replace(anchor, "\n" + rule + "\n" + anchor))
+            report, failures = guard_timing.measure_in_children(cubic, timeout=4, only=["RULES[0]"])
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("RULES[0]", failures[0])
+        self.assertTrue("slower than" in failures[0] or "over the" in failures[0], failures)
+
+    @staticmethod
+    def load_guard(path):
+        spec = __import__("importlib.util").util.spec_from_file_location("guard_" + str(abs(hash(path))), path)
+        guard = __import__("importlib.util").util.module_from_spec(spec)
+        spec.loader.exec_module(guard)
+        return guard
+
+    def test_the_deny_list_names_token_exec(self):
+        self.assertIn("Bash(* token exec*)", conductor.DENY)
+
+    def test_the_deny_list_keeps_the_read_tool_out_of_the_token_cache(self):
+        # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
+        self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
+        self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
