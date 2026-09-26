@@ -633,6 +633,8 @@ class Watcher:
                                 cache.load_seen_ids(self.gh.repo, me))
         payloads = {c.get("id"): marker.decode(c.get("body")) for c in issue_comments}
         self.issue_comments = issue_comments  # reviewer.py finds `@inisa-sidechain review` here
+        from . import reviewer
+        reviewer.Reviews(self, None).remember(issue_comments)  # kept in state: the cursor moves on
         reasons += message_reasons(items, payloads)
         if slow:
             reasons += stuck_reasons(snap, self.now)
@@ -761,7 +763,7 @@ class Watcher:
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
         if leader and github_ok and can_read and self.issue_comments is not None and not woke:
-            self.review_step(windows, down, pause, wake)
+            self.review_step(windows, down, pause, wake, extra)
         if github_ok and can_write:
             try:
                 self.beat(leader, extra)
@@ -777,20 +779,21 @@ class Watcher:
         return app_gh if app_gh.app is not None else None
 
     def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
-                    pause: Optional[Dict[str, Any]], wake: bool) -> None:
+                    pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None) -> None:
         """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
         from . import reviewer
         blocked = ("waking is off (--no-wake)" if not wake
                    else f"Claude is down until {iso(down['end'])}" if down
                    else f"paused until {pause['until']}" if pause else "")
-        if not blocked and reviewer.requests(self.issue_comments or []):
+        jobs = reviewer.Reviews(self, None)
+        jobs.prune()  # every tick, not only when a request waits
+        if not jobs.pending():
+            return
+        if not blocked:
             tampered = self.tampered()
             blocked = f"the conductor's own controls are modified in its checkout: {tampered}" if tampered else ""
-        jobs = reviewer.Reviews(self, None)
-        if not jobs.pending(self.issue_comments or []):
-            return
         jobs.app = None if blocked else self.app_gh_factory()
-        jobs.step(self.issue_comments or [], windows, blocked)
+        jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The most recent claude outage when it has run out and nobody has posted its
