@@ -737,6 +737,21 @@ def cmd_token_status(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+# Tokens gh and other GitHub tools read before, or instead of, GH_TOKEN. The parent's may be
+# Alex's own, so none of them reaches a `token exec` child.
+INHERITED_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+def exec_environment(parent: Dict[str, str], token: str) -> Dict[str, str]:
+    """The `token exec` child's environment: the parent's without any inherited GitHub token,
+    and GH_TOKEN set to the app token. GH_CONFIG_DIR is left alone: with GH_TOKEN set gh uses
+    it, but the child can still run `gh auth token` and reach Alex's keyring. This is a
+    convenience wrapper, not a sandbox."""
+    env = {name: value for name, value in parent.items() if name not in INHERITED_TOKENS}
+    env["GH_TOKEN"] = token
+    return env
+
+
 def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
     """Run a command with the app's token in ITS environment (GH_TOKEN) and nowhere else;
     exit with its exit code. `read` unless the caller asks for `--kind ops` by name."""
@@ -753,8 +768,7 @@ def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
     if low:
         print(f"coord: {low}", file=sys.stderr)
     token = gh.app.token(args.kind)  # AppAuthError: refused in run(), the command never starts
-    env = dict(os.environ)
-    env["GH_TOKEN"] = token
+    env = exec_environment(os.environ, token)
     try:
         result = subprocess.run(command, env=env)
     except OSError as error:

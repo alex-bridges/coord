@@ -804,6 +804,38 @@ class SecurityOverrideTests(AppTestCase):
         self.assertIn("COORD_SECURITY_BIN is set but refused", str(caught.exception))
         self.assertEqual(self.server.requests, [], "nothing minted")
 
+    def test_a_refused_override_never_hands_out_a_cached_token(self):
+        # Codex on 2d13f6b1e (P1): the refusal ran only on a cache miss, so with a reusable
+        # cached token for the real config, a probe that set a fake `security` got the LIVE
+        # token. It is checked before the cache is read now.
+        cached = self.seed_token("read")
+        path = os.path.join(self.token_dir, "read.json")
+        entry = read_json(path)
+        entry["client_id"] = self.REAL_ID  # the real (stand-in default) config's own token
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(entry, handle)
+        before = (os.stat(path).st_mtime_ns, read_json(path))
+        real = apptoken.load_config(self.default)
+        del os.environ["COORD_APP_CONFIG"]
+        self.assertEqual(apptoken.AppTokens(real, self.token_dir).token("read"), cached,
+                         "without the override the cached token is reusable")
+        os.environ["COORD_SECURITY_BIN"] = self.fake
+        for configured in (None, self.default):
+            with self.subTest(configured=configured):
+                if configured is None:
+                    os.environ.pop("COORD_APP_CONFIG", None)
+                else:
+                    os.environ["COORD_APP_CONFIG"] = configured
+                tokens = apptoken.AppTokens(real, self.token_dir)
+                for _ in range(2):  # and again in the same process
+                    with self.assertRaises(AppAuthError) as caught:
+                        tokens.token("read")
+                    self.assertIn("COORD_SECURITY_BIN is set but refused", str(caught.exception))
+                    self.assertNotIn(cached, str(caught.exception))
+                self.assertIsNone(tokens._installation, "the cached entry was never taken")
+        self.assertEqual((os.stat(path).st_mtime_ns, read_json(path)), before, "the cache was not touched")
+        self.assertEqual(sorted(os.listdir(self.token_dir)), ["read.json"], "no lock, no .failed.json")
+
     def test_the_mint_passes_its_client_id(self):
         seen = []
         self.patch(apptoken, "security_binary", lambda env=None, client_id=None: seen.append(client_id) or self.fake)

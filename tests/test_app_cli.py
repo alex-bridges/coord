@@ -572,6 +572,26 @@ class TokenExecTests(AppCliTestCase):
         self.assertNotIn("GH_TOKEN", os.environ)
         self.assert_no_secret(out, err)
 
+    def test_the_child_inherits_no_other_github_token(self):
+        # Codex on 2d13f6b1e (P2): the child inherited Alex's GITHUB_TOKEN, which gh and
+        # other tools read before GH_TOKEN. Every inherited GitHub token is removed.
+        parent = {"PATH": "/usr/bin", "GITHUB_TOKEN": "x", "GH_TOKEN": "y", "GH_ENTERPRISE_TOKEN": "z",
+                  "GITHUB_ENTERPRISE_TOKEN": "w", "GH_CONFIG_DIR": "/tmp/gh"}
+        self.assertEqual(cli.exec_environment(parent, "app"),
+                         {"PATH": "/usr/bin", "GH_TOKEN": "app", "GH_CONFIG_DIR": "/tmp/gh"})
+        for name in ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = USER_TOKEN
+        os.environ["GITHUB_TOKEN"] = USER_TOKEN
+        self.keychain("key")
+        check = ("import os, sys; names = ('GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'); "
+                 "sys.exit(7 if any(n in os.environ for n in names) else 0 if os.environ['GH_TOKEN'].startswith('ghs_') "
+                 "else 8)")
+        code, out, err = self.main(["token", "exec", "--", sys.executable, "-c", check])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(os.environ["GITHUB_TOKEN"], USER_TOKEN, "the parent's environment is unchanged")
+        self.assert_no_secret(out, err)
+
     def test_ops_only_by_name(self):
         self.keychain("key")
         self.assertEqual(self.main(["token", "exec", "--kind", "ops", "--", "true"])[0], EXIT_OK)
