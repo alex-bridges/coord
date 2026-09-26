@@ -61,7 +61,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
-from . import review
+from . import gh, review
 from .gh import GITHUB_API, AppAuthError, redact
 
 SWITCH_ENV = "COORD_APP"
@@ -544,14 +544,10 @@ class AppTokens:
         """One JWT-authenticated call. These are the app's own calls, on its own limit, so
         they are not recorded against the installation's budget."""
         data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(f"{self.api}/{path}", data=data, method=method)
-        request.add_header("Authorization", f"Bearer {jwt}")
-        request.add_header("Accept", "application/vnd.github+json")
-        request.add_header("X-GitHub-Api-Version", "2022-11-28")
-        request.add_header("User-Agent", "inisa-coord")
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        opener = self._urlopen or urllib.request.urlopen
+        # The JWT as an unredirected header, sent through gh.app_open: a redirect to another
+        # origin is refused, so the JWT never reaches anyone but GitHub.
+        request = gh.app_request(method, f"{self.api}/{path}", jwt, data)
+        opener = self._urlopen or gh.app_open
         try:
             with opener(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()

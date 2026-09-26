@@ -32,6 +32,7 @@ import re
 import shutil
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -132,6 +133,61 @@ def _next_link(header: Optional[str]) -> Optional[str]:
         if match:
             return match.group(1)
     return None
+
+
+# MARK: - Requests that carry an app credential
+
+
+class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Redirects for requests carrying an app credential (a JWT or an installation token).
+
+    urllib's own handler copies headers added with `add_header` onto 301, 302, 303 and 307
+    redirects, to any host and to plain http, so a redirect from GitHub (or from anything
+    between) would hand the credential to whoever it names. Here the credential travels as
+    an unredirected header, a redirect to another scheme, host or port is refused, and a
+    redirect within GitHub's own origin gets the credential back.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401 - urllib's signature
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if (old.scheme, old.netloc.lower()) != (new.scheme, new.netloc.lower()):
+            raise urllib.error.HTTPError(
+                req.full_url, code,
+                f"refused a redirect to {new.scheme}://{new.netloc}: app credentials stay with {old.netloc}",
+                headers, fp)
+        follow = super().redirect_request(req, fp, code, msg, headers, newurl)
+        credential = req.unredirected_hdrs.get("Authorization")
+        if follow is not None and credential:
+            follow.add_unredirected_header("Authorization", credential)
+        return follow
+
+
+_APP_OPENER: Optional[urllib.request.OpenerDirector] = None
+
+
+def app_open(request: urllib.request.Request, timeout: float = CALL_TIMEOUT_SECONDS) -> Any:
+    """urlopen for a request carrying an app credential (see SameOriginRedirects)."""
+    global _APP_OPENER
+    if _APP_OPENER is None:
+        _APP_OPENER = urllib.request.build_opener(SameOriginRedirects)
+    return _APP_OPENER.open(request, timeout=timeout)
+
+
+def app_request(method: str, url: str, credential: str, data: Optional[bytes] = None) -> urllib.request.Request:
+    """A request with an app credential as an UNREDIRECTED Authorization header, so no
+    redirect handler copies it anywhere. Send it with `app_open`."""
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_unredirected_header("Authorization", f"Bearer {credential}")
+    _api_headers(request, data)
+    return request
+
+
+def _api_headers(request: urllib.request.Request, data: Optional[bytes]) -> None:
+    request.add_header("Accept", "application/vnd.github+json")
+    request.add_header("X-GitHub-Api-Version", "2022-11-28")
+    request.add_header("User-Agent", "inisa-coord")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
 
 
 def token_kind(method: str, url: str) -> str:
@@ -246,16 +302,16 @@ class GitHub:
             bearer, principal = self.token(), budget.USER
         self.calls += 1
         data = json.dumps(body).encode() if body is not None else None
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("Authorization", f"Bearer {bearer}")
-        request.add_header("Accept", "application/vnd.github+json")
-        request.add_header("X-GitHub-Api-Version", "2022-11-28")
-        request.add_header("User-Agent", "inisa-coord")
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
+        if self.app is not None:
+            request, opener = app_request(method, url, bearer, data), app_open
+        else:
+            request = urllib.request.Request(url, data=data, method=method)
+            request.add_header("Authorization", f"Bearer {bearer}")
+            _api_headers(request, data)
+            opener = urllib.request.urlopen
         resource = "graphql" if url.rstrip("/").endswith("/graphql") else "core"
         try:
-            with urllib.request.urlopen(request, timeout=CALL_TIMEOUT_SECONDS) as response:
+            with opener(request, timeout=CALL_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
                 headers = {k.lower(): v for k, v in response.headers.items()}
             budget.record(self.repo, headers, resource, principal)

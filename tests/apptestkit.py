@@ -159,8 +159,10 @@ class FakeGitHub:
         assert url.startswith(API + "/"), f"a request left the fake API: {url}"
         path = url[len(API) + 1:]
         method = request.get_method()
-        auth = request.headers.get("Authorization") or ""
+        auth = request.get_header("Authorization") or ""  # unredirected (app) or ordinary (Alex)
         bearer = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
+        if (JWT_SHAPE.fullmatch(bearer) or bearer.startswith("ghs_")) and "Authorization" in request.headers:
+            raise AssertionError("an app credential travelled as a header a redirect would copy (add_header)")
         body = json.loads(request.data) if request.data else None
         with self.lock:
             self.requests.append({"method": method, "path": path, "bearer": bearer,
@@ -333,7 +335,8 @@ class AppTestCase(unittest.TestCase):
         os.chmod(security, 0o700)
         self.patch(apptoken, "SECURITY", security)
         self.server = FakeGitHub()
-        self.patch(urllib.request, "urlopen", self.server)
+        self.patch(urllib.request, "urlopen", self.server)  # Alex's HTTPS calls
+        self.patch(ghmodule, "app_open", self.server)  # every request carrying an app credential
         self.runner = FakeRunner(self.server)
         self.patch(ghmodule, "_default_runner", self.runner)
 

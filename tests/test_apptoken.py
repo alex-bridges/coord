@@ -16,6 +16,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -518,7 +520,7 @@ class MintErrorTests(AppTestCase):
         for name, kwargs in cases.items():
             with self.subTest(case=name):
                 self.forget_failures()
-                self.patch(apptoken.urllib.request, "urlopen", self.failing_urlopen(**kwargs))
+                self.patch(apptoken.gh, "app_open", self.failing_urlopen(**kwargs))
                 with self.assertRaises(AppAuthError) as caught:
                     self.tokens().token("read")
                 self.assert_no_secret(str(caught.exception))
@@ -530,6 +532,117 @@ class MintErrorTests(AppTestCase):
         with self.assertRaises(AppAuthError) as caught:
             self.tokens().token("read")
         self.assertIn("minting failed (KeyError", str(caught.exception))
+
+
+class RedirectTests(unittest.TestCase):
+    """App credentials never follow a redirect to another origin (review of #1046, P3-1).
+
+    Two REAL local HTTP servers, no patched urlopen: A answers 302 (or 307) to B, and B
+    records every Authorization header it receives. urllib's default redirect handler
+    copies add_header headers to any host; the app's requests must not reach B at all.
+    """
+
+    def setUp(self):
+        import http.server
+        self.servers = []
+        for _ in range(2):
+            server = http.server.HTTPServer(("127.0.0.1", 0), self.handler())
+            server.seen = []
+            threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            self.servers.append(server)
+        self.a, self.b = self.servers
+        # A fresh opener built with no proxy from the environment: 127.0.0.1 must be reached directly.
+        saved = {name: os.environ.pop(name) for name in list(os.environ) if name.lower().endswith("_proxy")}
+        self.addCleanup(os.environ.update, saved)
+        from coordlib import gh
+        self.gh = gh
+        original = gh._APP_OPENER  # noqa: SLF001
+        gh._APP_OPENER = None  # noqa: SLF001
+        self.addCleanup(setattr, gh, "_APP_OPENER", original)
+
+    def url(self, server, path):
+        return f"http://127.0.0.1:{server.server_address[1]}{path}"
+
+    def handler(self):
+        test = self
+
+        class Handler(__import__("http.server").server.BaseHTTPRequestHandler):
+            def answer(self):
+                self.server.seen.append((self.command, self.path, self.headers.get("Authorization")))
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(length)
+                if self.path.startswith("/away"):
+                    code = 307 if "307" in self.path else 302
+                    self.send_response(code)
+                    self.send_header("Location", test.url(test.b, "/stolen"))
+                elif self.path.startswith("/same"):
+                    self.send_response(302)
+                    self.send_header("Location", "/final")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = answer
+
+            def log_message(self, *args):
+                pass
+
+        return Handler
+
+    def test_the_harness_can_see_a_leak(self):
+        # The same redirect through plain urlopen with add_header DOES hand B the token:
+        # the leak the review demonstrated, so the checks below can fail.
+        request = urllib.request.Request(self.url(self.a, "/away"))
+        request.add_header("Authorization", "Bearer ghs_THROWAWAY_read")
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener.open(request, timeout=5).read()
+        self.assertEqual(self.b.seen, [("GET", "/stolen", "Bearer ghs_THROWAWAY_read")])
+
+    def test_an_app_token_never_reaches_another_origin(self):
+        for path, method, data in (("/away", "GET", None), ("/away-307", "POST", b"{}")):
+            with self.subTest(path=path):
+                request = self.gh.app_request(method, self.url(self.a, path), "ghs_THROWAWAY_read", data)
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.gh.app_open(request, timeout=5)
+                caught.exception.close()
+                self.assertIn("refused a redirect", str(caught.exception.reason))
+        self.assertEqual(self.b.seen, [], "B was never reached, with or without a credential")
+        self.assertEqual([seen[2] for seen in self.a.seen], ["Bearer ghs_THROWAWAY_read"] * 2)
+
+    def test_the_jwt_never_reaches_another_origin(self):
+        tokens = apptoken.AppTokens({"client_id": CLIENT_ID, "repo": REPO, "app_login": "", "app_id": None},
+                                    tempfile.mkdtemp())
+        tokens.api = self.url(self.a, "")  # the one test-only change: point the mint path at A
+        jwt = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjIzdGVzdCJ9.c2lnbmF0dXJlLWJ5dGVz"
+        with self.assertRaises(AppAuthError) as caught:
+            tokens._call("POST", "away-307/app/installations/1/access_tokens", jwt, {"x": 1})  # noqa: SLF001
+        self.assertIn("answered HTTP 307", str(caught.exception))
+        self.assertNotIn(jwt, str(caught.exception))
+        self.assertEqual(self.b.seen, [])
+
+    def test_a_redirect_within_the_origin_keeps_the_credential(self):
+        request = self.gh.app_request("GET", self.url(self.a, "/same"), "ghs_THROWAWAY_read")
+        self.gh.app_open(request, timeout=5).read()
+        self.assertEqual(self.a.seen, [("GET", "/same", "Bearer ghs_THROWAWAY_read"),
+                                       ("GET", "/final", "Bearer ghs_THROWAWAY_read")])
+
+    def test_a_downgrade_to_http_on_the_same_host_is_refused(self):
+        request = self.gh.app_request("GET", "https://api.github.com/repos/o/r", "ghs_THROWAWAY_read")
+        for target in ("http://api.github.com/repos/o/r", "https://api.github.com:8443/x", "https://evil.example/x"):
+            with self.subTest(target=target):
+                with self.assertRaises(urllib.error.HTTPError):
+                    self.gh.SameOriginRedirects().redirect_request(request, None, 302, "Found", {}, target)
+
+    def test_the_credential_is_never_a_redirectable_header(self):
+        request = self.gh.app_request("GET", "https://api.github.com/x", "ghs_THROWAWAY_read")
+        self.assertNotIn("Authorization", request.headers)
+        self.assertEqual(request.unredirected_hdrs["Authorization"], "Bearer ghs_THROWAWAY_read")
 
 
 class SecurityOverrideTests(AppTestCase):
