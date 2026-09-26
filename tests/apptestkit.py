@@ -315,6 +315,9 @@ class AppTestCase(unittest.TestCase):
            "FAKE_SECURITY_LOG", "FAKE_SECURITY_MODE", "FAKE_KEYCHAIN_B64", "TMPDIR", "COORD_SECURITY_BIN")
 
     def setUp(self) -> None:
+        # Registered first, so it runs last (cleanups run in reverse): no test may leave HOME
+        # changed for the test modules that run after it.
+        self.addCleanup(self._assert_home_unchanged, os.environ.get("HOME"))
         self.saved_env = {name: os.environ.get(name) for name in self.ENV}
         for name in self.ENV:
             os.environ.pop(name, None)
@@ -349,6 +352,9 @@ class AppTestCase(unittest.TestCase):
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+    def _assert_home_unchanged(self, home: Optional[str]) -> None:
+        self.assertEqual(os.environ.get("HOME"), home, "a test left HOME changed")
 
     def patch(self, owner: Any, name: str, value: Any) -> None:
         original = getattr(owner, name)

@@ -395,6 +395,9 @@ class AppTokens:
         try:
             entry = self.cached(kind)
             if entry is None:
+                # A refused COORD_SECURITY_BIN is this process's setting, not a failed mint:
+                # refuse now, before the lock, and never write it down for other processes.
+                security_binary(client_id=self.config["client_id"])
                 self._check_failed(kind)
                 with self._lock(kind):
                     entry = self.cached(kind)  # another process may have minted meanwhile

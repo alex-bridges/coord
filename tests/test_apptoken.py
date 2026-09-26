@@ -694,6 +694,7 @@ class SecurityOverrideTests(AppTestCase):
 
     def setUp(self):
         super().setUp()
+        self.saved_security, self.real_run = apptoken.SECURITY, apptoken.subprocess.run  # the fake, and run itself
         self.patch(apptoken, "SECURITY", "/usr/bin/security")
         self.fake = os.path.join(self.root, "bin", "security")
         # This test's stand-ins for ~/.config/inisa-coord/github-app.json under $HOME and
@@ -778,8 +779,16 @@ class SecurityOverrideTests(AppTestCase):
     def test_the_real_home_is_the_password_databases_not_HOME(self):
         import pwd
         self.patch(apptoken, "real_home", self.real_home_unpatched)
+        original = os.environ.get("HOME")
+
+        def restore():  # exactly as it was: the value, or no HOME at all
+            if original is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = original
+
+        self.addCleanup(restore)
         os.environ["HOME"] = os.path.join(self.root, "elsewhere")
-        self.addCleanup(os.environ.__setitem__, "HOME", pwd.getpwuid(os.getuid()).pw_dir)
         self.assertEqual(apptoken.real_home(), pwd.getpwuid(os.getuid()).pw_dir)
         self.assertNotEqual(apptoken.real_default_config_path(), apptoken.config_path({}),
                             "with HOME moved, the two defaults differ, and both are checked")
@@ -801,7 +810,24 @@ class SecurityOverrideTests(AppTestCase):
         with self.assertRaises(AppAuthError) as caught:  # no_subprocess tripped: it got as far as running it
             self.tokens().token("read")
         self.assertIn("reached a subprocess", str(caught.exception))
-        self.assertEqual(seen, [CLIENT_ID])
+        self.assertEqual(set(seen), {CLIENT_ID}, "checked before the lock and again for the command")
+
+    def test_a_refused_override_is_never_remembered_across_processes(self):
+        # Round four of the #1046 review (P3-A): the refusal is this process's setting, not a
+        # failed mint. No hold is written for the real config, and without the variable the
+        # next process mints at once.
+        self.patch(apptoken.subprocess, "run", self.real_run)
+        self.patch(apptoken, "SECURITY", self.saved_security)
+        self.write(self.config_path, self.REAL_ID)
+        os.environ["COORD_SECURITY_BIN"] = self.fake
+        self.keychain("key")
+        with self.assertRaises(AppAuthError):
+            self.tokens().token("read")
+        self.assertEqual([name for name in os.listdir(self.token_dir) if name.endswith(".failed.json")]
+                         if os.path.isdir(self.token_dir) else [], [], "no .failed.json")
+        del os.environ["COORD_SECURITY_BIN"]
+        self.assertTrue(self.tokens().token("read"), "without the variable the next run proceeds")
+        self.assertEqual(len(self.security_calls()), 1, "the fake Keychain answered once, for that run")
 
 
 if __name__ == "__main__":
