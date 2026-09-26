@@ -20,7 +20,9 @@ from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
 # the app: its reads on the read token, its writes on the ops token.
 #
 # Attestations, not operations: they record that Alex approved, or that a named reviewer
-# reviewed, a head. `train substitute-review` is the old name of `train review`.
+# reviewed, a head. `train substitute-review` is the old name of `train review`. The train
+# counts an attestation only when Alex's login posted it (snapshot.trusted_attestation),
+# so these must never move to the app.
 ATTESTATIONS = frozenset({"train approve", "train review", "train substitute-review"})
 # Commands that need what the app does not have:
 # - a hand-run `train step` moves and deletes branches (Contents write; in Actions app mode

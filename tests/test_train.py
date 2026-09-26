@@ -25,14 +25,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
-from test_coord import (BOT, NOW, REAL_FAILURE, check, codex_summary, coord_comment, pr_node, reaction,  # noqa: E402
-                        refused_check)
+from test_coord import (ALEX, BOT, NOW, REAL_FAILURE, REPO, check, codex_summary, coord_comment, pr_node,  # noqa: E402
+                        reaction, refused_check)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
 LIGHT_PATH = ".claude/skills/x.md"  # the docs lane only, and not one of train.ALEX_ONLY_PATHS
+# Who posted an attestation record, and whether it counts (snapshot.trusted_attestation):
+# only the repository's owner, never a bot or another user (Codex P1 on #1054).
+ATTESTERS = ((ALEX, True),
+             ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"}, False),
+             ({"login": "inisa-sidechain[bot]", "type": "Bot"}, False),
+             ({"login": "mallory", "type": "User"}, False))
+FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
 
 
 def checkout_file(path: str) -> str:
@@ -123,7 +130,7 @@ class EligibilityTests(unittest.TestCase):
                              ("review-substitute", ["train", "codex-unavailable"])):
             with self.subTest(kind=kind):
                 pr = self.unreviewed(labels=labels)
-                snapshot.attach_head_records([pr], [coord_comment(1, 1, 5, {"kind": kind, "pr": 1, "head": head})])
+                snapshot.attach_head_records([pr], [coord_comment(1, 1, 5, {"kind": kind, "pr": 1, "head": head})], REPO)
                 self.assertEqual(pr["reviewedHead"], head)
                 self.assertEqual(train.eligibility(pr), (train.READY, "ready"))
 
@@ -131,8 +138,30 @@ class EligibilityTests(unittest.TestCase):
         pr = self.unreviewed()
         snapshot.attach_head_records([pr], [
             coord_comment(1, 1, 30, {"kind": "review-clean", "pr": 1, "head": pr["head"]}),
-            coord_comment(2, 1, 10, {"kind": "review-substitute", "pr": 1, "head": "0" * 40})])
+            coord_comment(2, 1, 10, {"kind": "review-substitute", "pr": 1, "head": "0" * 40})], REPO)
         self.assertEqual(train.eligibility(pr)[0], train.HOLD, "the newer record names an older head")
+
+    def test_only_the_owner_s_records_attest_in_the_snapshot(self):
+        head = "a" * 40
+        for author, counts in ATTESTERS:
+            with self.subTest(author=author["login"]):
+                review = self.unreviewed()
+                snapshot.attach_head_records([review], [coord_comment(
+                    1, 1, 5, {"kind": "review-clean", "pr": 1, "head": head}, author)], REPO)
+                self.assertEqual(train.eligibility(review)[0], train.READY if counts else train.HOLD)
+                # Alex's approval: the same code path, and the same rule.
+                approval = dict(self.summary(), labels=["train", "needs-alex", "alex-approved"])
+                snapshot.attach_head_records([approval], [coord_comment(
+                    1, 1, 5, {"kind": "alex-approve", "pr": 1, "head": head}, author)], REPO)
+                self.assertEqual(train.assess(approval)[:2], (train.READY, "") if counts else
+                                 (train.HOLD, train.HOLD_NEEDS_ALEX))
+
+    def test_an_untrusted_record_never_displaces_a_trusted_one(self):
+        pr = self.unreviewed()
+        snapshot.attach_head_records([pr], [
+            coord_comment(1, 1, 30, {"kind": "review-clean", "pr": 1, "head": pr["head"]}),
+            coord_comment(2, 1, 10, {"kind": "review-clean", "pr": 1, "head": "0" * 40}, ATTESTERS[2][0])], REPO)
+        self.assertEqual(pr["reviewedHead"], pr["head"])
 
     def summary_with_checks(self, *checks):
         node = ready_node(1, "a" * 40, "b")
@@ -618,17 +647,60 @@ class StepTests(unittest.TestCase):
                 if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
                                                                                      "state_reason": "completed"}]
 
-    def queue_reviewed(self, head, reviewed_head):
+    @staticmethod
+    def review_record(head, author=FAKE_OWNER):
+        """A clean review of `head` as `coord train review` posts it, authored by `author`."""
+        return {"created_at": snapshot.iso(NOW), "user": dict(author), "body": marker.compose("reviewed", {
+            "kind": "review-clean", "v": 1, "agent": "claude@h:w", "by": "claude@h:reviewer", "pr": 1, "head": head})}
+
+    def queue_reviewed(self, head, reviewed_head, author=FAKE_OWNER):
         """PR 1 queued at `head` with no Codex 👍 and no label but `train`, and a clean
         review recorded by `coord train review` naming `reviewed_head`."""
         node = ready_node(1, head, "pr1")
         node["reactions"] = {"nodes": []}
         fake = FakeGitHub([node], self.main)
         self.queue(fake, 1, head, 20)
-        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "body": marker.compose("reviewed", {
-            "kind": "review-clean", "v": 1, "agent": "claude@h:w", "by": "claude@h:reviewer", "pr": 1,
-            "head": reviewed_head})})
+        fake.issue_comments[1].append(self.review_record(reviewed_head, author))
         return fake
+
+    def test_a_bot_s_record_at_the_head_is_held(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        lines = self.step(self.queue_reviewed(h1, h1, {"login": "inisa-sidechain[bot]", "type": "Bot"})).run()
+        self.assertEqual(self.batch_on_origin(), ("", ""), lines)
+        self.assertTrue(any("#1 held: no Codex" in line and "no clean review" in line for line in lines), lines)
+
+    def test_the_final_check_ignores_a_bot_s_record(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])  # built on Codex's 👍
+        self.run_on(fake, name, tip, conclusion="success")
+        node = ready_node(1, h1, "pr1")
+        node["reactions"] = {"nodes": []}  # the 👍 is gone; only a bot's record remains
+        fake.nodes = [node]
+        fake.issue_comments[1].append(self.review_record(h1, {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}))
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertTrue(any("#1 is no longer ready" in line for line in lines), lines)
+
+    def test_the_final_check_trusts_the_same_authors_as_the_snapshot(self):
+        head = "a" * 40
+        for kind, labels in (("review-clean", ("train",)), ("review-substitute", ("train",)),
+                             ("alex-approve", ("train", "needs-alex", "alex-approved"))):
+            for author, counts in ATTESTERS:
+                with self.subTest(kind=kind, author=author["login"]):
+                    node = ready_node(1, head, "pr1", labels=labels)
+                    if kind != "alex-approve":
+                        node["reactions"] = {"nodes": []}  # the record is its only review
+                    payload = {"kind": kind, "pr": 1, "head": head}
+                    fake = FakeGitHub([node], self.main)
+                    fake.repo = REPO  # trusted_attesters(REPO) is {alex-bridges}
+                    fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW), "user": dict(author),
+                                               "body": marker.compose("record", payload)}]
+                    fresh = snapshot.summarize_pr(node)
+                    self.step(fake).train_added(fresh)
+                    cached = snapshot.summarize_pr(node)
+                    snapshot.attach_head_records([cached], [coord_comment(1, 1, 5, payload, author)], REPO)
+                    self.assertEqual(train.assess(fresh)[0], train.READY if counts else train.HOLD)
+                    self.assertEqual(train.assess(cached), train.assess(fresh))
 
     def test_a_recorded_clean_review_lands_without_codex_or_a_label(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
@@ -1165,7 +1237,7 @@ class StepTests(unittest.TestCase):
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
         stale["labels"]["nodes"].append({"name": "alex-approved"})
-        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "body": marker.compose(
+        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "user": FAKE_OWNER, "body": marker.compose(
             "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
         lines = self.step(fake).run()
         self.assertTrue(any("does not name the current head" in line for line in lines), lines)

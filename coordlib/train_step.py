@@ -242,9 +242,11 @@ class Step:
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
         """The newest train-add marker on the PR (when it joined, at which head, by whom).
         Also sets on `pr` the heads its newest clean-review (review-clean, or the older
-        review-substitute) and alex-approve comments name, who added it (`trainAddedBy`), the (head, hold class) of every `held`
-        notice the train has posted on it (`heldNotices`), and `overtakenBy`: the light
-        batch that went ahead of it since it joined, if any."""
+        review-substitute) and alex-approve comments name, counting only those a trusted
+        user posted (snapshot.trusted_attestation, the snapshot's own rule), who added it
+        (`trainAddedBy`), the (head, hold class) of every `held` notice the train has
+        posted on it (`heldNotices`), and `overtakenBy`: the light batch that went ahead
+        of it since it joined, if any."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
         held = set()
@@ -257,7 +259,8 @@ class Step:
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
-                pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
+                if snapshot.trusted_attestation(snapshot.comment_author(comment), self.gh.repo):
+                    pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
             elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
             elif payload.get("event") == train.OVERTAKEN_EVENT and self.own_record(comment, payload):

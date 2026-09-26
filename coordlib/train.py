@@ -15,7 +15,8 @@ Merge rule (memory: feedback-pr-train-protocol), re-checked when a batch is buil
 AND again just before main moves — the `train` label is intent, not approval:
 - the current head is reviewed: Codex 👍 on it (review.codex_state), or a clean review
   of it by any agent (Alex, 2026-09-26), recorded by `coord train review` in a comment
-  naming that head;
+  naming that head. That record, like Alex's approval below, counts only when a
+  trusted user posted it, never a bot (snapshot.trusted_attestation);
 - no unanswered Codex findings;
 - CI at the head not red (pending is fine: the batch runs the gates anyway). A check
   GitHub never started (review.NOT_RUN_PREFIX, e.g. refused by the Actions budget) is

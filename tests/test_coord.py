@@ -106,8 +106,14 @@ def with_checks(*contexts):
     return node
 
 
-def coord_comment(comment_id: int, on: int, minutes_ago: float, payload):
-    return {"id": comment_id, "on": on, "createdAt": t(minutes_ago), "url": f"u/{comment_id}", "text": "", "payload": payload}
+REPO = "example-owner/example-repo"
+ALEX = {"login": "alex-bridges", "type": "User"}  # the repository owner: the one trusted attester
+
+
+def coord_comment(comment_id: int, on: int, minutes_ago: float, payload, author=None):
+    """A comment as snapshot.fetch_coord_comments shapes it, posted by `author` (default: Alex)."""
+    return {"id": comment_id, "on": on, "createdAt": t(minutes_ago), "url": f"u/{comment_id}", "text": "",
+            "payload": payload, "author": dict(author or ALEX)}
 
 
 class MarkerTests(unittest.TestCase):
@@ -641,8 +647,32 @@ class CodexRoundThreeTests(unittest.TestCase):
             coord_comment(1, 7, 30, {"kind": "review-substitute", "pr": 7, "head": "old"}),
             coord_comment(2, 7, 10, {"kind": "review-substitute", "pr": 7, "head": "new"}),
         ]
-        snapshot.attach_head_records(prs, comments)
+        snapshot.attach_head_records(prs, comments, REPO)
         self.assertEqual([p["reviewedHead"] for p in prs], ["new", None])
+
+    def test_only_a_trusted_user_can_attest(self):
+        self.assertEqual(snapshot.trusted_attesters("example-owner/example-repo"), frozenset({"alex-bridges"}))
+        self.assertTrue(snapshot.trusted_attestation(ALEX, REPO))
+        self.assertTrue(snapshot.trusted_attestation({"login": "Alex-Bridges"}, REPO), "logins are case-insensitive")
+        for author in ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"},
+                       {"login": "inisa-sidechain[bot]", "type": "Bot"},
+                       {"login": "github-actions[bot]", "type": "Bot"},
+                       {"login": "mallory", "type": "User"},
+                       {"login": "alex-bridges", "type": "Bot"},
+                       {"login": "alex-bridges[bot]"},
+                       {"login": ""}, {}, None):
+            with self.subTest(author=author):
+                self.assertFalse(snapshot.trusted_attestation(author, REPO))
+
+    def test_the_snapshot_keeps_each_comment_s_author(self):
+        class Fake:
+            def rest_paginated(self, path):
+                return [{"id": 3, "issue_url": "https://api.github.com/repos/o/r/issues/7", "created_at": t(5),
+                         "html_url": "u", "user": {"login": "inisa-sidechain[bot]", "type": "Bot"},
+                         "body": marker.compose("x", {"kind": "review-clean", "pr": 7, "head": "h"})}]
+
+        [comment] = snapshot.fetch_coord_comments(Fake(), NOW)
+        self.assertEqual(comment["author"], {"login": "inisa-sidechain[bot]", "type": "Bot"})
 
     def run_review(self, argv):
         """Run a `train review`-style command against a fake PR whose head is `abc…`;
