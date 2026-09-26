@@ -119,18 +119,31 @@ def rules(guard) -> dict:
     return found
 
 
+def cpu_seconds(call, command: str, tries: int = 3) -> float:
+    """The CPU time of call(command). One over BUDGET is run again, up to `tries` times in all,
+    and the lowest counts: a super-linear rule is slow every time, while a run the scheduler
+    moved to a slower core (an efficiency core, under load) is not. Measured: main's gh api
+    rule takes 0.85 CPU s on this Mac's performance cores and 2.3 on its efficiency cores."""
+    best = None
+    for _ in range(tries):
+        start = time.process_time()
+        call(command)
+        took = time.process_time() - start
+        best = took if best is None else min(best, took)
+        if best < BUDGET:
+            break
+    return best
+
+
 def measure(guard, name: str) -> dict:
     pattern, alone, needs_witness = rules(guard)[name]
     witness = " ".join(keywords(pattern))
     commands = inputs(pattern)
     slowest_verdict = slowest_alone = 0.0
     for command in commands:
-        start = time.process_time()
-        guard.bash_verdict(command, "/tmp/home", "/tmp/home")
-        slowest_verdict = max(slowest_verdict, time.process_time() - start)
-        start = time.process_time()
-        alone(command)
-        slowest_alone = max(slowest_alone, time.process_time() - start)
+        slowest_verdict = max(slowest_verdict, cpu_seconds(lambda c: guard.bash_verdict(c, "/tmp/home", "/tmp/home"),
+                                                           command))
+        slowest_alone = max(slowest_alone, cpu_seconds(alone, command))
     return {"rule": name, "inputs": len(commands), "witness": witness,
             "witness matches": bool(alone(witness)) if needs_witness else None,
             "verdict": round(slowest_verdict, 3), "alone": round(slowest_alone, 3)}
