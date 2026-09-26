@@ -779,14 +779,17 @@ class GuardHookTests(unittest.TestCase):
     def test_a_quoted_or_escaped_coord_subcommand_is_refused(self):
         # The shell's quoting is not decoded; no real command quotes its subcommand. The quotes
         # of a later argument are not the subcommand's.
-        for command in ("coord 'board'", "coord --repo 'o/r' board", "coord $CMD", "coord train \"status\""):
+        for command in ("coord 'board'", "coord --repo 'o/r' board", "coord $CMD", "coord train \"status\"",
+                        "coord \\\n'token' exec"):
             result = self.run_guard("Bash", {"command": command}, full=True)
             self.assertEqual(result.returncode, 2, command)
             self.assertIn("a coord subcommand spelled with quotes or escapes", result.stderr, command)
         for command in ("coord send 'a quoted message'", 'coord send --on 5 "x"',
                         "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'",
                         "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
-                        "Tools/coord/coord claim 991 --note 'on it'", "Tools/coord/coord --repo o/r board"):
+                        "Tools/coord/coord claim 991 --note 'on it'", "Tools/coord/coord --repo o/r board",
+                        # A newline ends the coord command; the next line's quotes are its own.
+                        "Tools/coord/coord board\n\"$CONDUCTOR_STATE_DIR/run.sh\""):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_is_blocked(self):
