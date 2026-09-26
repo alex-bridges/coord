@@ -667,7 +667,7 @@ def corpus_sources() -> dict:
 
 
 # Each source's DISTINCT commands when it was last grown: emptying or cutting one fails the test.
-MINIMUM = {"test_conductor.py": 243, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
+MINIMUM = {"test_conductor.py": 245, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
            "not heredoc openers": 67, "wrappers and shapes": 216, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
            "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120,
            "round twelve's review": 106, "trailing comments": 36}
