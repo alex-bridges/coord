@@ -13,6 +13,7 @@ import email.message
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -307,7 +308,12 @@ class ReadFloorTests(BudgetTestCase):
         code, out, err = self.run_cli(["board"], self.silent_http())
         self.assertEqual(code, EXIT_OK)
         self.assertIn("showing the snapshot from 60m ago", err)
-        self.assertIn("cached 3600s", out.splitlines()[0], "its age from its own timestamp, not the aged file")
+        # Its age from its own timestamp, not the aged file: the invalidated file's mtime is the epoch.
+        # generatedAt is whole seconds and the test takes time to run, so allow the same minute the
+        # "60m ago" line above allows, rather than an exact 3600.
+        age = re.search(r"cached (\d+)s", out.splitlines()[0])
+        self.assertIsNotNone(age, out.splitlines()[0])
+        self.assertTrue(3600 <= int(age.group(1)) < 3660, f"its age from its own timestamp, not the aged file: {age.group(1)}s")
 
     def test_above_the_floor_nothing_is_held_back(self):
         self.seed(budget.READ_FLOOR_DEFAULT)
