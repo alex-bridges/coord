@@ -114,6 +114,8 @@ def rules(guard) -> dict:
                                   guard._coord_subcommand_quoted, False)
     found["security"] = (" ".join([guard._SECURITY.pattern, guard._SECURITY_TOKEN.pattern, *guard._SECURITY_SECRETS, "-i"]),
                          guard._security_reads_secrets, True)
+    # Its inputs repeat `'`, `"`, `\` and `$` with `security`; no witness, as keywords never carry a quote.
+    found["assembled security"] = (guard._SECURITY.pattern + " '\"\\$", guard._security_assembled, False)
     found["token cache"] = ("inisa cache", guard._names_the_token_cache, True)
     found["apptoken"] = (guard._PYTHON.pattern + " apptoken test_apptoken", guard._python_apptoken, True)
     found["cap"] = ("a", lambda c: len(c) > guard.MAX_COMMAND, False)

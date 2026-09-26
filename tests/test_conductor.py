@@ -835,6 +835,23 @@ class GuardHookTests(unittest.TestCase):
                         "echo securityexport"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
+    def test_a_security_the_shell_assembles_is_refused(self):
+        # Codex on a774ba186 (P1), the third review in a row whose P1 is a shell spelling: with
+        # every quote, backslash and `$` deleted, the command names `security` more often than
+        # it does as written, so the shell assembles the program name. Refused whatever follows.
+        for command in ('"security" dump-keychain -d', "secu\\rity dump-keychain", "'security' du", 's"ec"urity f -w',
+                        '/usr/bin/"security" e', "sec$'u'rity dump-keychain", "\\security dump-keychain",
+                        "\"security\" $'\\x64ump-keychain'", "'security' list-keychains",
+                        # The cost: prose that quotes the name.
+                        "git commit -q -m 'fix the \"security\" wording'"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("`security` spelled with quotes or escapes", result.stderr, command)
+            self.assertIn("write such text with the Write tool", result.stderr, command)
+        for command in ("security list-keychains", "grep -rn security Tools/coord/coordlib/apptoken.py",
+                        "gh pr comment 5 -b 'the security fix landed'", "echo securityexport"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
     def test_the_token_cache_is_blocked(self):
         # Codex on 141d38f62 (P1): a path has spellings no pattern keeps up with, so the rule is
         # co-occurrence, like apptoken's: `inisa` and `cache` anywhere in the case-folded command.
@@ -1046,7 +1063,7 @@ class GuardHookTests(unittest.TestCase):
         guard = self.load_guard(GUARD)
         names = guard_timing.own_rules(guard)
         self.assertEqual(set(names), {"token exec", "train approve", "quoted subcommand", "security", "RAW_RULES[0]",
-                                      "token cache", "apptoken", "cap"})
+                                      "assembled security", "token cache", "apptoken", "cap"})
         report, failures = guard_timing.measure_in_children(GUARD, only=names)
         self.assertEqual(failures, [])
         self.assertEqual([rule["rule"] for rule in report], names)
