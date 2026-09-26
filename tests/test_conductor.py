@@ -947,7 +947,6 @@ class GuardHookTests(unittest.TestCase):
         report, failures = guard_timing.measure_in_children(GUARD, timeout=10)
         self.assertEqual(failures, [])
         self.assertEqual([rule["rule"] for rule in report], list(guard_timing.rules(guard)))
-        self.assertEqual(len(report), len(guard.RULES) + len(guard.RAW_RULES) + 5, "every rule, and the checks")
         for rule in report:
             self.assertGreater(rule["inputs"], 1, rule)
 
@@ -989,6 +988,73 @@ class GuardHookTests(unittest.TestCase):
         # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
         self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
         self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
+
+    def test_a_view_is_added_never_substituted(self):
+        # Round eleven (P1-1, P1-2): each normalisation is a view the rules read beside the raw
+        # command, and each is escape-aware. The metamorphic test cannot see these: the rewrites
+        # that make them change the meaning.
+        for command in (
+                # An escaped backslash, then a newline: not a continuation.
+                "echo \\\\\ncoord train approve 5", "echo \\\\\ncoord token exec -- env",
+                "echo \\\\\nsecurity find-generic-password -w", 'echo "a\\\\\n" ; gh pr merge 5 ; echo "b"',
+                'echo "a\\\\\n" ; git push origin main ; echo "b"', 'echo "a\\\\\n" ; coord train approve 5 ; echo "b"',
+                'echo "a\\\\\n" ; sudo ls ; echo "b"', 'echo "a\\\\\n" ; rm -rf Tools/coord ; echo "b"',
+                # An escaped `>` or `<`: a literal character, then `|` or `&`.
+                "echo x\\>|gh pr merge 5", "echo x\\<&sudo ls", "echo x\\>&coord train approve 5",
+                "true\\>|git push origin main", "echo x\\>|security find-generic-password -w",
+                "push\\<&sudo --force-f}-f"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+
+    def test_the_linear_quote_remover_is_the_regexs(self):
+        # Round eleven: the views run executable_text twice, so its quadratic `_QUOTED.sub` is
+        # now one pass. It must give the regex's result exactly.
+        guard = self.load_guard(GUARD)
+        random = __import__("random").Random(11)
+        alphabet = ["'", '"', "\\", "\n", "a", " ", "\\'", '\\"', "\\\\", "\\\n", "$", "(", "x"]
+        for _ in range(20000):
+            text = "".join(random.choice(alphabet) for _ in range(random.randint(0, 16)))
+            self.assertEqual(guard._unquoted(text), guard._QUOTED.sub("''", text), repr(text))
+        start = time.monotonic()
+        guard._unquoted('"' + 'a\\"' * 6663)
+        self.assertLess(time.monotonic() - start, 0.1, "one pass over an unclosed quote full of escapes")
+
+    def test_a_view_is_added_and_the_raw_command_always_read(self):
+        # Round eleven (Principle C): the raw command and its executable text come first; the
+        # joined command, and its text without redirections, are added beside them.
+        guard = self.load_guard(GUARD)
+        command = "gh pr view 5 \\\n  --json title >/tmp/x"
+        commands, texts = guard._views(command)
+        self.assertEqual(commands, [command, "gh pr view 5   --json title >/tmp/x"])
+        self.assertEqual(texts[0], guard.executable_text(command))
+        self.assertEqual(texts[1:], ["gh pr view 5   --json title >/tmp/x", "gh pr view 5   --json title  "])
+
+    def test_the_rest_of_the_shells_spellings_are_blocked(self):
+        for command in (
+                # P2-1: a space between a redirection and its target; zsh's {fd}.
+                "gh > /dev/null pr merge 5", "coord 2> /dev/null train approve 5", "bash > /dev/null -c 'gh pr merge 5'",
+                "eval > /dev/null 'gh pr merge 5'", "gh <<< x secret list", "gh >| f auth token", "gh &> f pr merge 5",
+                "gh 3> f pr merge 5", "gh {fd}>x pr merge 5", "bash > \"o u t\" -c 'gh pr merge 5'",
+                ">|\tsudo  launchctl<<<refs/heads/main",
+                # P2-2: every place a command starts.
+                "true\nlaunchctl list", "true\nrm -rf Tools/coord", "bash -c 'sudo ls'", "bash -c 'rm -rf Tools/coord'",
+                "  sudo ls", "{ sudo ls; }", "! sudo ls", "if true; then sudo ls; fi", "X=1 sudo ls", "command sudo ls",
+                "nice sudo ls", "nice -n 5 sudo ls", "timeout 5 sudo ls", "caffeinate sudo ls", "arch -arm64 sudo ls",
+                "stdbuf -o0 sudo ls",
+                # P3: nine redirections, a shell's options before -c, security's prefixes.
+                "bash >a >a >a >a >a >a >a >a >a -c 'gh pr merge 5'", "bash -x -c 'gh pr merge 5'",
+                "bash -c -- 'gh pr merge 5'", "bash --norc -c 'gh pr merge 5'", "sh -e -c 'sudo ls'",
+                "bash -o pipefail -c 'gh pr merge 5'", "security find-g -s x -w", "security find-generic -w",
+                "security dump-k",
+                # zsh's `=name` runs the program found on PATH; `\name` is the name, escaped.
+                "=sudo ls", "\tsudo\n=launchctl list", "=coord train approve 5", "=security find-generic-password -w",
+                "\\sudo ls", "\\coord token exec -- env", "=rm -rf Tools/coord",
+                # zsh runs `()cmd` at once (an anonymous function).
+                "()sudo ls", "true&()sudo ls", "() coord train approve 5", "()security find-generic-password -w",
+                "()rm -rf Tools/coord"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("gh pr diff 5 > /tmp/d.txt", "Tools/coord/coord board --brief 2> /dev/null",
+                        "cat notes.md | grep -n sudo", "gh pr view 5 --json title < /dev/null", "echo 'x' >> /tmp/log"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_a_word_ends_at_every_shell_metacharacter(self):
         # Round ten (P2-1): the push rule on its own, before redirections are taken out.

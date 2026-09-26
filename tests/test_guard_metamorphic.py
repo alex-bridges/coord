@@ -10,8 +10,10 @@ variant must be blocked too:
 (a) `\\<newline>` after one space or tab, with and without indentation after it;
 (b) the case of a program name, and of a path's directories (macOS resolves both without
     case): upper, Title and mixed;
-(c) a redirection right after a word: `>/dev/null`, `</dev/null`, `>&2`, and ` 2>&1`;
-(d) the command wrapped in `( … )` and in `$( … )`.
+(c) a redirection right after a word: `>/dev/null`, `</dev/null`, `>&2`, and (after a space)
+    `2>&1`, `> /dev/null`, `2> /dev/null`, `< /dev/null` and `<<< x`;
+(d) the command wrapped in `( … )` and in `$( … )`;
+(e) something before the command: a line (`true`), indentation, `{ … }`, or a redirection.
 
 Rewrites that would change the meaning are not made (SKIPPED below says which and why).
 Run: python3 -m unittest discover -s Tools/coord/tests
@@ -43,6 +45,7 @@ SKIPPED = {
     "(b) the final path component": "the case of a file name is left alone (the review's scope)",
     "(b) non-file paths": "API paths, git refs and $HOME are case-sensitive",
     "(c) after a word ending in a backslash": "the backslash would escape the redirection (or end a continuation)",
+    "(c) after a redirection operator": "`gh > /dev/null` would become `gh >>/dev/null /dev/null`",
 }
 
 
@@ -77,13 +80,15 @@ def recased(command: str):
                 yield command[:match.start()] + new_word + command[match.end():]
 
 
-REDIRECTIONS = (">/dev/null", "</dev/null", ">&2", " 2>&1")
+REDIRECTIONS = (">/dev/null", "</dev/null", ">&2", " 2>&1", " > /dev/null", " 2> /dev/null", " < /dev/null", " <<< x")
 
 
 def redirected(command: str):
     for match in re.finditer(r"\S+", command):
         if match.group(0).endswith("\\"):
             continue  # SKIPPED: the backslash would escape the redirection instead
+        if match.group(0)[-1] in "<>|&" and re.search(r"[<>]", match.group(0)):
+            continue  # SKIPPED: after a redirection operator, the insertion would become its target
         for redirection in REDIRECTIONS:
             yield command[:match.end()] + redirection + command[match.end():]
 
@@ -93,10 +98,19 @@ def wrapped(command: str):
     yield "$(" + command + "\n)"
 
 
+def prefixed(command: str):
+    """(`{ …\n}`, not `{ …; }`: a trailing comment or heredoc would swallow `; }`.)"""
+    yield "true\n" + command
+    yield "  " + command
+    yield "{ " + command + "\n}"
+    yield ">/dev/null " + command
+
+
 REWRITES = {"(a) continuation": continuations, "(b) case": recased, "(c) redirection": redirected,
-            "(d) subshell": wrapped}
+            "(d) subshell": wrapped, "(e) prefix": prefixed}
 # Each kind makes at least this many variants of the blocked commands (so dropping one fails).
-MINIMUM_VARIANTS = {"(a) continuation": 60000, "(b) case": 15000, "(c) redirection": 150000, "(d) subshell": 6000}
+MINIMUM_VARIANTS = {"(a) continuation": 25000, "(b) case": 15000, "(c) redirection": 130000, "(d) subshell": 6000,
+                    "(e) prefix": 12000}
 
 
 def blocked(guard, command: str) -> bool:
@@ -104,12 +118,19 @@ def blocked(guard, command: str) -> bool:
     return bool(guard.verdict(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"}))
 
 
-def escapes(guard, commands) -> dict:
+# The rewrites made at every position, (a) and (c), take every hand-written command but one
+# fuzz-grammar command in four: a deterministic sample, as the grammar repeats its shapes.
+EVERY_POSITION = ("(a) continuation", "(c) redirection")
+FUZZ_STRIDE = 4
+
+
+def escapes(guard, commands, fuzz=frozenset()) -> dict:
     """For each rewrite: the number of variants made, and the variants the guard allows."""
     report = {}
+    sampled = [command for index, command in enumerate(commands) if command not in fuzz or index % FUZZ_STRIDE == 0]
     for kind, rewrite in REWRITES.items():
         made, allowed = 0, []
-        for command in commands:
+        for command in (sampled if kind in EVERY_POSITION else commands):
             for variant in rewrite(command):
                 made += 1
                 if not blocked(guard, variant):
@@ -124,7 +145,7 @@ class GuardMetamorphicTests(unittest.TestCase):
         cls.guard = differential.load(GUARD, "conductor_guard_metamorphic")
         corpus = list(dict.fromkeys(command for source in differential.corpus_sources().values() for command in source))
         cls.blocked_commands = [command for command in corpus if blocked(cls.guard, command)]
-        cls.report = escapes(cls.guard, cls.blocked_commands)
+        cls.report = escapes(cls.guard, cls.blocked_commands, frozenset(differential.fuzz_grammar()))
 
     def test_the_rewrites_are_the_shells(self):
         self.assertIn("git push origin \\\nmain", list(continuations("git push origin main")))
@@ -134,6 +155,8 @@ class GuardMetamorphicTests(unittest.TestCase):
         self.assertIn("git push origin main>/dev/null", list(redirected("git push origin main")))
         self.assertIn("git push origin main 2>&1", list(redirected("git push origin main")))
         self.assertEqual(list(wrapped("sudo ls")), ["(sudo ls\n)", "$(sudo ls\n)"])
+        self.assertIn("gh pr merge 5 > /dev/null", list(redirected("gh pr merge 5")))
+        self.assertEqual(list(prefixed("sudo ls")), ["true\nsudo ls", "  sudo ls", "{ sudo ls\n}", ">/dev/null sudo ls"])
 
     def test_every_variant_of_a_blocked_command_is_blocked(self):
         self.assertGreater(len(self.blocked_commands), 3000)

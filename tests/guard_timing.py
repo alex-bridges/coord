@@ -73,28 +73,37 @@ def keywords(pattern: str) -> list:
 def inputs(pattern: str) -> list:
     """Repeated to LENGTH: each prefix of the keywords, ending in a space or in `X ` (so a `\\b`
     after the last keyword fails and the rule keeps searching); and each punctuation character
-    of the pattern, alone and before the first keyword (`((((`, `(coord(coord`)."""
+    of the pattern: alone, before the first keyword, and before it and a space (`((((`,
+    `(coord(coord`); and each keyword alone and as a flag (`-exec -exec …`, where every
+    `exec` is a new start)."""
     words = keywords(pattern)
     units = [" ".join(words[:count]) + tail for count in range(1, len(words) + 1) for tail in (" ", "X ")]
     for character in sorted(set(re.findall(r"[^\w\s\\]", pattern))):
-        units += [character, character + (words[0] if words else "")]
-    return [(unit * (LENGTH // len(unit) + 1))[:LENGTH] for unit in units]
+        first = words[0] if words else ""
+        units += [character, character + first, character + first + " "]
+    # Each keyword alone, and as a flag (`-exec -exec …`: a word inside every flag).
+    units += [word + " " for word in words] + ["-" + word + " " for word in words]
+    return [(unit * (LENGTH // len(unit) + 1))[:LENGTH] for unit in dict.fromkeys(units)]
 
 
 def rules(guard) -> dict:
-    """name -> (the rule's pattern text, a call that runs the rule alone, whether a witness must
-    match). The helpers every verdict runs (script extraction, `cd`, redirections) are timed too."""
+    """name -> (the rule's pattern text, a call that runs the rule alone over every view, whether
+    a witness must match). The helpers every verdict runs (views, script extraction, `cd`,
+    redirections, the continuation join) are timed too."""
     found = {}
     for index, (rule, _) in enumerate(guard.RULES):
-        found[f"RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: rule.search(guard._REDIRECT.sub(
-            " ", guard.executable_text(c))), True)
+        found[f"RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: any(rule.search(t) for t in guard._views(c)[1]),
+                                    True)
     for index, (rule, _) in enumerate(guard.RAW_RULES):
-        found[f"RAW_RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: rule.search(c), True)
+        found[f"RAW_RULES[{index}]"] = (rule.pattern, lambda c, rule=rule: any(rule.search(v) for v in guard._views(c)[0]),
+                                        True)
     found["apptoken"] = (guard._PYTHON.pattern + " apptoken test_apptoken", guard._python_apptoken, True)
-    found["writes"] = (guard._WRITES.pattern, lambda c: guard._WRITES.search(guard.executable_text(c)), True)
+    found["writes"] = (guard._WRITES.pattern, lambda c: any(guard._WRITES.search(t) for t in guard._views(c)[1]), True)
     found["script"] = (guard._SCRIPT.pattern, lambda c: list(guard._SCRIPT.finditer(c)), False)
     found["cd"] = (guard._CD.pattern, guard._CD.match, False)
-    found["redirect"] = (guard._REDIRECT.pattern, lambda c: guard._REDIRECT.sub(" ", c), False)
+    found["redirect"] = (guard._REDIRECT.pattern, guard._strip_redirections, False)
+    found["too many redirections"] = (guard._TOO_MANY_REDIRECTIONS.pattern, guard._TOO_MANY_REDIRECTIONS.search, False)
+    found["continuation"] = (guard._CONTINUATION.pattern, lambda c: guard._CONTINUATION.sub(r"\1", c), False)
     return found
 
 
