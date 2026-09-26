@@ -836,14 +836,22 @@ class GuardHookTests(unittest.TestCase):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_token_cache_is_blocked(self):
+        # Codex on 141d38f62 (P1): a path has spellings no pattern keeps up with, so the rule is
+        # co-occurrence, like apptoken's: `inisa` and `cache` anywhere in the case-folded command.
         for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
                         "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
                         "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/",
-                        # Matched without case: macOS's filesystem ignores it, so this is the same file.
-                        "cat ~/library/caches/INISA-COORD/ops.json"):
-            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
-        for command in ("ls ~/Library/Caches", "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json",
-                        "Tools/coord/coord token status"):
+                        "cat ~/library/caches/INISA-COORD/ops.json", "cat ~/Library//Caches/inisa-coord/read.json",
+                        "cat ~/Library/Caches/./inisa-coord/ops.json", "cat ~/Library/Caches/inisa*/ops.json",
+                        "cat ~/Library/Caches/INISA-COORD/ops.json", "cd ~/Library/Caches && cat inisa-coord/ops.json",
+                        # The cost, as for apptoken: any command that names both, the budget cache and
+                        # prose included. The way out is the Write tool.
+                        "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json"):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("`inisa` and `cache` in one command", result.stderr, command)
+            self.assertIn("write such text with the Write tool", result.stderr, command)
+        for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
