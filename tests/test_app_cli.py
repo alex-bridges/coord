@@ -19,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from apptestkit import INSTALLATION, REPO, AppTestCase  # noqa: E402
+from apptestkit import INSTALLATION, REPO, AppTestCase, FakeResponse  # noqa: E402
 from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli  # noqa: E402
 
 USER_TOKEN = "user-token-that-must-never-be-sent"
@@ -367,6 +367,62 @@ class NoFallbackTests(AppCliTestCase):
         self.break_app("keychain")
         self.main(["train", "status"])
         self.assertEqual(len(self.security_calls()), 1, "the failure is not retried within the command")
+
+
+class TrainStatusBatchTests(AppCliTestCase):
+    """Codex on e470b61da (P2): the read token failing after the refs call, on the batch's
+    workflow runs (its first page or a later one), took `train status` down with a backend
+    error. It reports the queue from the snapshot and does not read the batch, as for refs."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["GH_TOKEN"] = os.environ["GITHUB_TOKEN"] = USER_TOKEN  # a fallback would find it here
+        self.server.tokens[USER_TOKEN] = "user"
+        self.seed_token("read")
+        now = time.time()
+        cache.store_snapshot(REPO, {
+            "schema": 1, "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)), "repo": REPO,
+            "main": {"sha": "f" * 40}, "prs": [], "claims": [], "overlaps": [],
+            "train": [{"pr": 101, "headAtAdd": "a" * 40}], "runs": {"running": [], "queued": []}, "messages": [],
+            "apiCalls": 9})
+        self.runs_calls = 0
+        real = self.server._api_call
+
+        def api_call(method, path, body):
+            route = path.split("?", 1)[0]
+            if route.endswith("/git/matching-refs/heads/train"):
+                return FakeResponse([{"ref": "refs/heads/train/batch-1", "object": {"sha": "b" * 40}}], {})
+            if "/actions/workflows/" in route and route.endswith("/runs"):
+                self.runs_calls += 1
+                if self.runs_calls < self.fail_on_page:
+                    link = f"<https://api.github.com/{route}?page={self.runs_calls + 1}>; rel=\"next\""
+                    return FakeResponse({"workflow_runs": []}, {"Link": link})
+                raise self.server._error(f"https://api.github.com/{path}", 401, {"message": "Bad credentials"})
+            return real(method, path, body)
+
+        self.patch(self.server, "_api_call", api_call)
+
+    def test_a_refused_runs_request_reports_the_queue_and_skips_the_batch(self):
+        for page in (1, 2):
+            for argv in (["train", "status"], ["train", "status", "--json"]):
+                with self.subTest(page=page, argv=argv):
+                    self.fail_on_page, self.runs_calls = page, 0
+                    self.seed_token("read")  # the 401 dropped the last one
+                    code, out, err = self.main(argv)
+                    self.assertEqual(code, EXIT_OK, err)
+                    self.assertEqual(self.runs_calls, page, "the refs succeeded; the runs were refused on this page")
+                    self.assertIn("GitHub App token unavailable", err)
+                    self.assertIn("the queue is from the cached snapshot", err)
+                    if "--json" in argv:
+                        data = json.loads(out)
+                        self.assertIsNone(data["batches"])
+                        self.assertEqual([entry["pr"] for entry in data["queue"]], [101])
+                    else:
+                        self.assertIn("batch: not read (GitHub App token unavailable)", out)
+                        self.assertIn("1. #101", out)
+                    self.assertEqual(self.runner.calls, [], "the gh runner was never called")
+                    self.assertEqual([r for r in self.server.requests if r["bearer"] == USER_TOKEN], [],
+                                     "nothing was sent as Alex")
 
 
 class StaleWriteGuardTests(AppCliTestCase):

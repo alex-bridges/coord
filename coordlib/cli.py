@@ -668,16 +668,22 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         refs = []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
-    for ref in refs:
-        name = ref["ref"][len("refs/heads/"):]
-        tip = (ref.get("object") or {}).get("sha", "")
-        pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
-                                  f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
-        runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
-        run = max(runs, key=lambda r: r["id"]) if runs else None
-        batches.append({"branch": name, "tip": tip, "run": None if run is None else {
-            "status": run.get("status"), "conclusion": run.get("conclusion"),
-            "attempt": run.get("run_attempt"), "url": run.get("html_url")}})
+    try:
+        for ref in refs:
+            name = ref["ref"][len("refs/heads/"):]
+            tip = (ref.get("object") or {}).get("sha", "")
+            pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
+                                      f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
+            runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
+            run = max(runs, key=lambda r: r["id"]) if runs else None
+            batches.append({"branch": name, "tip": tip, "run": None if run is None else {
+                "status": run.get("status"), "conclusion": run.get("conclusion"),
+                "attempt": run.get("run_attempt"), "url": run.get("html_url")}})
+    except AppAuthError as error:  # the read token failed after the refs (on any page of the runs)
+        mark_app_unavailable(gh, error)
+        low = gh.app_unavailable
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        batches = []
     queue = []
     for entry in snap["train"]:
         pr = prs.get(entry["pr"])
