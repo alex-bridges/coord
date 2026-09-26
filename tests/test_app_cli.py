@@ -23,6 +23,7 @@ from apptestkit import INSTALLATION, REPO, AppTestCase  # noqa: E402
 from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli  # noqa: E402
 
 USER_TOKEN = "user-token-that-must-never-be-sent"
+DEEP_JSON = "[" * 1_000_000 + "]" * 1_000_000  # too deep for 3.9 and 3.14's parsers alike
 COORD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "coord")
 
 
@@ -261,7 +262,7 @@ class NoFallbackTests(AppCliTestCase):
     """After an app failure nothing is sent as Alex: the gh runner is never called and no
     request carries his token. Reads with a cache serve it; everything else refuses."""
 
-    FAILURES = ("keychain", "mint 401", "mint 403", "broken config")
+    FAILURES = ("keychain", "mint 401", "mint 403", "broken config", "deep config")
 
     def break_app(self, how):
         os.environ["GH_TOKEN"] = USER_TOKEN  # a fallback would find it right here
@@ -272,8 +273,12 @@ class NoFallbackTests(AppCliTestCase):
         elif how.startswith("mint"):
             self.keychain("key")
             self.server.mint_status = int(how.split()[1])
-        else:
+        elif how == "broken config":
             self.write_config("{broken")
+        else:
+            # Codex on a774ba186 (P2): nested too deep for any Python's parser (RecursionError).
+            # It must end as a broken config does: refused, never Alex's token.
+            self.write_config(DEEP_JSON)
 
     def assert_nothing_as_alex(self):
         self.assertEqual(self.runner.calls, [], "the gh runner was called after an app failure")
@@ -568,6 +573,21 @@ class TokenStatusTests(AppCliTestCase):
         code, out, _ = self.main(["token", "status"])
         self.assertIn("app mode: on (the app config exists but cannot be used)", out)
         self.assertIn("every app call refuses: the app config", out)
+        with self.assertRaises(RecursionError, msg="the fixture must really be too deep to parse"):
+            json.loads(DEEP_JSON)
+        self.write_config(DEEP_JSON)
+        code, out, err = self.main(["token", "status"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("app mode: on (the app config exists but cannot be used)", out)
+        self.assertIn("cannot be read (RecursionError)", out)
+
+    def test_a_group_readable_cached_token_is_not_reported_reusable(self):
+        # Codex on a774ba186 (P2): describe() said `reusable` for a 0644 file that cached()
+        # refuses, so `token status` disagreed with what the next call does.
+        self.seed_token("read", mode=0o644)
+        self.assertIsNone(self.tokens().cached("read"))
+        self.assertEqual(self.tokens().describe("read")["state"], "file not private to this user (not used)")
+        self.assertIn("read token: file not private to this user (not used)", self.main(["token", "status"])[1])
 
     def test_status_names_another_api_url_as_the_reason(self):
         os.environ["GITHUB_API_URL"] = "http://127.0.0.1:9"

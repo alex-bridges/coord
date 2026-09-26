@@ -222,7 +222,7 @@ def load_config(path: str) -> Dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError) as error:
+    except Exception as error:  # noqa: BLE001 - RecursionError, MemoryError: broken, as invalid JSON is
         raise AppAuthError(f"the app config {path} cannot be read ({type(error).__name__})") from None
     if not isinstance(data, dict):
         raise AppAuthError(f"the app config {path} is not a JSON object")
@@ -446,7 +446,7 @@ class AppTokens:
         expires = expiry_epoch(entry)
         out = {"permissions": entry.get("permissions") if isinstance(entry.get("permissions"), dict) else None,
                "expires_at": entry.get("expires_at") if isinstance(entry.get("expires_at"), str) else None}
-        if self.usable(entry, kind):
+        if self.usable(entry, kind) and self._private_file(self.path(kind)):  # what cached() will take
             out["state"] = "reusable"
             out["minutes_left"] = int((expires - self._clock()) // 60) if expires else None
         elif not self._same_config(entry):
