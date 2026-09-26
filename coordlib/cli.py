@@ -825,7 +825,9 @@ def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
     config = conductor.Config.from_env()
     snap = get_snapshot(gh, args.max_age)
     now = snapshot.now_utc()
-    lines = [line for window in render.active_outages(snap, now) for line in [render.outage_line(window, now)]]
+    # A board served from the cache says so first, as `board` and the brief do.
+    lines = [render.stale_words(snap)] if snap.get("stale") else []
+    lines += [line for window in render.active_outages(snap, now) for line in [render.outage_line(window, now)]]
     lines += render.conductor_lines(snap, now)
     wakes = conductor.read_wakes(config)
     day = [w for w in wakes if (review.parse_time(w.get("at")) or now) > now - dt.timedelta(days=1)]

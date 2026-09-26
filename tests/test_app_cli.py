@@ -468,6 +468,19 @@ class StaleBoardTests(AppCliTestCase):
         code, out, _ = self.main(["board", "--brief"])
         self.assertEqual(code, EXIT_OK)
         self.assertNotIn("STALE", out)
+        code, out, _ = self.main(["conductor", "status"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertNotIn("STALE", out)
+
+    def test_conductor_status_leads_with_the_age_too(self):
+        # Round three of the #1046 review (P3-3): conductor status serves the cache like board.
+        self.seed_snapshot(age_seconds=3 * 3600)
+        self.keychain("missing")
+        code, out, err = self.main(["conductor", "status"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertTrue(out.startswith("STALE: snapshot from 3h00m ago; GitHub App token unavailable: "), out)
+        self.assertIn("showing the snapshot from 3h00m ago", err)
+        self.assertEqual(self.runner.calls, [])
 
 
 class EchoedSecretTests(AppCliTestCase):
