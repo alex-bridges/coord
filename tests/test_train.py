@@ -116,7 +116,7 @@ class EligibilityTests(unittest.TestCase):
         verdict, hold, reason = train.assess(self.unreviewed())
         self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW))
         self.assertIn("no clean review of it recorded", reason)
-        self.assertIn("coord train review 1 --head <reviewed-sha> --by <agent>", reason)
+        self.assertIn("coord train review 1 --head <full-reviewed-sha> --by <agent>", reason)
         self.assertIn("current head aaaaaaaaa", reason, "the held head is named, outside the command")
         self.assertNotIn("--head aaaaaaa", reason, "never pre-filled with the current head")
         self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
@@ -1184,7 +1184,7 @@ class StepTests(unittest.TestCase):
         self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
         self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
         self.assertIn("waits for Alex", text, "the reason")
-        self.assertIn("coord train approve 1 --head <sha-Alex-approved>", text, "the action that clears it")
+        self.assertIn("coord train approve 1 --head <full-sha-Alex-approved>", text, "the action that clears it")
         self.assertIn(f"at head `{self.H1[:9]}`", text, "the held head is named, outside the command")
         self.assertNotIn(f"--head {self.H1[:7]}", text, "never pre-filled with the current head")
         [(payload, _)] = self.held(fake, 2)
@@ -1247,8 +1247,8 @@ class StepTests(unittest.TestCase):
         self.add(fake, 1, self.H1, 30)
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
-        for number, head, command in ((1, self.H1, "coord train review 1 --head <reviewed-sha> --by <agent>"),
-                                      (2, self.H2, "coord train approve 2 --head <sha-Alex-approved>")):
+        for number, head, command in ((1, self.H1, "coord train review 1 --head <full-reviewed-sha> --by <agent>"),
+                                      (2, self.H2, "coord train approve 2 --head <full-sha-Alex-approved>")):
             with self.subTest(pr=number):
                 [(_, text)] = self.held(fake, number)
                 self.assertIn(command, text)

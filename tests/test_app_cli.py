@@ -118,9 +118,9 @@ class RoutingTests(AppCliTestCase):
 
     def test_attestations_stay_on_alex(self):
         self.keychain("key")
-        for argv, label in ((["train", "approve", "101", "--head", "aaaaaaa", "--note", "Alex said so"], "alex-approved"),
-                            (["train", "review", "101", "--head", "aaaaaaa", "--by", "agy@h:gemini", "--note", "n"], "reviewed"),
-                            (["train", "substitute-review", "101", "--head", "aaaaaaa", "--note", "reviewed by X"], "reviewed")):
+        for argv, label in ((["train", "approve", "101", "--head", "a" * 40, "--note", "Alex said so"], "alex-approved"),
+                            (["train", "review", "101", "--head", "a" * 40, "--by", "agy@h:gemini", "--note", "n"], "reviewed"),
+                            (["train", "substitute-review", "101", "--head", "a" * 40, "--note", "reviewed by X"], "reviewed")):
             with self.subTest(argv=argv[:2]):
                 self.runner.calls.clear()
                 code, out, err = self.main(argv)
@@ -140,9 +140,9 @@ class RoutingTests(AppCliTestCase):
 
         argvs = [["board"], ["whoami"], ["claim", "5", "--branch", "b"], ["release", "5"], ["send", "x"],
                  ["inbox"], ["ci", "mk4"], ["train", "add", "7"], ["train", "remove", "7"], ["train", "status"],
-                 ["train", "approve", "7", "--head", "aaaaaaa", "--note", "n"],
-                 ["train", "review", "7", "--head", "aaaaaaa", "--by", "x", "--note", "n"],
-                 ["train", "substitute-review", "7", "--head", "aaaaaaa", "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
+                 ["train", "approve", "7", "--head", "a" * 40, "--note", "n"],
+                 ["train", "review", "7", "--head", "a" * 40, "--by", "x", "--note", "n"],
+                 ["train", "substitute-review", "7", "--head", "a" * 40, "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
                  ["conductor", "tick"], ["conductor", "status"], ["conductor", "pause", "--for", "1h"],
                  ["conductor", "resume"], ["conductor", "escalate", "x"],
                  ["token", "status"], ["token", "exec", "--", "true"]]
@@ -865,9 +865,9 @@ class NoLeakTests(AppCliTestCase):
             ["release", "55", "--everyone"], ["release", "57"], ["send", "hello"], ["send", "hi", "--on", "101"],
             ["inbox"], ["inbox", "--json", "--all"], ["ci", "mk4", "--ref", "feature/x"],
             ["train", "add", "101"], ["train", "remove", "101"], ["train", "status"], ["train", "status", "--json"],
-            ["train", "approve", "101", "--head", "aaaaaaa", "--note", "n"],
-            ["train", "review", "101", "--head", "aaaaaaa", "--by", "x", "--note", "n"],
-            ["train", "substitute-review", "101", "--head", "aaaaaaa", "--note", "n"],
+            ["train", "approve", "101", "--head", "a" * 40, "--note", "n"],
+            ["train", "review", "101", "--head", "a" * 40, "--by", "x", "--note", "n"],
+            ["train", "substitute-review", "101", "--head", "a" * 40, "--note", "n"],
             ["train", "step", "--repo-dir", self.no_repo],
             ["outage", "start", "claude", "--note", "limit"], ["outage", "end", "claude"],
             ["conductor", "tick", "--dry-run", "--no-wake"], ["conductor", "status"],

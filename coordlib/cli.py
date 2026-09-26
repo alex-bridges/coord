@@ -625,24 +625,33 @@ def cmd_train_remove(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+FULL_SHA_WORDS = "give the full 40-character SHA of the head you reviewed or approved"
+
+
 def head_sha(text: str) -> str:
-    """argparse type for `--head`: a full commit SHA or a prefix of at least 7 hex digits."""
+    """argparse type for `--head`: a full 40-hex commit SHA, case-folded. Never a prefix:
+    an author can grind a commit that shares a short prefix with the reviewed head
+    (about 2^28 hashes for 7 digits; Codex P1 on #1054)."""
     value = text.strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{7,40}", value):
-        raise argparse.ArgumentTypeError(f"{text!r} is not a commit SHA (7 to 40 hex digits)")
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError(f"{FULL_SHA_WORDS} (got {text!r})")
     return value
 
 
 def attested_head(gh: GitHub, number: int, given: str) -> Optional[str]:
-    """The PR's current head, full, when it is the head the attestation names (`--head`);
+    """The PR's current head when it EQUALS the head the attestation names (`--head`);
     otherwise None, after saying why. The head is read when the command runs, not when the
     review or approval happened, so without this a push in between would be recorded as
     reviewed or approved (review of #1054)."""
     pr = gh.rest(f"repos/{{repo}}/pulls/{number}")
-    head = str((pr.get("head") or {}).get("sha") or "")
-    if not head or not head.lower().startswith(given):
-        print(f"coord: #{number} is at {head or 'an unknown head'}, not {given}: its head moved after what "
-              "you are recording was done, so nothing was recorded; review or approve the new head", file=sys.stderr)
+    head = str((pr.get("head") or {}).get("sha") or "").lower()
+    if not head or head != given:
+        if head.startswith(given):
+            why = f"{FULL_SHA_WORDS}, not a prefix"
+        else:
+            why = "its head moved after what you are recording was done; review or approve the new head"
+        print(f"coord: #{number} is at {head or 'an unknown head'}, not {given}: {why}. Nothing was recorded.",
+              file=sys.stderr)
         return None
     return head
 
@@ -1012,7 +1021,7 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("pr", type=int)
     remove.add_argument("--note")
     remove.set_defaults(func=cmd_train_remove)
-    head_help = "the head that was reviewed or approved (a SHA or 7+ digit prefix); refused if the PR has moved on"
+    head_help = "the full 40-character SHA of the head that was reviewed or approved; refused unless it is the PR's head"
     reviewed = train_sub.add_parser("review", help="record a clean review of a PR's head by an agent")
     reviewed.add_argument("pr", type=int)
     reviewed.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)

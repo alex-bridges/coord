@@ -93,11 +93,12 @@ HOLD_ACTIONS = {
                         "Alex decides: merge it by hand, or take it out of the train."),
     # `--head` is a placeholder, never the current head: copying the current head would
     # attest whatever is there now, not the head that was reviewed or approved.
-    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} --head <sha-Alex-approved> "
-                      "--note \"…\"`, or tell an agent to), or take it out of the train. A new push needs a new "
-                      "approval."),
+    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} "
+                      "--head <full-sha-Alex-approved> --note \"…\"`, or tell an agent to), or take it out of the "
+                      "train. A new push needs a new approval."),
     HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head, or a clean review of this head by any agent, recorded "
-                     "with `Tools/coord/coord train review {pr} --head <reviewed-sha> --by <agent> --note \"…\"`."),
+                     "with `Tools/coord/coord train review {pr} --head <full-reviewed-sha> --by <agent> "
+                     "--note \"…\"`."),
     HOLD_UNANSWERED_FINDINGS: ("Answer every finding on the PR. If answering means a push, add the new head "
                                "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
     HOLD_CI_RED: ("Fix the failing checks, or re-run them if they flaked. A fix is a new push: add the new head "
@@ -175,7 +176,7 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         head = str(pr.get("head"))[:9]
         if not reviewed:
             return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head} and no clean review of it recorded "
-                                          f"(`coord train review {pr.get('number')} --head <reviewed-sha> "
+                                          f"(`coord train review {pr.get('number')} --head <full-reviewed-sha> "
                                           "--by <agent>`)")
         if reviewed != pr.get("head"):
             return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head}, and the recorded clean review "

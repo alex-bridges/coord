@@ -710,40 +710,64 @@ class CodexRoundThreeTests(unittest.TestCase):
         for argv, kind in ((["train", "review", "101", "--by", "x", "--note", "n"], "review-clean"),
                            (["train", "substitute-review", "101", "--note", "n"], "review-clean"),
                            (["train", "approve", "101", "--note", "n"], "alex-approve")):
-            for given in ("abc0000", self.HEAD, "ABC0000000"):
+            for given in (self.HEAD, self.HEAD.upper()):
                 with self.subTest(command=argv[1], head=given):
                     _, payload, _ = self.run_review(argv[:3] + ["--head", given] + argv[3:])
                     self.assertEqual((payload["kind"], payload["head"]), (kind, self.HEAD))
 
     def test_every_attestation_refuses_a_head_the_pr_has_moved_past(self):
+        moved = "def" + "1" * 37
         for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
                      ["train", "substitute-review", "101", "--note", "n"],
                      ["train", "approve", "101", "--note", "n"]):
             with self.subTest(command=argv[1]):
-                code, calls, err = self.run_attestation(argv[:3] + ["--head", "def1234"] + argv[3:])
+                code, calls, err = self.run_attestation(argv[:3] + ["--head", moved] + argv[3:])
                 self.assertEqual(code, cli.EXIT_CONFLICT)
                 self.assertEqual([c for c in calls if c[0] != "GET"], [], "nothing posted, no label")
                 self.assertIn(self.HEAD, err)
-                self.assertIn("def1234", err)
+                self.assertIn(moved, err)
+                self.assertIn("head moved", err)
 
-    def test_every_attestation_needs_a_head(self):
+    def test_every_attestation_needs_the_full_head(self):
+        # A prefix can be matched by a commit ground to share it (about 2^28 hashes for 7
+        # digits; Codex P1 on #1054), so only the full 40-character SHA is accepted.
         for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
                      ["train", "substitute-review", "101", "--note", "n"],
-                     ["train", "approve", "101", "--note", "n"],
-                     ["train", "approve", "101", "--head", "abc12", "--note", "n"],       # too short
-                     ["train", "approve", "101", "--head", "not-a-sha", "--note", "n"]):
-            with self.subTest(argv=argv):
-                with open(os.devnull, "w") as quiet:
-                    saved, sys.stderr = sys.stderr, quiet
+                     ["train", "approve", "101", "--note", "n"]):
+            for head in (None, "abc0000", self.HEAD[:39], self.HEAD + "0", "not-a-sha"):
+                with self.subTest(command=argv[1], head=head):
+                    full = argv if head is None else argv[:3] + ["--head", head] + argv[3:]
+                    err = io.StringIO()
+                    saved, sys.stderr = sys.stderr, err
                     try:
                         with self.assertRaises(SystemExit) as raised:
-                            cli.parser().parse_args(argv)
+                            cli.parser().parse_args(full)
                     finally:
                         sys.stderr = saved
-                self.assertEqual(raised.exception.code, cli.EXIT_USAGE)
+                    self.assertEqual(raised.exception.code, cli.EXIT_USAGE)
+                    if head is not None:
+                        self.assertIn("give the full 40-character SHA", err.getvalue())
+
+    def test_a_prefix_never_matches_the_head_even_past_the_parser(self):
+        calls = []
+
+        class Fake:
+            def rest(self, path, method="GET", body=None):
+                calls.append((method, path))
+                return {"head": {"sha": CodexRoundThreeTests.HEAD}}
+
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+        try:
+            self.assertIsNone(cli.attested_head(Fake(), 101, "abc0000"))
+            self.assertEqual(cli.attested_head(Fake(), 101, self.HEAD), self.HEAD)
+        finally:
+            sys.stderr = saved
+        self.assertIn("give the full 40-character SHA of the head you reviewed or approved, not a prefix",
+                      err.getvalue())
 
     def test_train_review_records_the_head_and_the_reviewing_agent(self):
-        calls, payload, text = self.run_review(["train", "review", "101", "--head", "abc0000", "--by", "agy@h:gemini",
+        calls, payload, text = self.run_review(["train", "review", "101", "--head", self.HEAD, "--by", "agy@h:gemini",
                                                 "--note", "all clear"])
         self.assertEqual((payload["kind"], payload["pr"], payload["head"], payload["by"]),
                          ("review-clean", 101, "abc" + "0" * 37, "agy@h:gemini"))
@@ -757,10 +781,10 @@ class CodexRoundThreeTests(unittest.TestCase):
         self.assertFalse(any("codex-unavailable" in json.dumps(body) for _, _, body in calls), "a retired label")
 
     def test_substitute_review_is_the_same_command_by_its_old_name(self):
-        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", "abc0000", "--note", "by X"])
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", self.HEAD, "--note", "by X"])
         self.assertEqual((payload["kind"], payload["head"]), ("review-clean", "abc" + "0" * 37))
         self.assertNotIn("by", payload, "no --by, so no reviewer is named in the record")
-        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", "abc0000", "--by", "codex",
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", self.HEAD, "--by", "codex",
                                          "--note", "n"])
         self.assertEqual(payload["by"], "codex")
 
@@ -769,7 +793,7 @@ class CodexRoundThreeTests(unittest.TestCase):
             saved, sys.stderr = sys.stderr, quiet
             try:
                 with self.assertRaises(SystemExit):
-                    cli.parser().parse_args(["train", "review", "101", "--head", "abc0000", "--note", "n"])
+                    cli.parser().parse_args(["train", "review", "101", "--head", self.HEAD, "--note", "n"])
             finally:
                 sys.stderr = saved
 
