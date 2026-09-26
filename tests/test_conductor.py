@@ -666,7 +666,18 @@ class GuardHookTests(unittest.TestCase):
                         "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
                         "gh auth token", "gh workflow disable ci.yml",
                         # Round nine: a word ends at the end of its segment, a `)` or a backtick.
-                        "git push origin main;echo ok", "git push origin main&& echo", "(git push origin main)"):
+                        "git push origin main;echo ok", "git push origin main&& echo", "(git push origin main)",
+                        # Round ten: the shell's view. Continuations are joined, redirections are not
+                        # words, and program names and paths ignore case.
+                        "git push origin \\\nmain", "git push \\\n-f", "git push origin \\\n+HEAD:x",
+                        "git push origin HEAD:\\\nrefs/heads/main", "gh pr \\\n  merge 5",
+                        "Tools/coord/coord train \\\n  approve 5",
+                        "git push origin main>/dev/null", "git push origin main</dev/null", "git push origin main>&2",
+                        "git push origin refs/heads/main>/tmp/o", "gh>/dev/null pr merge 5", "gh api -X>/dev/null PUT r/pulls/1/merge",
+                        "bash>/dev/null -c 'gh pr merge 5'", "eval>/dev/null 'gh pr merge 5'", "cd x &&>&2 sudo ls",
+                        "GIT push --force", "Git push origin main", "GH pr merge 5", "GH api -X PUT repos/o/r/pulls/5/merge",
+                        "GH secret list", "GH auth token", "SUDO ls", "LAUNCHCTL list", "ENV sudo ls",
+                        "BASH -c 'gh pr merge 5'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_ordinary_work_and_prose_are_allowed(self):
@@ -686,14 +697,19 @@ class GuardHookTests(unittest.TestCase):
     def test_its_own_controls_cannot_be_written_but_a_worktrees_can(self):
         for path in ("/tmp/home/.claude/settings.json", "/tmp/home/.claude/agents/conductor.md",
                      "/tmp/home/Tools/coord/coordlib/conductor.py", "/tmp/home/CLAUDE.md", "Tools/coord/coord",
-                     "~/.claude/settings.json", "~/.claude/hooks/x.sh"):
+                     "~/.claude/settings.json", "~/.claude/hooks/x.sh",
+                     # Round ten: macOS resolves paths without case.
+                     "/tmp/home/.CLAUDE/settings.json", "~/.CLAUDE/hooks/x.sh", "/tmp/home/tools/COORD/coord"):
             self.assertEqual(self.run_guard("Write", {"file_path": path}), 2, path)
         for path in ("/tmp/wt/.claude/hooks/conductor-guard.py", "/tmp/wt/Tools/coord/coordlib/conductor.py",
                      "/tmp/home/Docs/agent-coordination.md", "~/.claude/projects/x/memory/MEMORY.md"):
             self.assertEqual(self.run_guard("Edit", {"file_path": path}), 0, path)
         for command in ("sed -i '' s/a/b/ .claude/hooks/conductor-guard.py", "echo x > CLAUDE.md",
                         "cp /tmp/x /tmp/home/Tools/coord/coordlib/conductor.py", "rm -rf Tools/coord",
-                        "echo {} > ~/.claude/settings.json"):
+                        "echo {} > ~/.claude/settings.json",
+                        # Round ten: case, redirections and continuations.
+                        "RM -rf Tools/coord", "echo x > .CLAUDE/settings.json", "sed</dev/null -i '' s/a/b/ CLAUDE.md",
+                        "cd /tmp/home>/dev/null && echo x > .claude/agents/conductor.md", "rm -rf \\\nTools/coord"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
 
     def test_silent_outside_the_conductor_and_closed_inside_it(self):
@@ -854,7 +870,7 @@ class GuardHookTests(unittest.TestCase):
         result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=3)
         self.assertEqual(result.returncode, 2)
         self.assertIn("longer than 20000 characters", result.stderr)
-        self.assertIn("write it to a file", result.stderr)
+        self.assertIn("write long text with the Write tool", result.stderr)
         self.assertEqual(self.run_guard("Bash", {"command": "echo " + "a" * 19000}), 0, "under the cap: checked as usual")
 
     def test_the_guard_decides_in_time_or_refuses(self):
@@ -871,50 +887,85 @@ class GuardHookTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 3)
         # The same input with the old cubic push rule put back first: the watchdog refuses at
         # DEADLINE_SECONDS (7), whatever regex is slow.
-        legacy = self.load_guard(os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard",
-                                              "conductor-guard.py"))
-        with tempfile.TemporaryDirectory() as folder:
-            slow = os.path.join(folder, "conductor-guard.py")
-            with open(GUARD, encoding="utf-8") as handle:
-                source = handle.read()
-            anchor = '\nif __name__ == "__main__":'
-            self.assertEqual(source.count(anchor), 1)
-            with open(slow, "w", encoding="utf-8") as handle:
-                handle.write(source.replace(anchor, f"\nRULES.insert(0, (re.compile({legacy.RULES[0][0]!r}), 'old'))" + anchor))
-            start = time.monotonic()
-            result = subprocess.run([sys.executable, slow], input=payload, capture_output=True, text=True, env=env,
-                                    timeout=15)
-            took = time.monotonic() - start
+        result, took = self.run_patched_guard(self.SLOW_RULE, payload)
         self.assertEqual(result.returncode, 2)
         self.assertIn("could not decide within 7 s", result.stderr)
         self.assertLess(took, 9.5, "well inside the hook's 10 s timeout")
 
-    def test_without_fork_the_guard_decides_inline(self):
+    SLOW_RULE = "RULES.insert(0, (re.compile(LEGACY_PUSH), 'old'))"
+
+    def run_patched_guard(self, code, payload):
+        """The guard with `code` run before main(), LEGACY_PUSH being 4f7d4a4fd's cubic push rule."""
+        legacy = self.load_guard(os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard",
+                                              "conductor-guard.py"))
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        with tempfile.TemporaryDirectory() as folder:
+            patched = os.path.join(folder, "conductor-guard.py")
+            with open(GUARD, encoding="utf-8") as handle:
+                source = handle.read()
+            anchor = '\nif __name__ == "__main__":'
+            self.assertEqual(source.count(anchor), 1)
+            with open(patched, "w", encoding="utf-8") as handle:
+                handle.write(source.replace(anchor, f"\nLEGACY_PUSH = {legacy.RULES[0][0]!r}\n{code}\n" + anchor))
+            start = time.monotonic()
+            result = subprocess.run([sys.executable, patched], input=payload, capture_output=True, text=True, env=env,
+                                    timeout=15)
+            return result, time.monotonic() - start
+
+    def test_the_parent_never_waits_for_a_stuck_child(self):
+        # Round ten (P3-1): a failing select (or a child stuck in I/O) must not keep the parent
+        # waiting past the hook's timeout: it kills the child and refuses at once.
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "gh pr view 5 # " + "git push " * 780},
+                              "cwd": "/tmp/home"})
+        result, took = self.run_patched_guard(
+            self.SLOW_RULE + "\ndef _broken(*args):\n    raise ValueError('select failed')\nselect.select = _broken", payload)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not check this call (ValueError)", result.stderr)
+        self.assertLess(took, 5, "the slow child was killed, not waited for")
+
+    def test_without_fork_the_guard_refuses(self):
+        # Round ten (P3-2): without a checker there is no deadline to keep, so it refuses.
         guard = self.load_guard(GUARD)
-        payload = {"tool_name": "Bash", "tool_input": {"command": "gh pr merge 5"}, "cwd": "/tmp/home"}
-        with mock.patch.object(guard.os, "fork", side_effect=OSError("no fork")):
-            self.assertIn("merging a PR by hand", guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"}))
-        with mock.patch.object(guard.os, "pipe", side_effect=OSError("no pipe")):
-            self.assertIn("merging a PR by hand", guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"}))
+        payload = {"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": "/tmp/home"}
+        for name, error in (("fork", OSError("no fork")), ("pipe", OSError("no pipe")), ("fork", AttributeError("fork"))):
+            with mock.patch.object(guard.os, name, side_effect=error):
+                why = guard.decide(payload, {"CLAUDE_PROJECT_DIR": "/tmp/home"})
+            self.assertIn(f"could not start its checker ({error.__class__.__name__})", why)
         result = self.run_guard("Bash", {}, raw=json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}, "cwd": 5}),
                                 full=True)
         self.assertEqual(result.returncode, 2, "an error in the checking child still refuses")
         self.assertIn("could not check this call (TypeError)", result.stderr)
 
     def test_every_rule_is_fast_on_its_own_keywords(self):
-        # Round nine (P1): each rule of RULES and RAW_RULES (and the apptoken and write checks),
-        # on inputs built from its own keywords and punctuation up to the cap, in a child process
-        # so a slow rule fails here instead of hanging the suite. The watchdog is the backstop.
-        timing = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guard_timing.py")
-        result = subprocess.run([sys.executable, timing, GUARD], capture_output=True, text=True, timeout=120)
-        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        report = json.loads(result.stdout)
+        # Rounds nine and ten (P1, P2-3): each rule of RULES and RAW_RULES, the apptoken and write
+        # checks and the helpers every verdict runs, on inputs built from its own keywords and
+        # punctuation up to the cap. Each rule's keywords must match it (so its inputs engage it),
+        # and each rule runs in its own child with a 10 s timeout, reported as a failure.
+        import guard_timing
         guard = self.load_guard(GUARD)
-        self.assertEqual(report["rules"], len(guard.RULES) + len(guard.RAW_RULES))
-        self.assertEqual(len(report["measured"]), report["rules"] + 2, "every rule, plus apptoken and writes")
-        for rule in report["measured"]:
+        report, failures = guard_timing.measure_in_children(GUARD, timeout=10)
+        self.assertEqual(failures, [])
+        self.assertEqual([rule["rule"] for rule in report], list(guard_timing.rules(guard)))
+        self.assertEqual(len(report), len(guard.RULES) + len(guard.RAW_RULES) + 5, "every rule, and the checks")
+        for rule in report:
             self.assertGreater(rule["inputs"], 1, rule)
-            self.assertLess(max(rule["verdict"], rule["alone"]), 2, rule)
+
+    def test_the_timing_test_catches_a_cubic_rule(self):
+        # Round ten (P2-3): the review's known-cubic rule, put into a copy, must be reported.
+        import guard_timing
+        with tempfile.TemporaryDirectory() as folder:
+            cubic = os.path.join(folder, "conductor-guard.py")
+            with open(GUARD, encoding="utf-8") as handle:
+                source = handle.read()
+            anchor = '\nif __name__ == "__main__":'
+            rule = 'RULES.insert(0, (re.compile(r"\\bgh\\s+api\\b[^\\n;&|]*\\bapi\\b[^\\n;&|]*--force"), "cubic"))'
+            with open(cubic, "w", encoding="utf-8") as handle:
+                handle.write(source.replace(anchor, "\n" + rule + "\n" + anchor))
+            report, failures = guard_timing.measure_in_children(cubic, timeout=4, only=["RULES[0]"])
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("RULES[0]", failures[0])
+        self.assertTrue("slower than" in failures[0] or "over the" in failures[0], failures)
 
     @staticmethod
     def load_guard(path):
@@ -938,6 +989,13 @@ class GuardHookTests(unittest.TestCase):
         # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
         self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
         self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
+
+    def test_a_word_ends_at_every_shell_metacharacter(self):
+        # Round ten (P2-1): the push rule on its own, before redirections are taken out.
+        push = self.load_guard(GUARD).RULES[0][0]
+        for metacharacter in " \t;&|()<>`":
+            self.assertTrue(push.search(f"git push origin main{metacharacter}x"), metacharacter)
+        self.assertFalse(push.search("git push origin mainline"))
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
