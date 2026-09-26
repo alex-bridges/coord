@@ -46,6 +46,13 @@ class AppCliTestCase(AppTestCase):
         os.environ["COORD_TRANSPORT"] = "gh"  # Alex's identity goes through the (fake) gh runner
         self.no_repo = os.path.join(self.root, "not-a-clone")
         os.makedirs(self.no_repo)
+        # The conductor's commands keep their state, checkout and model command inside the
+        # test directory.
+        for name, value in (("CONDUCTOR_HOME", self.no_repo), ("CONDUCTOR_STATE_DIR", os.path.join(self.root, "state")),
+                            ("CONDUCTOR_CLAUDE", os.path.join(self.root, "no-claude")),
+                            ("CONDUCTOR_UPDATE_CHECKOUT", "0")):
+            self.addCleanup(os.environ.pop, name, None)
+            os.environ[name] = value
 
     def writes(self):
         return [r for r in self.server.api_requests() if is_write(r)]
@@ -79,6 +86,19 @@ class RoutingTests(AppCliTestCase):
         "outage start": (["outage", "start", "claude", "--note", "limit"],
                          {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
                           ("POST", "repos/o/r/issues/900/comments")}),
+        "outage end": (["outage", "end", "claude"],
+                       {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
+                        ("POST", "repos/o/r/issues/900/comments")}),
+        "conductor pause": (["conductor", "pause", "--for", "1h"],
+                            {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
+                             ("POST", "repos/o/r/issues/900/comments")}),
+        "conductor resume": (["conductor", "resume"],
+                             {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
+                              ("POST", "repos/o/r/issues/900/comments")}),
+        "conductor escalate": (["conductor", "escalate", "look at #101"],
+                               {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
+                                ("POST", "repos/o/r/issues/900/comments"),
+                                ("POST", "repos/o/r/actions/workflows/notify-alex.yml/dispatches")}),
     }
 
     def test_operational_writes_use_the_ops_token_and_reads_the_read_token(self):
@@ -133,9 +153,31 @@ class RoutingTests(AppCliTestCase):
             self.assertIsNotNone(gh.app)
             cli.run(args, gh)
         self.assertEqual({name for name, on_app in seen.items() if not on_app}, set(cli.USER_IDENTITY))
-        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train substitute-review", "train step", "conductor tick",
-                                             "conductor status", "conductor pause", "conductor resume",
-                                             "conductor escalate"})
+        self.assertEqual(cli.USER_IDENTITY, {"train approve", "train substitute-review", "train step", "conductor tick"})
+
+    def test_conductor_status_reads_on_the_app(self):
+        self.keychain("key")
+        code, out, err = self.main(["conductor", "status"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertTrue(self.server.api_requests())
+        self.assertEqual({r["kind"] for r in self.server.api_requests()}, {"read"})
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.runner.calls, [], "nothing on Alex's gh")
+
+    def test_conversation_records_move_to_alex_with_one_line(self):
+        # P3-6: if Alex ever wants claims and messages posted as himself again, the change is
+        # `USER_IDENTITY = ATTESTATIONS | NEEDS_ALEX | CONVERSATION`. Prove that line is enough.
+        self.patch(cli, "USER_IDENTITY", cli.ATTESTATIONS | cli.NEEDS_ALEX | cli.CONVERSATION)
+        self.keychain("key")
+        for argv in (["claim", "55", "--branch", "feature/x"], ["release", "55", "--everyone"], ["send", "hi"],
+                     ["send", "hi", "--on", "101"], ["outage", "start", "claude"], ["outage", "end", "claude"]):
+            with self.subTest(argv=argv):
+                self.runner.calls.clear()
+                code, _, err = self.main(argv)
+                self.assertEqual(code, EXIT_OK, err)
+                self.assertTrue(self.runner_writes(), "posted through Alex's gh")
+        self.assertEqual(self.server.requests, [], "no app token minted or used")
+        self.assertEqual(self.security_calls(), [])
 
     def test_a_hand_run_train_step_never_touches_the_app(self):
         code, _, err = self.main(["train", "step", "--repo-dir", self.no_repo])
@@ -168,8 +210,7 @@ class RoutingTests(AppCliTestCase):
         code, out, _ = self.main(["whoami"])
         self.assertEqual(code, EXIT_OK)
         self.assertIn("githubIdentity: inisa-sidechain[bot] (installation not yet known)", out)
-        self.assertIn("Alex for `conductor escalate`", out)
-        self.assertIn("`train approve`, `train step`, `train substitute-review`", out)
+        self.assertIn("Alex for `conductor tick`, `train approve`, `train step`, `train substitute-review`", out)
         self.assertIn("apiBudget: API (app): no current reading", out)
         self.assertEqual(self.server.requests, [])
         self.assertEqual(self.security_calls(), [])
@@ -321,6 +362,51 @@ class NoFallbackTests(AppCliTestCase):
         self.break_app("keychain")
         self.main(["train", "status"])
         self.assertEqual(len(self.security_calls()), 1, "the failure is not retried within the command")
+
+
+class StaleWriteGuardTests(AppCliTestCase):
+    """A write never acts on a board served from the cache (review of #1046, P3-2 / M5).
+
+    The read token fails and the ops token works: exactly the case where only
+    get_snapshot's guard (a cached board serves READS only) stands between a 3-hour-old
+    board and real writes. Round one's test failed earlier (in fetch_targets) or was
+    stopped by a failure memory shared across kinds, so removing the guard passed it.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from apptestkit import pr_node
+        from coordlib import snapshot
+        self.seed_snapshot(age_seconds=3 * 3600)
+        stale = cache.load_snapshot(REPO, float("inf"))
+        stale["prs"] = [snapshot.summarize_pr(pr_node(101))]
+        stale.pop("cacheAgeSeconds", None)
+        cache.store_snapshot(REPO, stale)
+        os.utime(cache.snapshot_path(REPO), (time.time() - 3 * 3600,) * 2)
+        self.keychain("key")
+        self.server.refuse_kinds = {"read"}
+
+    def test_writes_that_read_the_board_refuse_instead_of_using_a_stale_one(self):
+        for argv in (["train", "add", "101"], ["claim", "55", "--branch", "feature/x"], ["send", "hi"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.main(argv)
+                self.assertEqual(code, EXIT_BACKEND, err)
+                self.assertEqual(self.writes(), [], "no write from a stale board")
+                self.assertNotIn("showing the snapshot", err)
+                self.assertIn("GitHub App token unavailable", err)
+                self.assertEqual(self.runner.calls, [])
+        self.assertTrue(self.server.refuse_kinds, "the read mint really was refused throughout")
+
+    def test_the_ops_token_itself_works_here(self):
+        # The control: writes that read nothing (no board, no issue) go through on ops,
+        # so the refusals above come from the guard, not from a dead ops token.
+        for argv in (["train", "remove", "101"], ["send", "hi", "--on", "101"]):
+            with self.subTest(argv=argv):
+                self.server.requests.clear()
+                code, _, err = self.main(argv)
+                self.assertEqual(code, EXIT_OK, err)
+                self.assertTrue(self.writes())
+                self.assertEqual({r["kind"] for r in self.server.api_requests()}, {"ops"})
 
 
 class RevokedTokenTests(AppCliTestCase):
@@ -551,16 +637,6 @@ class NoLeakTests(AppCliTestCase):
     """Every subcommand, with throwaway credentials minted for real by the fake GitHub, on
     success and on failure: no `ghs_`, no JWT-shaped string, no key material, and none of
     the tokens or JWTs the fake saw, in stdout or stderr."""
-
-    def setUp(self):
-        super().setUp()
-        # The conductor's tick runs on Alex's (fake) gh; keep its state, checkout and model
-        # command inside the test directory.
-        for name, value in (("CONDUCTOR_HOME", self.no_repo), ("CONDUCTOR_STATE_DIR", os.path.join(self.root, "state")),
-                            ("CONDUCTOR_CLAUDE", os.path.join(self.root, "no-claude")),
-                            ("CONDUCTOR_UPDATE_CHECKOUT", "0")):
-            self.addCleanup(os.environ.pop, name, None)
-            os.environ[name] = value
 
     def argvs(self):
         return [

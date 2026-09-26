@@ -16,19 +16,29 @@ from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK,
 from . import apptoken, budget, cache, identity, lease, marker, outage, render, review, snapshot, train, train_step
 from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
 
-# Commands that stay on Alex's identity (gh/keyring) in app mode:
-# - `train approve` and `train substitute-review` are attestations, not operations: they
-#   record that Alex approved, or that a named reviewer reviewed, a head.
-# - A hand-run `train step` moves and deletes branches, which needs Contents write, which
-#   the app deliberately lacks (in Actions app mode is off and the step uses GITHUB_TOKEN).
-# - The conductor (`conductor tick|status|pause|resume|escalate`): its tick lists the
-#   Actions runners (Administration read, which the app lacks), edits the lease and
-#   outage comments it posted as Alex, and gates its spending on Alex's budget.
-# coord has no command that creates a PR or replies in a review thread; if one is added
-# it belongs here, because review.is_bot counts an app reply as no answer to a Codex
-# finding.
-USER_IDENTITY = frozenset({"train approve", "train substitute-review", "train step", "conductor tick",
-                           "conductor status", "conductor pause", "conductor resume", "conductor escalate"})
+# Which identity each command uses in app mode. Every command not in USER_IDENTITY runs on
+# the app: its reads on the read token, its writes on the ops token.
+#
+# Attestations, not operations: they record that Alex approved, or that a named reviewer
+# reviewed, a head.
+ATTESTATIONS = frozenset({"train approve", "train substitute-review"})
+# Commands that need what the app does not have:
+# - a hand-run `train step` moves and deletes branches (Contents write; in Actions app mode
+#   is off and the step uses GITHUB_TOKEN);
+# - `conductor tick` lists the Actions runners (Administration read), edits the lease and
+#   outage comments it posted as Alex, and gates its spending on Alex's budget
+#   (conductor.Watcher.budget_left). The rest of `conductor` (status, pause, resume,
+#   escalate) is a board read or a record post, like any other operation.
+NEEDS_ALEX = frozenset({"train step", "conductor tick"})
+# The records agents post in conversation: claims, releases, messages, outages. They run
+# on the app (Alex's decision, 2026-09-25): an app-authored comment notifies Alex on
+# threads he takes part in, and he handles that with notification settings. To post them
+# as Alex again, add `| CONVERSATION` to USER_IDENTITY below; nothing else changes.
+CONVERSATION = frozenset({"claim", "release", "send", "outage start", "outage end"})
+# coord has no command that creates a PR or replies in a review thread; if one is added it
+# belongs in USER_IDENTITY, because review.is_bot counts an app reply as no answer to a
+# Codex finding.
+USER_IDENTITY = ATTESTATIONS | NEEDS_ALEX
 
 INBOX_DEFAULT_DAYS = 7
 DEFAULT_MAX_AGE = 60
