@@ -240,7 +240,10 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
     """App mode for `repo`: on only when every condition in the module doc holds.
 
     A config that exists but cannot be used is app mode ON with an error: every call
-    then refuses. Absent is not failed; broken is.
+    then refuses. Absent is not failed; broken is. Absent means the path does not exist
+    (FileNotFoundError, or a parent that is not a directory, NotADirectoryError). A path
+    that cannot be checked (EACCES on a folder above it, say) is broken, not absent: turning
+    app mode off there would run every command as Alex, a fallback.
     """
     env = os.environ if env is None else env
     path = config_path(env)
@@ -253,8 +256,13 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
         # The app's JWT and tokens go to GitHub and nowhere else (a local test port, a
         # proxy, a typo), so any other API URL means Alex's identity, as before the app.
         return Mode(False, f"GITHUB_API_URL is {api}, not {GITHUB_API}; app credentials go to GitHub only", path)
-    if not os.path.lexists(path):
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
         return Mode(False, f"no app config at {path} (cloud sessions and machines without the app)", path)
+    except OSError as error:
+        return Mode(True, "the app config's path cannot be checked", path,
+                    error=f"the app config {path} cannot be checked ({type(error).__name__}: {error.strerror})")
     try:
         config = load_config(path)
     except AppAuthError as error:

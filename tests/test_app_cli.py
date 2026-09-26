@@ -425,6 +425,59 @@ class TrainStatusBatchTests(AppCliTestCase):
                                      "nothing was sent as Alex")
 
 
+class ConfigPathTests(AppCliTestCase):
+    """Codex on fb63aef6e (P1): os.path.lexists is False on EACCES, so a config whose folder
+    cannot be searched read as "no app config" and turned app mode off: every command ran as
+    Alex. Only a path that does not exist is absent; any other failure to check it is a broken
+    config, app mode on with an error."""
+
+    def use_config_at(self, path):
+        os.environ["COORD_APP_CONFIG"] = path
+        os.environ["GH_TOKEN"] = os.environ["GITHUB_TOKEN"] = USER_TOKEN  # a fallback would find it here
+        self.server.tokens[USER_TOKEN] = "user"
+
+    def assert_nothing_as_alex(self):
+        self.assertEqual(self.runner.calls, [], "the gh runner was called")
+        self.assertEqual([r for r in self.server.requests if r["bearer"] == USER_TOKEN], [])
+        self.assertEqual(self.server.api_requests(), [], "no API call went out at all")
+
+    @unittest.skipIf(os.geteuid() == 0, "root searches a mode-000 folder anyway")
+    def test_a_config_folder_that_cannot_be_searched_is_broken_not_absent(self):
+        folder = os.path.join(self.root, "locked")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "github-app.json"), "w", encoding="utf-8") as handle:
+            json.dump({"client_id": "Iv23test", "repo": REPO}, handle)
+        os.chmod(folder, 0)
+        self.addCleanup(os.chmod, folder, 0o700)  # before the temporary root is removed
+        self.use_config_at(os.path.join(folder, "github-app.json"))
+        mode = apptoken.detect(REPO)
+        self.assertTrue(mode.on, mode.reason)
+        self.assertIn("cannot be checked (PermissionError", mode.error)
+        code, _, err = self.main(["send", "hi"])
+        self.assertEqual(code, EXIT_BACKEND, err)
+        self.assertIn("GitHub App token unavailable", err)
+        self.assertIn("COORD_APP=off", err)
+        self.assert_nothing_as_alex()
+        code, _, err = self.main(["board"])
+        self.assertEqual(code, EXIT_BACKEND, err)
+        self.assertIn("no cached snapshot on this machine to show", err)
+        self.assert_nothing_as_alex()
+        code, out, _ = self.main(["token", "status"])
+        self.assertIn("app mode: on (the app config's path cannot be checked)", out)
+
+    def test_a_path_that_does_not_exist_is_absent(self):
+        plain = os.path.join(self.root, "regular-file")
+        with open(plain, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        for name, path in (("missing", os.path.join(self.root, "nowhere", "github-app.json")),
+                           ("under a regular file", os.path.join(plain, "github-app.json"))):
+            with self.subTest(name):
+                self.use_config_at(path)
+                mode = apptoken.detect(REPO)
+                self.assertFalse(mode.on)
+                self.assertIn("no app config at", mode.reason)
+
+
 class StaleWriteGuardTests(AppCliTestCase):
     """A write never acts on a board served from the cache (review of #1046, P3-2 / M5).
 
