@@ -596,6 +596,127 @@ class CodexRoundTests(ReviewFlowTests):
                                              reviewer.prompt(self.app.pr, HEAD, "/w", "/s", {})).group(1))
 
 
+class CodexRound2Tests(ReviewFlowTests):
+    """Codex's review of b595afb1 (#1049)."""
+
+    def settings(self):
+        cmd = self.reviews()[0]["cmd"]
+        return json.loads(cmd[cmd.index("--settings") + 1])
+
+    def test_d1_the_run_is_sandboxed_with_no_network_and_no_way_out(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        sandbox = self.settings()["sandbox"]
+        self.assertEqual((sandbox["enabled"], sandbox["failIfUnavailable"], sandbox["allowUnsandboxedCommands"]),
+                         (True, True, False))
+        self.assertNotIn("network", sandbox, "no allowed domains: nothing reaches GitHub")
+        self.assertIn(os.path.realpath(self.config.home), sandbox["filesystem"]["denyWrite"])
+        self.assertTrue(any(p.endswith(os.path.join("Library", "Caches", "inisa-coord"))
+                            for p in sandbox["filesystem"]["denyRead"]))
+        self.assertIn("Bash(git push:*)", self.settings()["permissions"]["deny"])
+
+    def test_d1_nothing_shaped_like_a_credential_is_posted(self):
+        found = reviewer.normalize({"findings": [{"severity": "P3", "summary": "token ghs_abcdefghijklmnop1234"}],
+                                    "summary": "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----"})
+        body, _ = reviewer.render(7, HEAD, "opus", found, "pass", {}, False, {})
+        self.assertNotIn("ghs_abc", body)
+        self.assertNotIn("BEGIN PRIVATE", body)
+
+    def test_d2_a_pass_does_not_answer_an_earlier_blocking_review_of_the_head(self):
+        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "verdict": "changes"}
+        self.app.pr_comments = [
+            {"user": {"login": "chatgpt-codex-connector[bot]"}, "body": CODEX_NOTICE, "created_at": snapshot.iso(at(-60))},
+            {"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-30)),
+             "html_url": "https://github.com/o/r/pull/7#issuecomment-99", "body": marker.compose("Review", blocking)}]
+        self.tick(0)
+        self.ask(1, "@inisa-sidechain review sonnet")
+        self.replies = [review_reply()]
+        self.tick(5)
+        review = self.app.markers("review")[-1]
+        self.assertEqual((review["verdict"], review["countsForTrain"]), ("pass", False))
+        self.assertEqual(self.app.markers("review-substitute"), [])
+        self.assertIn("issuecomment-99", self.app.posts[-1])
+
+    def test_d3_a_finished_review_survives_a_failed_read(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        real = self.app.rest
+
+        def flaky(path, method="GET", body=None):
+            if "/check-suites" in path:
+                raise reviewer.GitHubError("HTTP 502")
+            return real(path, method, body)
+        self.app.rest = flaky
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        self.app.rest = real
+        self.tick(10)
+        self.assertEqual(len(self.reviews()), 1, "not run again")
+        self.assertEqual(len(self.app.markers("review")), 1)
+
+    def test_d4_a_checked_field_that_is_not_a_list_is_ignored(self):
+        found = reviewer.normalize({"findings": [], "checked": 1})
+        self.assertEqual(found["checked"], [])
+        self.assertEqual(reviewer.normalize({"findings": [], "checked": "abc"})["checked"], [])
+
+    def test_d5_the_diff_is_against_the_prs_base(self):
+        self.app.pr["base"] = {"ref": "claude/parent", "sha": "b" * 40}
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        self.assertIn(f"diff {'b' * 40}...HEAD", self.reviews()[0]["cmd"][2])
+        self.assertIn(["fetch", "-q", "origin", "b" * 40], self.git_calls)
+        self.assertIn("diff origin/main...HEAD", reviewer.prompt({"base": {"ref": "main"}}, HEAD, "/w", "/s", {}))
+
+    def test_d6_a_give_up_reply_that_fails_is_sent_later_without_another_run(self):
+        self.tick(0)
+        self.ask(1)
+        for minutes in (5, 10):
+            self.replies = [claude_result("no block")]
+            self.tick(minutes)
+        self.replies = [claude_result("no block")]
+        self.app.fail_posts = 1
+        self.tick(15)
+        self.assertEqual(len(self.reviews()), 3)
+        self.assertFalse(any("gave up" in p for p in self.app.posts))
+        self.tick(20)
+        self.assertEqual(len(self.reviews()), 3, "no fourth run")
+        self.assertTrue(any("gave up" in p for p in self.app.posts))
+
+    def test_d7_a_new_leader_finds_requests_the_old_one_held(self):
+        request = self.ask(1)
+        answered_request = self.ask(2)
+        self.gh.repo_comments.append(dict(self.gh.raw(marker.compose("done", {
+            "kind": "review", "v": 1, "pr": 7, "request": answered_request["id"], "verdict": "none"}), 3),
+            user={"login": reviewer.APP_LOGIN}, html_url="https://github.com/o/r/pull/7#issuecomment-x"))
+        cli.cache.store_cursor("o/r", self.config.agent, snapshot.iso(at(60 * 30)), [])
+        self.replies = [review_reply()]
+        self.tick(60 * 30)
+        runs = self.reviews()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(len(reviewer.Reviews(mock.Mock(state=self.last_state(), config=self.config, now=at(0)),
+                                              None).done_heads), 1)
+        self.assertNotIn(str(answered_request["id"]), self.last_state()["reviews"])
+        self.assertIn(str(request["id"]), self.last_state()["reviews"])
+
+    def last_state(self):
+        with open(os.path.join(self.config.state_dir, "state.json")) as handle:
+            return json.load(handle)
+
+    def test_d8_every_casing_of_the_agent_config_is_stripped(self):
+        root = os.path.join(self.tmp.name, "reviews")
+        tree = os.path.join(root, "pr-7")
+        for name in (".Claude/agents", "sub/.CLAUDE/skills"):
+            os.makedirs(os.path.join(tree, name))
+        reviewer.strip_agent_config(tree, root)
+        leftovers = [d for _, dirs, _ in os.walk(tree) for d in dirs if d.lower() == ".claude"]
+        self.assertEqual(leftovers, [])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

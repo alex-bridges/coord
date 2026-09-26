@@ -635,6 +635,14 @@ class Watcher:
         self.issue_comments = issue_comments  # reviewer.py finds `@inisa-sidechain review` here
         from . import reviewer
         reviewer.Reviews(self, None).remember(issue_comments)  # kept in state: the cursor moves on
+        if not self.state.get("wasLeader"):
+            self.state["reviewRescan"] = True  # kept until it succeeds
+        if self.state.get("reviewRescan"):
+            # A new leader: requests the last leader held only in its own state (reviewer.rescan).
+            older = self.gh.rest_paginated(
+                f"repos/{{repo}}/issues/comments?since={iso(self.now - reviewer.FRESH)}&per_page=100")
+            reviewer.Reviews(self, None).rescan(older)
+            self.state.pop("reviewRescan", None)
         reasons += message_reasons(items, payloads)
         if slow:
             reasons += stuck_reasons(snap, self.now)

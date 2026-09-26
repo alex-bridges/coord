@@ -60,7 +60,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import marker, outage, review, snapshot, train
-from .gh import AppAuthError, GitHub, GitHubError
+from .gh import AppAuthError, GitHub, GitHubError, redact
 
 APP_LOGIN = "inisa-sidechain[bot]"
 MODELS = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "claude-fable-5-1"}
@@ -79,7 +79,7 @@ KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads ar
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
 # Directories never copied into the reviewer's view of the PR: Claude Code loads agents,
 # skills and commands from an --add-dir tree, and a PR could add one (review of #1049).
-STRIP = (".claude",)
+STRIP = (".claude",)  # compared case-insensitively: macOS finds `.Claude` as `.claude` (Codex on #1049)
 
 # What a review run may not do on top of the conductor's DENY: write to GitHub in any way.
 # The watcher posts the result; the run only reads, builds and tests.
@@ -204,7 +204,8 @@ def normalize(data: Dict[str, Any]) -> Dict[str, Any]:
             "fix": _clip(str(item.get("fix") or ""), 300),
         })
     findings.sort(key=lambda f: SEVERITIES.index(f["severity"]))
-    checked = [_clip(str(c), 200) for c in (data.get("checked") or []) if isinstance(c, (str, int, float))][:20]
+    listed = data.get("checked") if isinstance(data.get("checked"), list) else []  # Codex on #1049
+    checked = [_clip(str(c), 200) for c in listed if isinstance(c, (str, int, float))][:20]
     return {"findings": findings, "checked": checked, "summary": _clip(str(data.get("summary") or ""), 600)}
 
 
@@ -244,6 +245,30 @@ def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: 
     return None
 
 
+def blocked_head(pr_comments: List[Dict[str, Any]], pr: int, head: str) -> Optional[str]:
+    """The link to a review this app posted that requested changes at (pr, head), or None.
+    A pass by another model does not answer it: only a new head does (Codex on #1049)."""
+    for comment in pr_comments:
+        if (comment.get("user") or {}).get("login") != APP_LOGIN:
+            continue
+        payload = marker.decode(comment.get("body")) or {}
+        if payload.get("kind") == "review" and payload.get("pr") == pr and payload.get("head") == head \
+                and payload.get("verdict") == "changes":
+            return comment.get("html_url") or ""
+    return None
+
+
+def answered(comments: List[Dict[str, Any]]) -> set:
+    """Request ids this app has already answered (every reply names its request)."""
+    ids = set()
+    for comment in comments:
+        if (comment.get("user") or {}).get("login") == APP_LOGIN:
+            payload = marker.decode(comment.get("body")) or {}
+            if payload.get("kind") == "review" and payload.get("request") is not None:
+                ids.add(payload["request"])
+    return ids
+
+
 def substitute_head(pr_comments: List[Dict[str, Any]], pr: int) -> Optional[str]:
     """The head the PR's newest review-substitute record names (what the train reads)."""
     head = None
@@ -255,7 +280,7 @@ def substitute_head(pr_comments: List[Dict[str, Any]], pr: int) -> Optional[str]
 
 
 def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str, request: Dict[str, Any],
-           counts_for_train: bool, run: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+           counts_for_train: bool, run: Dict[str, Any], blocked_by: str = "") -> Tuple[str, Dict[str, Any]]:
     findings = result["findings"]
     passed = outcome == "pass"
     lines = [f"## Review by inisa-sidechain: {'PASS' if passed else 'changes requested'} at `{head[:9]}` ({model})", ""]
@@ -264,6 +289,9 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
     if passed:
         lines.append("This counts as the substitute review for this head (Codex is out of quota), so the train "
                      "accepts it." if counts_for_train else
+                     f"This does not count for the train: an earlier review of this head requested changes "
+                     f"({blocked_by}). Push a fix; a pass by another model does not answer those findings."
+                     if blocked_by else
                      "This is advice: Codex is not out of quota for this head, so the PR still needs Codex's 👍.")
     lines.append("")
     if result.get("summary"):
@@ -284,7 +312,8 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
         lines += ["", "</details>", ""]
     lines.append(f"<sub>A fresh `claude -p --agent reviewer` on Tycho: {run.get('seconds', '?')} s, "
                  f"{run.get('turns', '?')} turns. Findings are the reviewer's; the verdict is coord's rule.</sub>")
-    text = "\n".join(lines)
+    # The run could read files a PR's test pointed it at; nothing shaped like a credential is posted.
+    text = redact("\n".join(lines))
     if len(text) > MAX_BODY:  # a post GitHub refuses would be retried on every tick
         text = text[:MAX_BODY] + "\n\n(cut to fit a GitHub comment)"
     counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERITIES}
@@ -296,6 +325,12 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
     return text, payload
 
 
+def base_of(pr: Dict[str, Any]) -> str:
+    """What to diff against: the PR's base commit (a stacked PR's parent branch, not main)."""
+    sha = str((pr.get("base") or {}).get("sha") or "")
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "origin/main"
+
+
 def prompt(pr: Dict[str, Any], head: str, worktree: str, scratch: str, request: Dict[str, Any]) -> str:
     body = (pr.get("body") or "").strip()
     # A boundary the author cannot know, so a body cannot close it early (Codex on #1049).
@@ -303,7 +338,8 @@ def prompt(pr: Dict[str, Any], head: str, worktree: str, scratch: str, request: 
     return "\n".join([
         f"Review pull request #{pr.get('number')} of example-owner/example-repo at head {head}.",
         f"The PR's tree is checked out at {worktree} (base branch: {((pr.get('base') or {}).get('ref')) or 'main'}).",
-        f"Diff: `git -C {worktree} diff origin/main...HEAD`. Scratch space: {scratch}.",
+        f"Diff: `git -C {worktree} diff {base_of(pr)}...HEAD` (the PR's base; review only this delta). "
+        f"Scratch space: {scratch}.",
         "This run has no GitHub credentials: `gh` is not logged in and git cannot fetch or push. Everything you "
         "need is local; the PR's description is below.",
         "",
@@ -337,6 +373,27 @@ def isolated_env(base: Dict[str, str], empty_dir: str) -> Dict[str, str]:
                 "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/false",
                 "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"})
     return env
+
+
+def run_settings(home: str, deny: List[str]) -> Dict[str, Any]:
+    """The review run's settings. Its Bash runs in Claude Code's OS sandbox (macOS Seatbelt,
+    inherited by every child a PR's test starts): no network, so nothing it starts can mint a
+    token or reach GitHub whatever it does to its environment; no writes to the conductor's
+    checkout; no reading the app's config, token cache or keychain files. It refuses to start
+    without the sandbox, and nothing may run outside it (Codex on #1049). The added
+    directories (the PR's tree and scratch) stay writable."""
+    from . import apptoken
+    return {
+        "permissions": {"deny": deny},
+        "sandbox": {
+            "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
+            "filesystem": {
+                "denyWrite": [os.path.realpath(home)],
+                "denyRead": [os.path.dirname(apptoken.default_config_path()), apptoken.token_cache_dir({}),
+                             os.path.join(os.path.expanduser("~"), "Library", "Keychains")],
+            },
+        },
+    }
 
 
 def pushed_at(check_suites: List[Dict[str, Any]], branch: str) -> Optional[dt.datetime]:
@@ -374,10 +431,18 @@ class Reviews:
             self.state.setdefault(str(request["id"]), dict(request, status="pending", attempts=0,
                                                            seen=snapshot.iso(self.w.now)))
 
+    def rescan(self, issue_comments: List[Dict[str, Any]]) -> None:
+        """On taking the lead: remember the requests of the last FRESH hours that this app has
+        not answered. The last leader may have seen them, and a wake moved the shared inbox
+        cursor past them, before it died with them in its own state (Codex on #1049)."""
+        done = answered(issue_comments)
+        self.remember([c for c in issue_comments if c.get("id") not in done])
+
     def pending(self, issue_comments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         if issue_comments:
             self.remember(issue_comments)
-        waiting = [r for r in self.state.values() if isinstance(r, dict) and r.get("status") == "pending"]
+        waiting = [r for r in self.state.values()
+                   if isinstance(r, dict) and (r.get("status") == "pending" or r.get("unsent"))]
         return sorted(waiting, key=lambda r: r.get("id") or 0)
 
     def prune(self) -> None:
@@ -398,7 +463,7 @@ class Reviews:
              extra: Optional[Dict[str, Any]] = None) -> None:
         self.extra = extra or {}
         self.prune()
-        jobs = self.pending(issue_comments)
+        jobs = sorted(self.pending(issue_comments), key=lambda r: not r.get("unsent"))
         if not jobs:
             return
         now = self.w.now
@@ -416,6 +481,9 @@ class Reviews:
         request = jobs[0]
         record = self.state[str(request["id"])]
         try:
+            if record.get("unsent"):
+                self.send_unsent(request, record)
+                return
             self.handle(request, record, windows)
         except AppAuthError as error:
             self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
@@ -423,7 +491,10 @@ class Reviews:
             self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
 
     def reply(self, request: Dict[str, Any], text: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        body = marker.compose(text, payload) if payload else text
+        # Every reply names its request, so a new leader rescanning can tell answered from not.
+        payload = payload or {"kind": "review", "v": 1, "agent": self.agent(), "pr": request["pr"],
+                              "request": request["id"], "verdict": "none"}
+        body = marker.compose(text, payload)
         return self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={"body": body})
 
     def handle(self, request: Dict[str, Any], record: Dict[str, Any], windows: List[Dict[str, Any]]) -> None:
@@ -462,17 +533,24 @@ class Reviews:
                 self.done_heads[key] = {"url": earlier, "at": snapshot.iso(now)}
                 record.update(status="skipped", at=snapshot.iso(now))
                 return
-        posting = record.get("posting")
+        posting, finished = record.get("posting"), record.get("finished")
         if posting and posting.get("head") != head:
             record.pop("posting")  # the head moved: that review is stale
             posting = None
+        if finished and finished.get("head") != head:
+            record.pop("finished")
+            finished = None
         if not posting:
-            posting = self.review(request, record, pr, head, windows)
-            if posting is None:
-                return
-            # Kept before any post: if a post fails, the next tick posts this again instead of
-            # running a 45-minute review a second time (review of 58ac99de).
+            if not finished:
+                finished = self.review(request, record, pr, head, windows)
+                if finished is None:
+                    return
+                # Kept before any GitHub call: if a read or a post fails, the next tick carries
+                # on from here instead of running the review again (review of 58ac99de; Codex).
+                record["finished"] = finished
+            posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
+            record.pop("finished", None)
         self.publish(request, record, posting, key)
 
     def review(self, request: Dict[str, Any], record: Dict[str, Any], pr: Dict[str, Any], head: str,
@@ -481,7 +559,7 @@ class Reviews:
         now = self.w.now
         worktree = os.path.join(self.config.state_dir, "reviews", f"pr-{request['pr']}-{head[:10]}")
         scratch = worktree + "-scratch"
-        if not self.checkout(request["pr"], head, worktree, scratch):
+        if not self.checkout(request["pr"], head, worktree, scratch, base_of(pr)):
             shutil.rmtree(scratch, ignore_errors=True)
             self.fail(request, record, "could not check out the PR's head on the CI box")
             return None
@@ -511,15 +589,24 @@ class Reviews:
                       if result["ok"] else f"the review run failed ({_clip(result['summary'], 160)})")
             return None
         found = normalize(data)
-        outcome = verdict(found["findings"])
+        return {"head": head, "found": found, "verdict": verdict(found["findings"]), "run": run}
+
+    def compose(self, request: Dict[str, Any], pr: Dict[str, Any], finished: Dict[str, Any],
+                windows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """The finished review as it will be posted: does it count for the train, and does it
+        withdraw an earlier substitute record?"""
+        now = self.w.now
+        head, found, outcome, run = finished["head"], finished["found"], finished["verdict"], finished["run"]
         suites = self.app.rest(f"repos/{{repo}}/commits/{head}/check-suites?per_page=100") or {}
         head_time = pushed_at(suites.get("check_suites") or [], (pr.get("head") or {}).get("ref") or "")
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
-        counts = outcome == "pass" and codex_out(comments, head_time, windows, now)
+        blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
+        counts = outcome == "pass" and not blocked_by and codex_out(comments, head_time, windows, now)
         # A blocking review of a head that a substitute review passed withdraws that pass;
         # otherwise the train would still take the head (Codex on #1049).
         revoke = outcome != "pass" and substitute_head(comments, request["pr"]) == head
-        body, payload = render(request["pr"], head, request["model"], found, outcome, request, counts, run)
+        body, payload = render(request["pr"], head, request["model"], found, outcome, request, counts, run,
+                               blocked_by or "")
         return {"head": head, "body": body, "payload": payload, "counts": counts, "verdict": outcome,
                 "revoke": revoke}
 
@@ -578,19 +665,31 @@ class Reviews:
         record["at"] = snapshot.iso(self.w.now)
         self.w.say(f"review of #{request['pr']} failed ({why}); attempt {record['attempts']} of {MAX_ATTEMPTS}")
         if record["attempts"] >= MAX_ATTEMPTS:
-            record["status"] = "failed"  # before the reply: a failed post must not buy a fourth run
-            self.reply(request, f"@inisa-sidechain gave up on this review after {MAX_ATTEMPTS} tries: {why}. "
+            # Status first, so a failed post never buys a fourth run; the reply is kept until it
+            # posts, so the requester always hears (Codex on #1049).
+            record["status"] = "failed"
+            record["unsent"] = (f"@inisa-sidechain gave up on this review after {MAX_ATTEMPTS} tries: {why}. "
                                 f"({request['url']})")
+            self.send_unsent(request, record)
 
-    def checkout(self, pr: int, head: str, worktree: str, scratch: str) -> bool:
+    def send_unsent(self, request: Dict[str, Any], record: Dict[str, Any]) -> None:
+        self.reply(request, record["unsent"])
+        record.pop("unsent", None)
+
+    def checkout(self, pr: int, head: str, worktree: str, scratch: str, base: str = "origin/main") -> bool:
         os.makedirs(scratch, exist_ok=True)
         if os.path.exists(worktree):
             self.w.git(["worktree", "remove", "--force", worktree])
         if self.w.git(["fetch", "-q", "origin", f"pull/{pr}/head"])[0] != 0:
             return False
+        if base != "origin/main" and self.w.git(["fetch", "-q", "origin", base])[0] != 0:
+            return False  # the diff the prompt names must exist
         if self.w.git(["worktree", "add", "-q", "--detach", worktree, head])[0] != 0:
             return False
-        strip_agent_config(worktree, os.path.join(self.config.state_dir, "reviews"))
+        try:
+            strip_agent_config(worktree, os.path.join(self.config.state_dir, "reviews"))
+        except (OSError, ValueError):
+            return False  # never run on a tree that may still carry the PR's own agents
         return True
 
     def run(self, pr: Dict[str, Any], head: str, request: Dict[str, Any], worktree: str,
@@ -600,7 +699,7 @@ class Reviews:
         command = [self.config.claude, "-p", prompt(pr, head, worktree, scratch, request), "--agent", "reviewer",
                    "--model", model, "--output-format", "json", "--permission-mode", "auto",
                    "--add-dir", worktree, "--add-dir", scratch,
-                   "--settings", json.dumps({"permissions": {"deny": conductor.DENY + REVIEW_DENY}})]
+                   "--settings", json.dumps(run_settings(self.config.home, conductor.DENY + REVIEW_DENY))]
         empty = tempfile.mkdtemp(prefix="gh-none-", dir=scratch)
         env = isolated_env(dict(os.environ), empty)
         # CONDUCTOR_WAKE turns on the conductor guard hook for this run.
@@ -632,9 +731,9 @@ def strip_agent_config(tree: str, reviews_root: str) -> None:
     if not os.path.realpath(tree).startswith(root_real):
         raise ValueError(f"strip_agent_config: {tree} is not under {reviews_root}")
     for root, dirs, files in os.walk(tree):
-        for name in list(dirs) + [f for f in files if f in STRIP]:
+        for name in list(dirs) + [f for f in files if f.lower() in STRIP]:
             path = os.path.join(root, name)
-            if name in STRIP:
+            if name.lower() in STRIP:
                 if os.path.islink(path) or os.path.isfile(path):
                     os.unlink(path)
                 else:
@@ -643,3 +742,5 @@ def strip_agent_config(tree: str, reviews_root: str) -> None:
                     dirs.remove(name)
             elif name in (".git", ".build", "node_modules", "DerivedData"):
                 dirs.remove(name)
+    if any(os.path.lexists(os.path.join(tree, name)) for name in STRIP):
+        raise OSError(f"strip_agent_config: could not remove the PR's agent config from {tree}")
