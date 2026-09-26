@@ -654,11 +654,15 @@ class RedirectTests(unittest.TestCase):
                                     tempfile.mkdtemp())
         tokens.api = self.url(self.a, "")  # the one test-only change: point the mint path at A
         jwt = "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJJdjIzdGVzdCJ9.c2lnbmF0dXJlLWJ5dGVz"
-        with self.assertRaises(AppAuthError) as caught:
-            tokens._call("POST", "away-307/app/installations/1/access_tokens", jwt, {"x": 1})  # noqa: SLF001
-        self.assertIn("answered HTTP 307", str(caught.exception))
-        self.assertNotIn(jwt, str(caught.exception))
-        self.assertEqual(self.b.seen, [])
+        # The installation lookup is a GET: a 302 there is what urllib's own handler follows.
+        for method, path, body, code in (("GET", "away/repos/o/r/installation", None, 302),
+                                         ("POST", "away-307/app/installations/1/access_tokens", {"x": 1}, 307)):
+            with self.subTest(method=method):
+                with self.assertRaises(AppAuthError) as caught:
+                    tokens._call(method, path, jwt, body)  # noqa: SLF001
+                self.assertIn(f"answered HTTP {code}", str(caught.exception))
+                self.assertNotIn(jwt, str(caught.exception))
+        self.assertEqual(self.b.seen, [], "B was never reached")
 
     def test_a_redirect_within_the_origin_keeps_the_credential(self):
         request = self.gh.app_request("GET", self.url(self.a, "/same"), "ghs_THROWAWAY_read")
