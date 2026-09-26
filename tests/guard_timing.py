@@ -106,6 +106,9 @@ def rules(guard) -> dict:
                            lambda c: guard._coord_runs(c, "token", "exec", False), True)
     found["train approve"] = ("coord " + guard._COORD_WORD.pattern + " -x train -x approve",
                               lambda c: guard._coord_runs(c, "train", "approve", True), True)
+    # Its inputs repeat `'`, `"`, `\` and `$` with `coord`; no witness, as keywords never carry a quote.
+    found["quoted subcommand"] = ("coord " + guard._COORD_WORD.pattern + " '\"\\$ -x token -x exec",
+                                  guard._coord_subcommand_quoted, False)
     found["security"] = (" ".join([guard._SECURITY.pattern, guard._SECURITY_TOKEN.pattern, *guard._SECURITY_SECRETS, "-i"]),
                          guard._security_reads_secrets, True)
     found["apptoken"] = (guard._PYTHON.pattern + " apptoken test_apptoken", guard._python_apptoken, True)

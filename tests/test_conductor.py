@@ -743,6 +743,11 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord --repo a/b --repo o/r token exec -- env",
                         "Tools/coord/coord --repo= token exec -- env", "Tools/coord/coord -- token exec -- env",
                         "Tools/coord/coord token -- exec -- env", "Tools/coord/coord --repo o/r -- token -- exec -- env",
+                        # The delta review of 2d13f6b1e (P2-A): argparse runs a quoted or escaped
+                        # subcommand word as the word, so any such spelling is refused.
+                        "coord 'token' exec -- env", 'coord "token" exec -- env', "coord t''oken exec -- env",
+                        "coord tok\\en exec -- env", "coord token 'exec' -- env", "coord $'token' exec -- env",
+                        "sh -c 'coord \"token\" exec'",
                         # The raw command is read: prose that names the command is refused too.
                         "gh pr comment 5 -b 'never run coord token exec here'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
@@ -763,10 +768,25 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord --r o/r train approve 5 --note x",
                         "Tools/coord/coord --repo a/b --repo o/r train approve 5 --note x",
                         "Tools/coord/coord --repo= train approve 5 --note x",
-                        "Tools/coord/coord -- train approve 5 --note x", "Tools/coord/coord train -- approve 5 --note x"):
+                        "Tools/coord/coord -- train approve 5 --note x", "Tools/coord/coord train -- approve 5 --note x",
+                        "Tools/coord/coord --repo o/r 'train' approve 5 --note x",
+                        "Tools/coord/coord --repo o/r train 'approve' 5 --note x", "coord 'train' approve 5"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("Tools/coord/coord --repo o/r train status", "Tools/coord/coord --rep o/r train add 5",
                         "Tools/coord/coord -- train status"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_a_quoted_or_escaped_coord_subcommand_is_refused(self):
+        # The shell's quoting is not decoded; no real command quotes its subcommand. The quotes
+        # of a later argument are not the subcommand's.
+        for command in ("coord 'board'", "coord --repo 'o/r' board", "coord $CMD", "coord train \"status\""):
+            result = self.run_guard("Bash", {"command": command}, full=True)
+            self.assertEqual(result.returncode, 2, command)
+            self.assertIn("a coord subcommand spelled with quotes or escapes", result.stderr, command)
+        for command in ("coord send 'a quoted message'", 'coord send --on 5 "x"',
+                        "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'",
+                        "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
+                        "Tools/coord/coord claim 991 --note 'on it'", "Tools/coord/coord --repo o/r board"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_is_blocked(self):
@@ -796,6 +816,11 @@ class GuardHookTests(unittest.TestCase):
                         "security &>/dev/null f -w", "security f>/tmp/o -w", "security 'f' -w", "security \"find\" -w",
                         "security $CMD -w", "security $(echo f) -w", "security `echo f` -w", "security f* -w",
                         "security {find-generic-password,x}", "(security f -w)", "true && security du -d",
+                        # The delta review of 2d13f6b1e (P2-B): escapes are not decoded, so `$` or a
+                        # backslash in a word up to the command word is refused.
+                        "security $'\\x64ump-keychain' -d", "security $'\\x66ind-generic-password' -w",
+                        "security $'\\145xport' -k login.keychain -t privKeys -o /tmp/k", "security -$X",
+                        "security \\-i", "security fin\\d -w",
                         # The raw command is read: prose that names the command is refused too.
                         "grep -n 'security find-generic-password' Docs/agent-coordination.md",
                         "gh pr comment 5 -b 'the key is read with security find-generic-password'"):
