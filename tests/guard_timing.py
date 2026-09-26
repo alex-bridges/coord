@@ -65,6 +65,7 @@ def keywords(pattern: str) -> list:
     """The literal words of a regex, in order and with repeats."""
     pattern = without_optional_groups(pattern)
     pattern = re.sub(r"\\S\+", " x ", pattern)  # a word: `--repo(=|\s+)\S+` needs one
+    pattern = re.sub(r"-\[\^\\s[^\]]*\][*+]", " -x ", pattern)  # an option word: `-[^\s;&|]*`
     pattern = re.sub(r"\[[^\]]*\][+*?]?", " ", pattern)  # character classes
     pattern = re.sub(r"\\.[+*?]?", " ", pattern)  # escapes, with their quantifier
     pattern = re.sub(r"\(\?(?:[a-zA-Z]+:|<?[=!]|:)", " ", pattern)  # group syntax: (?i: (?= (?<! (?:
@@ -98,6 +99,12 @@ def rules(guard) -> dict:
         found[f"RULES[{index}]"] = (pattern, lambda c, rule=rule: rule.search(guard.executable_text(c)), True)
     for index, (rule, _) in enumerate(guard.RAW_RULES):
         found[f"RAW_RULES[{index}]"] = (rule.pattern, rule.search, True)
+    found["token exec"] = ("coord " + guard._COORD_WORD.pattern + " -x token -x exec",
+                           lambda c: guard._coord_runs(c, "token", "exec", False), True)
+    found["train approve"] = ("coord " + guard._COORD_WORD.pattern + " -x train -x approve",
+                              lambda c: guard._coord_runs(c, "train", "approve", True), True)
+    found["security"] = (" ".join([guard._SECURITY.pattern, guard._SECURITY_TOKEN.pattern, *guard._SECURITY_SECRETS, "-i"]),
+                         guard._security_reads_secrets, True)
     found["apptoken"] = (guard._PYTHON.pattern + " apptoken test_apptoken", guard._python_apptoken, True)
     found["writes"] = (guard._WRITES.pattern,
                        lambda c: guard._WRITES.search(guard._HARMLESS_REDIRECT.sub(" ", guard.executable_text(c))), True)

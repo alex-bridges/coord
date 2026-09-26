@@ -9,6 +9,11 @@ unless it is in INTENDED_UNBLOCKS below. Round seven's heredoc parser then faile
 same way, and round eight made the apptoken rule co-occurrence on the raw command, so a
 second test checks that every command naming python and apptoken is blocked.
 
+Round twelve rebuilt the guard as main's (59e25cc6f) with lines inserted. The structural test
+in test_conductor.py pins main's lines, but an inserted line could still allow what main
+blocks, so a third test runs main's guard (tests/legacy_guard/conductor-guard-59e25cc6f.py)
+over the same corpus and fails when a command main blocks is allowed now.
+
 The corpus: every command the guard tests in test_conductor.py list (read from that file,
 so new cases join by themselves), the reviewers' probes from rounds five to seven, the
 wrapped heredocs of round six, and round seven's shapes and fuzz grammar. Each source has
@@ -31,6 +36,8 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 GUARD = os.path.join(HERE, "..", "..", "..", ".claude", "hooks", "conductor-guard.py")
 LEGACY_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard.py")
+MAIN_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard-59e25cc6f.py")
+MAIN_BLOB = "d0441c4ecc072255a06b189566b7afbbef524f5b"  # `git hash-object` of main's guard at 59e25cc6f
 
 
 def load(path: str, name: str):
@@ -581,6 +588,65 @@ def round_eight() -> list:
             + OTHER_RULES_AND_WORK)
 
 
+# Round twelve's review (review12/probe12.py), verbatim: the new rules' blocked and allowed
+# lists and the spellings it tried against them.
+ROUND_TWELVE = [
+    "Tools/coord/coord token exec -- env", "coord token exec", "./coord token exec -- gh api user",
+    "Tools/coord/coord --repo o/r token exec -- env", "Tools/coord/coord --repo=o/r token exec -- env",
+    "(coord token exec -- env)", "`coord token exec`", "$(coord token exec -- env)", "x;coord token exec",
+    "a&&coord token exec", "a|coord token exec", "sh -c 'coord token exec'", 'sh -c "coord token exec"',
+    "coord\ttoken\texec", "coord token exec\n",
+    "Tools/coord/coord --repo o/r train approve 5 --note x", "coord --repo=o/r train approve 5",
+    "coord  --repo   o/r  train  approve 5",
+    "security find-generic-password -s x -w", "/usr/bin/security find-generic-password -w -s x", "security find-g -s x -w",
+    "security find-internet-password -s x -w", "security find-i -w", "security dump-keychain -d", "security dump-k -d",
+    "security export -k login.keychain -t privKeys", "security -v find-generic-password -s x", "security -i find-g",
+    "echo | security find-generic-password", "env security find-generic-password", "'security' find-generic-password",
+    "cat ~/Library/Caches/inisa-coord/tokens.json", "ls $HOME/Library/Caches/inisa-coord",
+    "cat ~/library/caches/INISA-COORD/x", "cat ~/Library/Caches/Inisa-Coord/x",
+    "cp /Users/dev/Library/Caches/inisa-coord/t /tmp",
+    "security find-generic-password -s example-coord-github-app -w", "echo EXAMPLE-COORD-GITHUB-APP",
+    "echo Example-Coord-GitHub-App",
+    "python3 -c 'import subprocess; subprocess.run([\"security\",\"find-generic-password\",\"-s\",\"example-coord-github-app\"])'",
+    "python3 -c 'import coordlib.apptoken'", "echo 'import coordlib.apptoken' | python3 -",
+    "Python3 -c 'import coordlib.APPTOKEN'", "PYTHON3 - <<'E'\nfrom coordlib import apptoken\nE",
+    "python3 -c 'import coordlib.\uff41pptoken'", "/usr/bin/python3 x.py apptoken",
+    "python3 -m test_apptoken; python3 -c 'import coordlib.apptoken'", "python3 -c 'import test_apptoken as t; t.apptoken'",
+    "python3 -m unittest test_apptoken_x_apptoken", "python3 -c 'import coordlib._apptoken'",
+    "python3 -c 'import coordlib.test_apptoken, coordlib.apptoken'", "python3.14 -c 'from coordlib.apptoken import *'",
+    "python3 -c 'import coordlib.\uff21\uff30\uff30\uff34\uff2f\uff2b\uff25\uff2e'",
+    "Tools/coord/coord token status", "Tools/coord/coord board", "Tools/coord/coord --repo o/r board", "coord train status",
+    "python3 -m unittest test_apptoken", "cd Tools/coord/tests && python3 -m unittest test_apptoken -v",
+    "python3 -m unittest discover -s Tools/coord/tests", "git log -- Tools/coord/coordlib/apptoken.py",
+    "grep -rn apptoken Tools/coord", "security list-keychains", "security find-certificate -a",
+    "security verify-cert -c x.pem", "security show-keychain-info", "echo securityexport", "ls ~/Library/Caches",
+    "gh pr view 1046", "git status", "python3 --version", "python3 Tools/coord/tests/test_apptoken.py",
+    "python3 -m unittest tests.test_apptoken.JWTTests",
+    "Tools/coord/coord --rep o/r token exec -- env", "Tools/coord/coord --re=o/r token exec -- env",
+    "Tools/coord/coord --r o/r token exec -- env", "Tools/coord/coord --repo a/b --repo o/r token exec -- env",
+    "Tools/coord/coord --repo= token exec -- env", "Tools/coord/coord -- token exec -- env",
+    "Tools/coord/coord --rep o/r train approve 5 --note x",
+    "Tools/coord/coord --repo a/b --repo o/r train approve 5 --note x", "Tools/coord/coord -- train approve 5 --note x",
+    "Tools/coord/COORD token exec -- env", "Tools/Coord/Coord token exec -- env", "SECURITY dump-keychain -d",
+    "Security find-generic-password -s x -w",
+    "/usr/bin/SECURITY export -k login.keychain -t privKeys -f pkcs12 -P x -o /tmp/k.p12",
+    "security f -s x -w", "security fi -s x -w", "security find -s x -w", "security find- -s x -w", "security du -d",
+    "security dump -d", "security dump- -d", "security e -k login.keychain -t privKeys -o /tmp/k",
+    "security expor -t privKeys", "python3 -m test_apptoken", "cd /tmp/x && python3 -m test_apptoken",
+    "python3 -c 'from test_apptoken import *; print(AppTokens)'", "cat ~/Library//Caches/inisa-coord/x",
+    "cat ~/Library/Caches/./inisa-coord/x", "cat ~/Library/Caches/inisa-coor?/x", "cd ~/Library/Caches && cat inisa-coord/x",
+    "cat ~/Library/Caches/inisa-c*/x", "security find-generic-password -s inisa-coord-github-'app' -w",
+    "security f -s inisa-coord-github-'app' -w",
+]
+# Its insert-only mutant (`if command.endswith(" #r12"): return ""` in bash_verdict) kept every
+# line of main's guard and every test green. Commands main blocks, with trailing comments:
+MAIN_BLOCKS = ["gh pr merge 5 --squash", "git push origin HEAD:main", "git push origin --force HEAD",
+               "gh api -X PUT repos/o/r/pulls/1/merge", "Tools/coord/coord train approve 1", "gh secret list",
+               "gh auth token", "sudo ls", "launchctl list", "bash -c 'gh pr merge 5'", "echo x > CLAUDE.md",
+               "rm -rf Tools/coord"]
+TRAILING_COMMENTS = [command + suffix for command in MAIN_BLOCKS for suffix in (" #", " # note", " #r12")]
+
+
 def corpus_sources() -> dict:
     return {
         "test_conductor.py": conductor_test_commands(),
@@ -595,13 +661,16 @@ def corpus_sources() -> dict:
         "conductor commands": CONDUCTOR_COMMANDS,
         "fuzz grammar": fuzz_grammar(),
         "round eight's review": round_eight(),
+        "round twelve's review": ROUND_TWELVE,
+        "trailing comments": TRAILING_COMMENTS,
     }
 
 
 # Each source's DISTINCT commands when it was last grown: emptying or cutting one fails the test.
-MINIMUM = {"test_conductor.py": 158, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
+MINIMUM = {"test_conductor.py": 219, "rounds five and six": 151, "round seven's list": 10, "wrapped heredocs": 138,
            "not heredoc openers": 67, "wrappers and shapes": 216, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
-           "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120}
+           "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120,
+           "round twelve's review": 106, "trailing comments": 36}
 LEGACY_BLOB = "c7a05e3547d96008cf3c59885576616519c9e08d"  # `git hash-object` of 4f7d4a4fd's guard
 
 # Commands the old guard blocked that this one allows on purpose. Each needs a reason. None since
@@ -623,6 +692,7 @@ class GuardDifferentialTests(unittest.TestCase):
     def setUpClass(cls):
         cls.guard = load(GUARD, "conductor_guard_now")
         cls.legacy = load(LEGACY_GUARD, "conductor_guard_4f7d4a4fd")
+        cls.main = load(MAIN_GUARD, "conductor_guard_59e25cc6f")
         cls.sources = corpus_sources()
         cls.corpus = list(dict.fromkeys(command for source in cls.sources.values() for command in source))
 
@@ -645,6 +715,19 @@ class GuardDifferentialTests(unittest.TestCase):
         self.assertEqual(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), LEGACY_BLOB)
         self.assertTrue(all(self.blocked(self.legacy, command) for command in wrapped_heredocs()))
         self.assertFalse(self.blocked(self.legacy, "python3 -c \"print(1)\"; git log -- Tools/coord/coordlib/apptoken.py"))
+
+    def test_mains_guard_is_mains(self):
+        with open(MAIN_GUARD, "rb") as handle:
+            data = handle.read()
+        self.assertEqual(hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest(), MAIN_BLOB)
+
+    def test_nothing_mains_guard_blocks_is_allowed_now(self):
+        # Main's lines are pinned (test_conductor's structural test); this shows, over the corpus,
+        # that the lines #1046 inserts only add refusals.
+        main_blocks = [command for command in self.corpus if self.blocked(self.main, command)]
+        self.assertGreater(len(main_blocks), 100)
+        self.assertEqual([command for command in main_blocks if not self.blocked(self.guard, command)], [],
+                         "blocked by main's guard, allowed now")
 
     def test_nothing_the_old_guard_blocked_is_allowed_now(self):
         regressions = [command for command in self.corpus

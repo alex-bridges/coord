@@ -708,7 +708,9 @@ class GuardHookTests(unittest.TestCase):
     def test_every_line_of_mains_guard_is_here_in_order(self):
         # #1046 adds to main's guard and changes none of it: every line of main's guard
         # (tests/legacy_guard/conductor-guard-59e25cc6f.py, main at 59e25cc6f) is in the guard, in
-        # order. So nothing main blocks can pass, by construction.
+        # order. Main's lines are pinned here; test_guard_differential's
+        # test_nothing_mains_guard_blocks_is_allowed_now shows, over its corpus, that the
+        # additions only add refusals (an inserted line could still allow).
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard", "conductor-guard-59e25cc6f.py")
         with open(path, "rb") as handle:
             data = handle.read()
@@ -734,26 +736,45 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
                         "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
                         "sh -c 'coord --repo o/r token exec -- env'",
+                        # Round twelve's review (P3-1): every spelling of coord's options that
+                        # argparse takes, before the command and between its two words.
+                        "Tools/coord/coord --rep o/r token exec -- env", "Tools/coord/coord --re=o/r token exec -- env",
+                        "Tools/coord/coord --r o/r token exec -- env",
+                        "Tools/coord/coord --repo a/b --repo o/r token exec -- env",
+                        "Tools/coord/coord --repo= token exec -- env", "Tools/coord/coord -- token exec -- env",
+                        "Tools/coord/coord token -- exec -- env", "Tools/coord/coord --repo o/r -- token -- exec -- env",
                         # The raw command is read: prose that names the command is refused too.
                         "gh pr comment 5 -b 'never run coord token exec here'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("Tools/coord/coord token status", "grep -n 'token exec' Docs/agent-coordination.md",
                         "Tools/coord/coord --repo example-owner/example-repo token status",
-                        "Tools/coord/coord --repo example-owner/example-repo board"):
+                        "Tools/coord/coord --repo example-owner/example-repo board", "Tools/coord/coord --rep o/r board",
+                        "Tools/coord/coord -- token status", "Tools/coord/coord send --on 1 'the token exec docs'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
         self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
                          "outside the conductor the guard is silent")
 
     def test_train_approve_with_repo_is_blocked(self):
-        # A second rule beside main's `coord train approve` rule, which is unchanged.
+        # A second rule beside main's `coord train approve` rule, which is unchanged: the same
+        # command with at least one of coord's options in it, in any spelling argparse takes.
         for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
-                        "coord --repo=o/r train approve 5"):
+                        "coord --repo=o/r train approve 5", "Tools/coord/coord --rep o/r train approve 5 --note x",
+                        "Tools/coord/coord --re=o/r train approve 5 --note x",
+                        "Tools/coord/coord --r o/r train approve 5 --note x",
+                        "Tools/coord/coord --repo a/b --repo o/r train approve 5 --note x",
+                        "Tools/coord/coord --repo= train approve 5 --note x",
+                        "Tools/coord/coord -- train approve 5 --note x", "Tools/coord/coord train -- approve 5 --note x"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("Tools/coord/coord --repo o/r train status", "Tools/coord/coord --rep o/r train add 5",
+                        "Tools/coord/coord -- train status"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_is_blocked(self):
         # The app's private key: `security find-generic-password -s example-coord-github-app -w`
-        # prints it without a prompt to any process running as Alex. `security` takes any
-        # unique prefix of a subcommand.
+        # prints it without a prompt to any process running as Alex. `security` runs the FIRST
+        # command in its table that its word is a prefix of (`security help` lists the table):
+        # `f` is find-generic-password, `find-i` find-internet-password (before find-identity),
+        # `du` dump-keychain, `e` export. -i and -p read commands from stdin.
         for command in ("security find-generic-password -s example-coord-github-app -w",
                         "/usr/bin/security find-generic-password -s 'example-coord-github-app' -a x -w",
                         "security find-internet-password -s github.com -w", "security dump-keychain -d",
@@ -761,12 +782,29 @@ class GuardHookTests(unittest.TestCase):
                         "x=$(security find-generic-password -s example-coord-github-app -w)",
                         "cd /tmp && security find-generic-password -ga inisa", "security find-g -s x -w",
                         "security find-generic -w", "security dump-k",
+                        # Round twelve's review (P2-1): any prefix, and interactive mode.
+                        "security f -s x -w", "security fi -s x -w", "security find -s x -w", "security find- -s x -w",
+                        "security du -d", "security dump -d", "security dump- -d",
+                        "security e -k login.keychain -t privKeys -o /tmp/k", "security expor -t privKeys",
+                        "security find-i -w", "security find-k", "security export-smartcard",
+                        "/usr/bin/security f -a client-id -w", "security -i", "security -q -i", "security -p 'k> '",
+                        "printf 'find-generic-password -w\\n' | security -i", "security -v find-g -s x",
+                        "security -- find-generic-password -w",
+                        # The command word is found past redirections and quotes; one built at run
+                        # time is refused.
+                        "security 2>/dev/null f -w", "security > /dev/null find-generic-password -w",
+                        "security &>/dev/null f -w", "security f>/tmp/o -w", "security 'f' -w", "security \"find\" -w",
+                        "security $CMD -w", "security $(echo f) -w", "security `echo f` -w", "security f* -w",
+                        "security {find-generic-password,x}", "(security f -w)", "true && security du -d",
                         # The raw command is read: prose that names the command is refused too.
                         "grep -n 'security find-generic-password' Docs/agent-coordination.md",
                         "gh pr comment 5 -b 'the key is read with security find-generic-password'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("security list-keychains", "security show-keychain-info",
-                        "grep -rn security Tools/coord/coordlib/apptoken.py"):
+                        "grep -rn security Tools/coord/coordlib/apptoken.py", "security find-certificate -a",
+                        "security find-identity -v -p codesigning", "security verify-cert -c x.pem", "security help",
+                        "security -h", "security dump-trust-settings", "gh pr comment 5 -b 'the security fix landed'",
+                        "echo securityexport"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_token_cache_is_blocked(self):
