@@ -374,6 +374,7 @@ def fetch_coord_comments(gh: GitHub, since: dt.datetime) -> List[Dict[str, Any]]
             "url": comment.get("html_url"),
             "text": marker.strip(comment.get("body") or ""),
             "payload": payload,
+            "author": {"login": (comment.get("user") or {}).get("login")},
         })
     out.sort(key=lambda c: c["id"] or 0)
     return out
@@ -728,6 +729,19 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
 
 
 HEAD_RECORDS = {"review-substitute": "substituteReviewHead", "alex-approve": "alexApprovedHead"}
+SIDECHAIN_LOGIN = "inisa-sidechain[bot]"  # the app that posts `@inisa-sidechain review` results (reviewer.py)
+
+
+def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
+    """The head a comment blocks: a `review` marker with verdict `changes`, posted by the
+    app itself (anyone can write a marker; Codex on #1049). Such a head is held whatever
+    else is said of it (Codex's 👍 included); only a new head answers it."""
+    author = comment.get("author")
+    login = author.get("login") if isinstance(author, dict) else ((comment.get("user") or {}).get("login"))
+    if login == SIDECHAIN_LOGIN and payload.get("kind") == "review" and payload.get("verdict") == "changes" \
+            and isinstance(payload.get("head"), str):
+        return payload["head"]
+    return None
 
 
 def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
@@ -739,14 +753,13 @@ def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str
         field = HEAD_RECORDS.get(payload.get("kind"))
         if field and isinstance(payload.get("pr"), int):
             latest[(payload["pr"], field)] = payload.get("head")
+    # For the board; the train re-reads each queued PR's whole history (train_step.train_added),
+    # so a block older than this snapshot's comment window still holds there.
     blocked: Dict[int, set] = {}
     for comment in comments:
-        payload = comment["payload"]
-        # A sidechain review that requested changes holds its head whatever else is said of
-        # it (Codex's 👍 included); only a new head answers it (Codex on #1049).
-        if payload.get("kind") == "review" and payload.get("verdict") == "changes" \
-                and isinstance(payload.get("pr"), int) and isinstance(payload.get("head"), str):
-            blocked.setdefault(payload["pr"], set()).add(payload["head"])
+        head = sidechain_blocks(comment, comment["payload"])
+        if head and isinstance(comment["payload"].get("pr"), int):
+            blocked.setdefault(comment["payload"]["pr"], set()).add(head)
     for pr in prs:
         for field in HEAD_RECORDS.values():
             pr[field] = latest.get((pr["number"], field))

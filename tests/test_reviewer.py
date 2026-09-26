@@ -759,8 +759,9 @@ class CodexRound3Tests(ReviewFlowTests):
         self.assertFalse(any("the cap" in line for line in lines))
 
     def test_e3_a_sidechain_block_holds_the_head_even_with_codex_approval(self):
-        comments = [{"payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus",
-                                 "verdict": "changes"}},
+        app = {"login": reviewer.APP_LOGIN}
+        comments = [{"author": app, "payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus",
+                                                "verdict": "changes"}},
                     {"payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "pass"}},
                     {"payload": {"kind": "review", "v": 1, "pr": 7, "request": 3, "verdict": "none"}}]
         pr = {"number": 7, "head": HEAD, "base": "main", "state": "OPEN", "labels": [], "codex": {"approved": True},
@@ -780,6 +781,115 @@ class CodexRound3Tests(ReviewFlowTests):
         notice = {"user": {"login": "chatgpt-codex-connector[bot]"}, "body": CODEX_NOTICE,
                   "created_at": snapshot.iso(at(-100))}
         self.assertFalse(reviewer.codex_out([notice], reviewer.pushed_at(suites, "b"), [], at(0)))
+
+
+class CodexRound4Tests(ReviewFlowTests):
+    """Codex's review of f1d0bcfb (#1049)."""
+
+    def test_f1_f2_the_train_reads_the_whole_history_and_only_the_apps_blocks(self):
+        from coordlib import train_step
+        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "verdict": "changes"}
+        forged = dict(blocking, head="f" * 40)
+        fake = mock.Mock()
+        fake.gh.rest_paginated.return_value = [
+            {"user": {"login": reviewer.APP_LOGIN}, "created_at": "2026-01-01T00:00:00Z",  # months old
+             "body": marker.compose("Review", blocking)},
+            {"user": {"login": "alex-bridges"}, "created_at": "2026-09-26T00:00:00Z",
+             "body": marker.compose("Review", forged)}]
+        fake.own_record.return_value = False
+        pr = {"number": 7}
+        train_step.Step.train_added(fake, pr)
+        self.assertEqual(pr["sidechainBlockedHeads"], [HEAD])
+        board = [{"author": {"login": "someone"}, "payload": forged}]
+        prs = [{"number": 7}]
+        snapshot.attach_substitute_reviews(prs, board)
+        self.assertEqual(prs[0]["sidechainBlockedHeads"], [], "a forged marker blocks nothing")
+
+    def test_f3_a_counting_pass_posts_its_review_last(self):
+        self.app.pr_comments = [{"user": {"login": "chatgpt-codex-connector[bot]"}, "body": CODEX_NOTICE,
+                                 "created_at": snapshot.iso(at(-60))}]
+        order = []
+        real = self.app.rest
+
+        def spy(path, method="GET", body=None):
+            if method == "POST" and path.endswith("/labels"):
+                order.append("label")
+            elif method == "POST" and path.endswith("/comments"):
+                order.append((marker.decode(body["body"]) or {}).get("kind"))
+            return real(path, method, body)
+        self.app.rest = spy
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        self.assertEqual(order, ["review-substitute", "label", "review"])
+
+    def test_f4_a_finished_review_is_posted_during_a_pause(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        with mock.patch.object(reviewer.Reviews, "runs_today", return_value=0):
+            jobs = reviewer.Reviews(mock.Mock(state=self.last_state(), config=self.config, now=at(10),
+                                              say=lambda *_: None), self.app)
+            jobs.step([], [], "paused until later")
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.reviews()), 1)
+
+    def last_state(self):
+        with open(os.path.join(self.config.state_dir, "state.json")) as handle:
+            return json.load(handle)
+
+    def test_f4_a_pause_still_holds_a_new_run(self):
+        self.tick(0)
+        self.ask(1)
+        jobs = reviewer.Reviews(mock.Mock(state={"reviews": {"1": {"id": 1, "pr": 7, "model": "opus", "error": None,
+                                                                   "url": "", "status": "pending"}}},
+                                          config=self.config, now=at(10), say=lambda *_: None), self.app)
+        jobs.step([], [], "paused until later")
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(self.app.posts, [])
+
+    def test_f5_scratch_is_fresh_on_every_attempt(self):
+        scratch = os.path.join(self.config.state_dir, "reviews", f"pr-7-{HEAD[:10]}-scratch")
+        os.makedirs(os.path.join(scratch, ".claude", "agents"))
+        seen = []
+        runner = self.runner
+
+        def looking(cmd, cwd, env, timeout):
+            seen.append(sorted(n for n in os.listdir(scratch) if n != os.path.basename(env["GH_CONFIG_DIR"])))
+            return runner(cmd, cwd, env, timeout)
+        self.runner = looking
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        self.assertEqual(seen, [[]])
+
+    def test_f6_whether_a_pass_counts_is_decided_when_it_is_posted(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        with mock.patch.object(reviewer, "codex_out", return_value=True):
+            self.tick(5)  # counts, but the first post fails
+        self.assertEqual(self.app.posts, [])
+        with mock.patch.object(reviewer, "codex_out", return_value=False):
+            self.tick(10)  # Codex is back
+        self.assertEqual(self.app.markers("review-substitute"), [])
+        self.assertEqual(self.app.markers("review")[0]["countsForTrain"], False)
+        self.assertNotIn(train.CODEX_UNAVAILABLE_LABEL, self.app.labels)
+
+    def test_f7_an_unwritable_audit_log_costs_no_rerun(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        with mock.patch.object(conductor, "append_review", side_effect=OSError("disk full")):
+            self.tick(5)
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.reviews()), 1)
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):

@@ -800,7 +800,7 @@ class Watcher:
         if not blocked:
             tampered = self.tampered()
             blocked = f"the conductor's own controls are modified in its checkout: {tampered}" if tampered else ""
-        jobs.app = None if blocked else self.app_gh_factory()
+        jobs.app = self.app_gh_factory()  # posting a finished review needs no run: Reviews.step decides
         jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

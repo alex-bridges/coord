@@ -62,7 +62,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import marker, outage, review, snapshot, train
 from .gh import AppAuthError, GitHub, GitHubError, redact
 
-APP_LOGIN = "inisa-sidechain[bot]"
+APP_LOGIN = snapshot.SIDECHAIN_LOGIN
 MODELS = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "claude-fable-5-1"}
 DEFAULT_MODEL = "opus"
 BLOCKING = ("P0", "P1", "P2")
@@ -470,19 +470,21 @@ class Reviews:
         if not jobs:
             return
         now = self.w.now
-        if blocked:
+        self.blocked = blocked
+        # Work that needs no model run (a reply or a finished review to post) goes ahead
+        # through a pause, an outage or the cap; only starting a run waits (Codex on #1049).
+        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished")]
+        if blocked and not continuing:
             self.w.say(f"{len(jobs)} review request(s) waiting: {blocked}")
             return
         if self.app is None or getattr(self.app, "app", None) is None:
             self.w.say(f"{len(jobs)} review request(s) waiting: the inisa-sidechain app is not available here "
                        "(reviews are posted by the app only)")
             return
-        cap = self.config.max_reviews_per_day
-        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished")]
         if continuing:
-            jobs = continuing  # no model run needed: never held by the cap (Codex on #1049)
-        elif self.runs_today(now) >= cap:
-            self.w.say(f"{len(jobs)} review request(s) waiting: {cap} reviews in 24 h, the cap")
+            jobs = continuing
+        elif self.may_run():
+            self.w.say(f"{len(jobs)} review request(s) waiting: {self.may_run()}")
             return
         request = jobs[0]
         record = self.state[str(request["id"])]
@@ -495,6 +497,15 @@ class Reviews:
             self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
         except GitHubError as error:
             self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
+
+    def may_run(self) -> str:
+        """Why a new model run may not start now, or ""."""
+        if getattr(self, "blocked", ""):
+            return self.blocked
+        cap = self.config.max_reviews_per_day
+        if self.runs_today(self.w.now) >= cap:
+            return f"{cap} reviews in 24 h, the cap"
+        return ""
 
     def reply(self, request: Dict[str, Any], text: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         # Every reply names its request, so a new leader rescanning can tell answered from not.
@@ -546,17 +557,21 @@ class Reviews:
         if finished and finished.get("head") != head:
             record.pop("finished")
             finished = None
-        if not posting:
+        if not posting or not posting.get("started"):
             if not finished:
+                if self.may_run():
+                    self.w.say(f"review of #{request['pr']} waits: {self.may_run()}")
+                    return
                 finished = self.review(request, record, pr, head, windows)
                 if finished is None:
                     return
                 # Kept before any GitHub call: if a read or a post fails, the next tick carries
                 # on from here instead of running the review again (review of 58ac99de; Codex).
                 record["finished"] = finished
+            # Composed again on every attempt until something is posted, so whether a pass
+            # counts is decided on the outage and notices as they are then (Codex on #1049).
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
-            record.pop("finished", None)
         self.publish(request, record, posting, key)
 
     def review(self, request: Dict[str, Any], record: Dict[str, Any], pr: Dict[str, Any], head: str,
@@ -583,8 +598,11 @@ class Reviews:
         text = str(conductor.parse_result(completed.stdout).get("result") or "")
         run = {"seconds": seconds, "turns": result["turns"], "agent": self.agent(), "usage": result["usage"],
                "cost": result["cost"], "session": result["session"]}
-        conductor.append_review(self.config, {"at": snapshot.iso(now), "pr": request["pr"], "head": head,
-                                              "model": request["model"], "ok": result["ok"], **run})
+        try:  # the audit log is best-effort: a full disk must not cost a rerun (Codex on #1049)
+            conductor.append_review(self.config, {"at": snapshot.iso(now), "pr": request["pr"], "head": head,
+                                                  "model": request["model"], "ok": result["ok"], **run})
+        except OSError as error:
+            self.w.say(f"could not log the review of #{request['pr']} ({_clip(str(error), 100)})")
         if result["limit"]:
             self.runs.pop()  # a refused run is not a review; the job stays for after the reset
             self.w.post_outage(result["limit"])
@@ -617,39 +635,41 @@ class Reviews:
                 "revoke": revoke}
 
     def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
-        """Post a finished review, and for a pass that counts, the train's record and label.
-        Each step is remembered, so a retry after a failed post repeats none that succeeded."""
+        """Post a finished review. Order: a withdrawal of an older substitute first (a blocking
+        verdict is never out while it stands); for a pass that counts, the substitute record
+        and the label; the review itself last, so a posted review means every step before
+        it happened, which is what a new leader's rescan relies on (Codex on #1049). Each step
+        is remembered, so a retry repeats none that succeeded; once one has, the decision is
+        frozen (`started`)."""
         now = self.w.now
         head = posting["head"]
+        comments = f"repos/{{repo}}/issues/{request['pr']}/comments"
         if posting.get("revoke") and not posting.get("revoked"):
-            # Before the review is visible: a blocking verdict must never be out while the old
-            # substitute still stands (Codex on #1049). The train also holds a head any
-            # sidechain review blocked (snapshot.attach_substitute_reviews).
-            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={
-                "body": marker.compose(
-                    f"**Substitute review withdrawn** for head `{head[:9]}`: a later review found blocking "
-                    "findings (posted next). The train holds this head until a new push is reviewed.",
-                    {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
-                     "revokes": head})})
-            posting["revoked"] = True
-        if not posting.get("url"):
-            posted = self.reply(request, posting["body"], posting["payload"])
-            posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"))
-        link = posting["url"]
+            self.app.rest(comments, method="POST", body={"body": marker.compose(
+                f"**Substitute review withdrawn** for head `{head[:9]}`: a later review found blocking "
+                "findings (posted next). The train holds this head until a new push is reviewed.",
+                {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
+                 "revokes": head, "request": request["id"]})})
+            posting.update(revoked=True, started=True)
         if posting["counts"] and not posting.get("recorded"):
-            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={
-                "body": marker.compose(
-                    f"**Substitute review** of head `{head[:9]}` (Codex out of quota): {link}\n\n"
-                    "This stands in for Codex's 👍 on this head only; a new push needs a new review.",
-                    {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
-                     "review": posting.get("id")})})
-            posting["recorded"] = True
+            self.app.rest(comments, method="POST", body={"body": marker.compose(
+                f"**Substitute review** of head `{head[:9]}` (Codex out of quota): the review follows, "
+                f"requested in {request.get('url') or 'a comment'}.\n\n"
+                "This stands in for Codex's 👍 on this head only; a new push needs a new review.",
+                {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
+                 "request": request["id"]})})
+            posting.update(recorded=True, started=True)
         if posting["counts"] and not posting.get("labelled"):
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
                           body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
             posting["labelled"] = True
+        if not posting.get("url"):
+            posted = self.reply(request, posting["body"], posting["payload"])
+            posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"), started=True)
+        link = posting["url"]
         self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
         record.pop("posting", None)
+        record.pop("finished", None)
         record.update(status="done", at=snapshot.iso(now), url=link, verdict=posting["verdict"])
         self.w.say(f"reviewed #{request['pr']} at {head[:9]} with {request['model']}: {posting['verdict']}"
                    + (" (counts for the train)" if posting["counts"] else "") + f" {link}")
@@ -686,7 +706,12 @@ class Reviews:
         record.pop("unsent", None)
 
     def checkout(self, pr: int, head: str, worktree: str, scratch: str, base: str = "origin/main") -> bool:
-        os.makedirs(scratch, exist_ok=True)
+        # A fresh scratch every attempt: an interrupted run's tests could have left a `.claude`
+        # there for the retry to load (Codex on #1049).
+        shutil.rmtree(scratch, ignore_errors=True)
+        if os.path.lexists(scratch):
+            return False
+        os.makedirs(scratch)
         if os.path.exists(worktree):
             self.w.git(["worktree", "remove", "--force", worktree])
         if self.w.git(["fetch", "-q", "origin", f"pull/{pr}/head"])[0] != 0:
