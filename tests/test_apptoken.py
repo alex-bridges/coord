@@ -823,8 +823,8 @@ class SecurityOverrideTests(AppTestCase):
         self.keychain("key")
         with self.assertRaises(AppAuthError):
             self.tokens().token("read")
-        self.assertEqual([name for name in os.listdir(self.token_dir) if name.endswith(".failed.json")]
-                         if os.path.isdir(self.token_dir) else [], [], "no .failed.json")
+        self.assertFalse(os.path.exists(self.token_dir),
+                         "refused before the lock: no lock, no cache, no .failed.json (the directory never made)")
         del os.environ["COORD_SECURITY_BIN"]
         self.assertTrue(self.tokens().token("read"), "without the variable the next run proceeds")
         self.assertEqual(len(self.security_calls()), 1, "the fake Keychain answered once, for that run")
