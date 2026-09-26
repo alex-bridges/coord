@@ -75,6 +75,9 @@ DENY = [
     # Mid-command forms; prefix rules alone missed `git push origin --force` and an API
     # merge (substitute review of #1043). .claude/hooks/conductor-guard.py is the backstop.
     "Bash(git push * --force*)", "Bash(git push * -f*)", "Bash(gh api * pulls/*/merge*)", "Bash(* train approve*)",
+    # A GitHub App token in a shell (#1035); the guard also blocks the Keychain item, the
+    # token cache and apptoken one-liners.
+    "Bash(* token exec*)",
 ]
 FAILED = ("failure", "timed_out", "startup_failure")
 

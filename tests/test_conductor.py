@@ -709,13 +709,64 @@ class GuardHookTests(unittest.TestCase):
                         "sh -c 'Tools/coord/coord token exec --kind ops -- env'",
                         "bash -c \"coord token exec -- gh api user\"", "eval 'coord token exec -- true'",
                         "cd /tmp && Tools/coord/coord token exec -- true",
-                        "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true"):
+                        "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true",
+                        # coord's top-level --repo before the command (round three, P3-1)
+                        "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
+                        "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
+                        "sh -c 'coord --repo o/r token exec -- env'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("Tools/coord/coord token status", "gh pr comment 5 -b 'never run coord token exec here'",
-                        "grep -n 'token exec' Docs/agent-coordination.md"):
+                        "grep -n 'token exec' Docs/agent-coordination.md",
+                        "Tools/coord/coord --repo example-owner/example-repo token status",
+                        "Tools/coord/coord --repo example-owner/example-repo board"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
         self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
                          "outside the conductor the guard is silent")
+
+    def test_train_approve_with_repo_is_blocked(self):
+        for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
+                        "coord --repo=o/r train approve 5"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+
+    def test_the_keychain_is_blocked(self):
+        # The app's private key: `security find-generic-password -s example-coord-github-app -w`
+        # prints it without a prompt to any process running as Alex.
+        for command in ("security find-generic-password -s example-coord-github-app -w",
+                        "/usr/bin/security find-generic-password -s 'example-coord-github-app' -a x -w",
+                        "security find-internet-password -s github.com -w", "security dump-keychain -d",
+                        "security export -k login.keychain -o /tmp/k.p12", "sh -c 'security find-generic-password -w'",
+                        "x=$(security find-generic-password -s example-coord-github-app -w)",
+                        "cd /tmp && security find-generic-password -ga inisa"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("security list-keychains", "security show-keychain-info",
+                        "grep -n 'security find-generic-password' Docs/agent-coordination.md",
+                        "gh pr comment 5 -b 'the key is read with security find-generic-password'",
+                        "grep -rn security Tools/coord/coordlib/apptoken.py"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_token_cache_is_blocked(self):
+        for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
+                        "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
+                        "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("ls ~/Library/Caches", "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json",
+                        "Tools/coord/coord token status"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_apptoken_one_liners_are_blocked(self):
+        for command in ("python3 -c 'from coordlib import apptoken; print(apptoken.AppTokens)'",
+                        "cd Tools/coord && python3 -c \"import coordlib.apptoken as a\"",
+                        "python3 -B -c 'from coordlib.apptoken import AppTokens'",
+                        "/usr/bin/python3 -c 'import coordlib.apptoken'",
+                        "python3 - <<'EOF'\nfrom coordlib import apptoken\nEOF"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
+        for command in ("python3 -m unittest discover -s Tools/coord/tests",
+                        "python3 -m unittest test_apptoken", "grep -n AppTokens Tools/coord/coordlib/apptoken.py",
+                        "python3 -c 'print(1)'", "git log --oneline -- Tools/coord/coordlib/apptoken.py"):
+            self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
+
+    def test_the_deny_list_names_token_exec(self):
+        self.assertIn("Bash(* token exec*)", conductor.DENY)
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
