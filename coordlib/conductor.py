@@ -45,7 +45,7 @@ import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import budget, cache, identity, lease, marker, outage, review, snapshot, train
+from . import budget, cache, identity, lease, marker, outage, review, runtime, snapshot, train
 from .gh import AppAuthError, GitHub, GitHubError
 
 TRIAGE_MODEL = "sonnet"
@@ -382,16 +382,8 @@ def compose_prompt(config: Config, reasons: List[Dict[str, Any]], model: str, no
 
 
 def parse_result(stdout: str) -> Dict[str, Any]:
-    """The JSON object `claude -p --output-format json` prints (the last parseable line)."""
-    text = (stdout or "").strip()
-    for candidate in [text] + text.splitlines()[::-1]:
-        try:
-            data = json.loads(candidate)
-        except ValueError:
-            continue
-        if isinstance(data, dict):
-            return data
-    return {}
+    """The conductor's existing Claude result, through the shared runtime adapter."""
+    return runtime.parse_claude(stdout)
 
 
 _FINAL = re.compile(r"^\s*(SUMMARY|ESCALATE):\s*(.*)$", re.MULTILINE)
@@ -455,9 +447,7 @@ def default_runner(cmd: Sequence[str], cwd: str, env: Dict[str, str], timeout: i
 
 
 def model_command(config: Config, prompt: str, model: str) -> List[str]:
-    return [config.claude, "-p", prompt, "--agent", "conductor", "--model", model, "--output-format", "json",
-            "--permission-mode", "auto", "--add-dir", config.state_dir,
-            "--settings", json.dumps({"permissions": {"deny": DENY}})]
+    return runtime.claude_command(config.claude, prompt, model, config.state_dir, DENY)
 
 
 # MARK: - The watcher

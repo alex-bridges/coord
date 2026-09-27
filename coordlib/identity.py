@@ -1,18 +1,25 @@
-"""Who is running this command: `<harness>@<host>:<worktree>`.
+"""Who is running this command: `<harness>@<host>:<worktree>-<identity digest>`.
 
-Examples: claude@Eidolon:agent-coord, codex@Eidolon:leveltrim, claude-cloud@a1b2c3:INISA.
-Set COORD_AGENT to override (a Codex environment the heuristics miss, a
-teammate who wants a fixed name).
+The digest distinguishes tasks in one checkout and same-named worktrees. Set
+COORD_AGENT for a fixed address, or COORD_SESSION_ID for a harness-independent
+task identifier. An automatically chosen address stays stable while its task,
+host and checkout stay the same.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import socket
 import subprocess
+import tempfile
 import uuid
 from typing import Mapping, Optional
+
+
+class IdentityError(RuntimeError):
+    """A stable agent address could not be established."""
 
 
 def detect_harness(env: Mapping[str, str], toplevel: str) -> str:
@@ -80,37 +87,71 @@ def agent_id(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None)
     if explicit:
         return explicit
     toplevel = git_toplevel(cwd)
-    worktree = os.path.basename(toplevel) if toplevel else "nogit"
-    harness = detect_harness(env, toplevel)
-    if harness == "claude-cloud":
-        # Every cloud container reports host "vm" and checkout "INISA" (probed
-        # 2026-09-24), so host:worktree would give all cloud sessions ONE identity and
-        # mix their claims and messages. A container is one session: name it by that.
-        session = env.get("CLAUDE_CODE_REMOTE_SESSION_ID") or env.get("CLAUDE_CODE_SESSION_ID") or container_id()
-        return f"claude-cloud@{re.sub(r'[^A-Za-z0-9]', '', session)[:8] or 'unknown'}:{worktree}"
-    return f"{harness}@{detect_host()}:{worktree}"
+    # Codex worktrees often all end in /INISA; that basename is a label, not an id.
+    # Normalize aliases before both naming and hashing the checkout.
+    checkout = os.path.normcase(os.path.realpath(toplevel or cwd or os.getcwd()))
+    worktree = os.path.basename(checkout) if toplevel else "nogit"
+    worktree = re.sub(r"[^A-Za-z0-9_-]", "-", worktree) or "worktree"
+    harness = detect_harness(env, checkout)
+    session = env.get("COORD_SESSION_ID")
+    if not session and harness == "codex":
+        session = env.get("CODEX_THREAD_ID")
+    elif not session and harness in ("claude", "claude-cloud"):
+        session = env.get("CLAUDE_CODE_REMOTE_SESSION_ID") or env.get("CLAUDE_CODE_SESSION_ID")
+    if not session and harness == "claude-cloud":
+        # Cloud containers can share BOTH hostname and checkout path. Keep a
+        # container id only for the known cloud environment without a session id.
+        session = container_id()
+    source = f"session:{session}" if session else f"checkout:{checkout}"
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    return f"{harness}@{detect_host()}:{worktree}-{digest}"
 
 
 def container_id() -> str:
-    """A random id created once per machine and kept in the coord cache."""
+    """A persistent cloud fallback id, published once even by concurrent creators.
+
+    Only a completely written file becomes visible at container-id. A contender
+    reads the winner; an unavailable cache must never yield a one-command identity.
+    """
     base = os.environ.get("COORD_CACHE_DIR") or os.path.join(
         os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "inisa-coord")
     path = os.path.join(base, "container-id")
-    try:
+    message = "cannot read or persist a stable cloud identity; set COORD_AGENT or COORD_SESSION_ID"
+
+    def read() -> str:
         with open(path, encoding="utf-8") as handle:
             existing = handle.read().strip()
-            if existing:
-                return existing
-    except OSError:
+        if not existing:
+            raise IdentityError(message)
+        return existing
+
+    try:
+        return read()
+    except FileNotFoundError:
         pass
-    fresh = uuid.uuid4().hex
+    except (OSError, UnicodeError):
+        raise IdentityError(message) from None
+    temporary = None
     try:
         os.makedirs(base, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(fresh)
-    except OSError:
-        pass
-    return fresh
+        descriptor, temporary = tempfile.mkstemp(dir=base, prefix=".container-id-")
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(uuid.uuid4().hex)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass  # another creator published first; return the same identity
+        return read()
+    except (OSError, UnicodeError):
+        raise IdentityError(message) from None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 def matches(address: str, agent: str) -> bool:

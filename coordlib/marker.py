@@ -20,14 +20,130 @@ Rules:
 from __future__ import annotations
 
 import json
+import math
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 PREFIX = "<!-- coord:v1 "
 SUFFIX = " -->"
 
 KINDS = ("claim", "release", "msg", "train-add", "train-remove", "train", "review-clean", "review-substitute",
          "alex-approve", "outage", "conductor", "review")
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str)
+
+
+def _nonempty_text(value: Any) -> bool:
+    return _text(value) and bool(value.strip())
+
+
+def _positive_int(value: Any) -> bool:
+    return type(value) is int and value > 0
+
+
+def _texts(value: Any) -> bool:
+    return isinstance(value, list) and all(_text(item) for item in value)
+
+
+def _number(value: Any) -> bool:
+    return type(value) is int or (type(value) is float and math.isfinite(value))
+
+
+def _wake(value: Any) -> bool:
+    return (isinstance(value, dict) and _nonempty_text(value.get("at"))
+            and all(name not in value or check(value[name]) for name, check in {
+                "model": _text, "ok": lambda v: type(v) is bool, "summary": _text,
+            }.items()))
+
+
+# Additive fields are allowed within v1. Every field the current readers interpret
+# has a type here, including routing fields on records other than messages. Do not
+# coerce values: a stringified list is not an agent, nor is True an issue number.
+_FIELDS: Dict[str, Callable[[Any], bool]] = {
+    **{name: _text for name in (
+        "branch", "note", "head", "by", "batch", "tip", "hold", "reason", "mode",
+        "host", "beat", "until", "at",
+    )},
+    "agent": _nonempty_text, "event": _nonempty_text, "harness": _nonempty_text,
+    "issue": _positive_int, "pr": _positive_int, "on": _positive_int,
+    "files": _texts, "takesOverFrom": _texts, "to": _texts, "failed": _texts,
+    "members": lambda value: isinstance(value, list) and all(_positive_int(item) for item in value),
+    "everyone": lambda value: type(value) is bool,
+    "leader": lambda value: type(value) is bool,
+    "run": lambda value: value is None or _positive_int(value),
+    "seenThrough": lambda value: value is None or _text(value),
+    "pending": _number, "disk": _number, "lastWake": _wake,
+    # reviewer.py: its `review` records, and the model its review-clean records name. (Its
+    # `request`, a comment id, stays untyped: train records use that name for an object.)
+    "verdict": _nonempty_text, "model": _text, "revokes": _text,
+    "countsForTrain": lambda value: type(value) is bool,
+    "reviewRuns": _texts,
+}
+_REQUIRED = {
+    "claim": ("issue",), "release": ("issue",), "msg": ("to",),
+    "train-add": ("pr", "head"), "train-remove": ("pr",), "train": ("pr", "event"),
+    "review-clean": ("pr", "head"), "review-substitute": ("pr", "head"),
+    "alex-approve": ("pr", "head"), "outage": ("event", "harness"), "conductor": ("event",),
+    "review": ("pr", "verdict"),
+}
+MAX_NESTING = 32
+
+
+def _json_error(payload: Any) -> Optional[str]:
+    # Bound nesting before returning even unknown extension fields to callers that
+    # copy records into JSON snapshots. Use an iterative walk, independent of the
+    # Python version's JSON decoder recursion limit.
+    pending = [(payload, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if isinstance(value, (dict, list)):
+            if depth > MAX_NESTING:
+                return "record nesting limit exceeded"
+            children = value.values() if isinstance(value, dict) else value
+            pending.extend((item, depth + 1) for item in children)
+        elif isinstance(value, float) and not math.isfinite(value):
+            return "non-JSON number"
+    return None
+
+
+def validation_error(payload: Any) -> Optional[str]:
+    """A value-free protocol diagnostic, or None for a supported v1 record.
+
+    v1 is the published wire contract, not a best-effort conversion. Empty heads
+    remain valid: a newer blank attestation revokes an older reviewed/approved head.
+    Train events can grow within v1; readers act only on the events they understand.
+    """
+    if not isinstance(payload, dict):
+        return "record must be an object"
+    json_error = _json_error(payload)
+    if json_error:
+        return json_error
+    if type(payload.get("v")) is not int or payload["v"] != 1:
+        return "unsupported or missing version"
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or kind not in KINDS:
+        return "unsupported or missing kind"
+    for name in ("agent", *_REQUIRED[kind]):
+        if name not in payload:
+            return f"missing {name}"
+    for name, check in _FIELDS.items():
+        if name in payload and not check(payload[name]):
+            return f"invalid {name}"
+    if kind == "outage":
+        if payload["event"] not in ("start", "end"):
+            return "unsupported outage event"
+        if payload["event"] == "start" and "until" not in payload:
+            return "missing until"
+    if kind == "conductor":
+        event = payload["event"]
+        if event not in ("beat", "pause", "resume", "escalate"):
+            return "unsupported conductor event"
+        needed = {"beat": "beat", "pause": "until"}.get(event)
+        if needed and needed not in payload:
+            return f"missing {needed}"
+    return None
 
 
 def encode(payload: Dict[str, Any]) -> str:
@@ -61,9 +177,40 @@ def _marker_index(lines: List[str]) -> int:
     return probe if saw_generated else index
 
 
+def _object(pairs: List[Any]) -> Dict[str, Any]:
+    value: Dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate record field")
+        value[key] = item
+    return value
+
+
+def _constant(value: str) -> Any:
+    raise ValueError("non-JSON number")
+
+
+def parse_json(raw: str) -> Any:
+    """Read bounded, unambiguous JSON; schema validation belongs to the caller.
+
+    Both comment markers and train trailers use this boundary. Duplicate keys,
+    non-finite numbers, and excessive nesting always raise ValueError.
+    """
+    if not isinstance(raw, str):
+        raise ValueError("JSON text must be a string")
+    try:
+        value = json.loads(raw, object_pairs_hook=_object, parse_constant=_constant)
+    except RecursionError:
+        raise ValueError("record nesting limit exceeded") from None
+    error = _json_error(value)
+    if error:
+        raise ValueError(error)
+    return value
+
+
 def decode(body: Optional[str]) -> Optional[Dict[str, Any]]:
-    """The payload of a comment whose last non-blank line (before any tool footer) is a marker."""
-    if not body:
+    """A valid final v1 marker; malformed external records are ignored before ingestion."""
+    if not isinstance(body, str) or not body:
         return None
     lines = [line.strip() for line in body.replace("\r\n", "\n").split("\n")]
     index = _marker_index(lines)
@@ -74,10 +221,10 @@ def decode(body: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
     raw = last[len(PREFIX): -len(SUFFIX)]
     try:
-        payload = json.loads(raw)
+        payload = parse_json(raw)
     except ValueError:
         return None
-    if not isinstance(payload, dict) or payload.get("kind") not in KINDS:
+    if validation_error(payload) is not None:
         return None
     return payload
 
@@ -87,7 +234,7 @@ def recipients(payload: Dict[str, Any]) -> List[str]:
     and the same field on any other record that notifies someone, such as the train's
     `held` notice (#1034). `inbox` delivers a record by this, whatever its kind."""
     to = payload.get("to")
-    return [str(address) for address in to] if isinstance(to, list) else []
+    return list(to) if _texts(to) else []
 
 
 def compose(text: str, payload: Dict[str, Any]) -> str:

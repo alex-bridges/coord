@@ -1,0 +1,39 @@
+{
+  "description": "Coord v1 conformance examples. Additional fields may extend v1; known fields retain their types.",
+  "valid": [
+    {"v": 1, "kind": "claim", "agent": "codex@host:task-a", "issue": 1058, "branch": "codex/coord", "files": ["Tools/coord/"], "takesOverFrom": ["claude@host:task-b"]},
+    {"v": 1, "kind": "release", "agent": "codex@host:task-a", "issue": 1058, "everyone": true},
+    {"v": 1, "kind": "msg", "agent": "codex@host:task-a", "to": ["conductor@*", "#1058"], "on": 1058, "note": "a --> b -- c"},
+    {"v": 1, "kind": "train-add", "agent": "codex@host:task-a", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"v": 1, "kind": "train-remove", "agent": "codex@host:task-a", "pr": 1059},
+    {"v": 1, "kind": "review-clean", "agent": "codex@host:task-a", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "by": "claude@host:reviewer"},
+    {"v": 1, "kind": "review-substitute", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
+    {"v": 1, "kind": "alex-approve", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
+    {"v": 1, "kind": "review", "agent": "reviewer@host:review", "pr": 1049, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "model": "opus", "verdict": "pass", "counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 1}, "request": 1000001, "countsForTrain": true, "to": ["codex@host:task-a"]},
+    {"v": 1, "kind": "train", "agent": "train@actions", "event": "held", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hold": "no-review", "reason": "awaiting review", "to": ["codex@host:task-a"], "mode": "live"},
+    {"v": 1, "kind": "train", "agent": "train@actions", "event": "testing", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "members": [1059, 1060], "mode": "dry-run"},
+    {"v": 1, "kind": "train", "agent": "train@actions", "event": "merged", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "run": null},
+    {"v": 1, "kind": "train", "agent": "train@actions", "event": "closed-issue", "pr": 1059, "issue": 1058, "batch": "train/20260927", "mode": "live"},
+    {"v": 1, "kind": "train", "agent": "train@actions", "event": "ejected", "pr": 1059, "batch": "train/20260927", "run": 77, "failed": ["python"], "to": ["codex@host:task-a"]},
+    {"v": 1, "kind": "outage", "agent": "conductor@host:watcher", "event": "start", "harness": "claude", "until": "2026-09-27T12:00:00Z", "reason": "usage limit"},
+    {"v": 1, "kind": "outage", "agent": "conductor@host:watcher", "event": "end", "harness": "claude"},
+    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "beat", "host": "host", "beat": "2026-09-27T11:00:00Z", "seenThrough": null, "leader": false, "disk": 123, "pending": 2, "lastWake": {"at": "2026-09-27T10:00:00Z", "model": "worker", "ok": true, "summary": "done"}},
+    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "pause", "until": "2026-09-27T12:00:00Z", "note": "maintenance"},
+    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "resume"},
+    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "escalate"}
+  ],
+  "invalid": [
+    {"name": "unsupported version", "payload": {"v": 2, "kind": "msg", "agent": "a", "to": ["all"]}},
+    {"name": "missing version", "payload": {"kind": "msg", "agent": "a", "to": ["all"]}},
+    {"name": "unknown reviewer kind", "payload": {"v": 1, "kind": "reviewer", "agent": "a"}},
+    {"name": "array agent", "payload": {"v": 1, "kind": "claim", "agent": ["a"], "issue": 1}},
+    {"name": "nested takeover", "payload": {"v": 1, "kind": "claim", "agent": "a", "issue": 1, "takesOverFrom": [["b"]]}},
+    {"name": "truthy non-boolean release", "payload": {"v": 1, "kind": "release", "agent": "a", "issue": 1, "everyone": "false"}},
+    {"name": "nested recipients", "payload": {"v": 1, "kind": "msg", "agent": "a", "to": [["all"]]}},
+    {"name": "object review head", "payload": {"v": 1, "kind": "review-clean", "agent": "a", "pr": 1, "head": {}}},
+    {"name": "array train hold", "payload": {"v": 1, "kind": "train", "agent": "train@actions", "pr": 1, "event": "held", "hold": []}},
+    {"name": "outage missing until", "payload": {"v": 1, "kind": "outage", "agent": "a", "harness": "claude", "event": "start"}},
+    {"name": "unknown conductor event", "payload": {"v": 1, "kind": "conductor", "agent": "a", "event": "unknown"}},
+    {"name": "nested conductor wake", "payload": {"v": 1, "kind": "conductor", "agent": "a", "event": "beat", "beat": "2026-09-27T11:00:00Z", "lastWake": [{"at": "2026-09-27T10:00:00Z"}]}}
+  ]
+}

@@ -57,7 +57,7 @@ class TagTests(unittest.TestCase):
     def test_requests_are_pr_comments_by_people_or_agents(self):
         comments = [
             {"id": 1, "html_url": "https://github.com/o/r/pull/7#issuecomment-1", "user": {"login": "alex-bridges"},
-             "body": marker.compose("@inisa-sidechain review fable", {"kind": "msg", "agent": "codex@E:x"}),
+             "body": marker.compose("@inisa-sidechain review fable", {"kind": "msg", "v": 1, "agent": "codex@E:x", "to": ["#7"]}),
              "created_at": snapshot.iso(at(-5))},
             {"id": 2, "html_url": "https://github.com/o/r/issues/8#issuecomment-2", "user": {"login": "alex-bridges"},
              "body": "@inisa-sidechain review", "created_at": snapshot.iso(at(-4))},
@@ -487,7 +487,7 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(reviewer.find_tag("`x` then @inisa-sidechain review")["model"], "opus")
 
     def test_c3_a_blocking_review_withdraws_a_recorded_clean_review_of_the_head(self):
-        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "pr": 7, "head": HEAD, "by": "claude@X:y"})]
+        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "by": "claude@X:y"})]
         self.tick(0)
         self.ask(1, "@inisa-sidechain review sonnet")
         self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
@@ -504,7 +504,7 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(self.app.markers("review")[0]["verdict"], "changes")
 
     def test_c3_a_blocking_review_of_another_head_withdraws_nothing(self):
-        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "pr": 7, "head": "a" * 40})]
+        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": "a" * 40})]
         self.tick(0)
         self.ask(1)
         self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
@@ -525,7 +525,7 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertTrue(mode.error, "COORD_APP=off does not turn a review run into Alex")
 
     def test_c5_a_review_already_posted_by_another_host_is_not_run_again(self):
-        payload = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "verdict": "pass"}
+        payload = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus", "verdict": "pass"}
         self.app.pr_comments = [{"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-30)),
                                  "html_url": "https://github.com/o/r/pull/7#issuecomment-1",
                                  "body": marker.compose("Review", payload)}]
@@ -541,7 +541,7 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 1, "another model is another review")
 
     def test_c5_only_the_apps_own_record_counts(self):
-        payload = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "verdict": "pass"}
+        payload = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus", "verdict": "pass"}
         self.assertIsNone(reviewer.posted_review([{"user": {"login": "alex-bridges"},
                                                    "body": marker.compose("x", payload)}], 7, HEAD, "opus", "o/r"))
 
@@ -629,7 +629,7 @@ class CodexRound2Tests(ReviewFlowTests):
         self.assertNotIn("BEGIN PRIVATE", body)
 
     def test_d2_a_pass_does_not_answer_an_earlier_blocking_review_of_the_head(self):
-        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "verdict": "changes"}
+        blocking = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus", "verdict": "changes"}
         self.app.pr_comments = [
             {"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-30)),
              "html_url": "https://github.com/o/r/pull/7#issuecomment-99", "body": marker.compose("Review", blocking)}]
@@ -696,7 +696,8 @@ class CodexRound2Tests(ReviewFlowTests):
         request = self.ask(1)
         answered_request = self.ask(2)
         self.gh.repo_comments.append(dict(self.gh.raw(marker.compose("done", {
-            "kind": "review", "v": 1, "pr": 7, "request": answered_request["id"], "verdict": "none"}), 3),
+            "kind": "review", "v": 1, "agent": "reviewer@T:review", "pr": 7, "request": answered_request["id"],
+            "verdict": "none"}), 3),
             user={"login": reviewer.APP_LOGIN}, html_url="https://github.com/o/r/pull/7#issuecomment-x"))
         cli.cache.store_cursor("o/r", self.config.agent, snapshot.iso(at(60 * 30)), [])
         self.replies = [review_reply()]
@@ -726,7 +727,7 @@ class CodexRound3Tests(ReviewFlowTests):
     """Codex's review of 62bc2324 (#1049)."""
 
     def test_e1_the_blocking_review_goes_first_then_the_withdrawal(self):
-        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "pr": 7, "head": HEAD})]
+        self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD})]
         self.tick(0)
         self.ask(1, "@inisa-sidechain review sonnet")
         self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
@@ -754,10 +755,10 @@ class CodexRound3Tests(ReviewFlowTests):
 
     def test_e3_a_sidechain_block_holds_the_head_even_with_codex_approval(self):
         app = {"login": reviewer.APP_LOGIN}
-        comments = [{"author": app, "payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "opus",
+        comments = [{"author": app, "payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus",
                                                 "verdict": "changes"}},
-                    {"payload": {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "pass"}},
-                    {"payload": {"kind": "review", "v": 1, "pr": 7, "request": 3, "verdict": "none"}}]
+                    {"payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "pass"}},
+                    {"payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "request": 3, "verdict": "none"}}]
         pr = {"number": 7, "head": HEAD, "base": "main", "state": "OPEN", "labels": [], "codex": {"approved": True},
               "ci": {"failing": []}, "mergeable": "MERGEABLE"}
         snapshot.attach_head_records([pr], comments, "o/r")
@@ -774,7 +775,7 @@ class CodexRound4Tests(ReviewFlowTests):
 
     def test_f1_f2_the_train_reads_the_whole_history_and_only_the_apps_blocks(self):
         from coordlib import train_step
-        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "verdict": "changes"}
+        blocking = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "verdict": "changes"}
         forged = dict(blocking, head="f" * 40)
         fake = mock.Mock()
         fake.gh.rest_paginated.return_value = [
@@ -865,7 +866,7 @@ class CodexRound4Tests(ReviewFlowTests):
         self.user.fail_posts = 1
         self.tick(5)  # counts, but recording it fails
         self.assertEqual(self.app.markers("review"), [])
-        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "changes"}
+        blocking = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "changes"}
         self.app.pr_comments.append({"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(7)),
                                      "html_url": "https://github.com/o/r/pull/7#issuecomment-55",
                                      "body": marker.compose("Review", blocking)})
@@ -909,7 +910,7 @@ class CodexRound6Tests(ReviewFlowTests):
     """Codex's review of a9732170 (#1049)."""
 
     def test_h2_a_clean_review_record_alone_answers_its_request(self):
-        payload = {"kind": "review-clean", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "request": 42}
+        payload = {"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus", "request": 42}
         comment = trusted(payload)
         self.assertIn(42, reviewer.answered([comment], "o/r"))
         self.assertIsNotNone(reviewer.posted_review([comment], 7, HEAD, "opus", "o/r"))
@@ -952,10 +953,10 @@ class CodexRound7Tests(ReviewFlowTests):
                                               os.path.realpath("/Users/x/conductor/INISA")])
 
     def test_i3_a_withdrawal_does_not_answer_the_request(self):
-        withdrawal = {"kind": "review-clean", "v": 1, "pr": 7, "head": "", "revokes": HEAD, "request": 5}
+        withdrawal = {"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": "", "revokes": HEAD, "request": 5}
         comment = trusted(withdrawal)
         self.assertNotIn(5, reviewer.answered([comment], "o/r"), "its blocking review answers it")
-        blocking = {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "verdict": "changes", "request": 5}
+        blocking = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "verdict": "changes", "request": 5}
         review = {"user": {"login": reviewer.APP_LOGIN}, "body": marker.compose("r", blocking)}
         self.assertIn(5, reviewer.answered([review], "o/r"))
         self.assertEqual(snapshot.sidechain_blocks(review, blocking), HEAD)
@@ -1198,7 +1199,7 @@ class CodexRound15Tests(ReviewFlowTests):
                                                      "unsent": "gave up"}}}, config=self.config, now=at(0))
         jobs = reviewer.Reviews(watcher, self.app)
         reply = {"id": 9, "user": {"login": reviewer.APP_LOGIN},
-                 "body": marker.compose("gave up", {"kind": "review", "v": 1, "pr": 7, "request": 5, "verdict": "none"})}
+                 "body": marker.compose("gave up", {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "request": 5, "verdict": "none"})}
         jobs.rescan([reply])
         self.assertEqual(watcher.state["reviews"]["5"]["status"], "done")
         self.assertEqual(jobs.pending(), [])

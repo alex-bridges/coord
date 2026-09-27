@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 import urllib.parse
+from unittest import mock
 from typing import Any, Dict, List, Optional
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -40,6 +41,10 @@ ATTESTERS = ((ALEX, True),
              ({"login": "inisa-sidechain[bot]", "type": "Bot"}, False),
              ({"login": "mallory", "type": "User"}, False))
 FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
+
+
+def compose_record(text, payload):
+    return marker.compose(text, dict({"v": 1, "agent": "codex@test:train"}, **payload))
 
 
 def checkout_file(path: str) -> str:
@@ -456,7 +461,8 @@ class FakeGitHub:
             # GitHub names the token's user as the author: the bot for the Actions train,
             # alex-bridges for a step run by hand (set `login`).
             self.issue_comments.setdefault(int(match.group(1)), []).append(
-                {"created_at": snapshot.iso(NOW), "body": body["body"], "user": {"login": self.login}})
+                {"created_at": (marker.decode(body["body"]) or {}).get("at", snapshot.iso(NOW)),
+                 "body": body["body"], "user": {"login": self.login}})
         return {"html_url": "h"} if method == "POST" else None
 
     def rest_paginated(self, path):
@@ -473,6 +479,9 @@ class FakeGitHub:
         if "actions/runs?branch=" in path:
             branch = urllib.parse.unquote(path.split("branch=")[1].split("&")[0])
             return [{"workflow_runs": self.branch_runs.get(branch, [])}]
+        if "issues/comments?since=" in path:
+            return [dict(comment, issue_url=f"https://api.github.com/repos/o/r/issues/{number}")
+                    for number, comments in self.issue_comments.items() for comment in comments]
         match = re.search(r"issues/(\d+)/comments", path)
         if match:
             if self.fail_comment_reads:
@@ -552,7 +561,7 @@ class StepTests(unittest.TestCase):
 
     def queue(self, fake, number, head, minutes_ago):
         fake.issue_comments[number] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
-                                        "body": marker.compose("added", {"kind": "train-add", "pr": number, "head": head})}]
+                                        "body": compose_record("added", {"kind": "train-add", "pr": number, "head": head})}]
 
     def test_build_batches_ready_prs_and_removes_dropped_ones(self):
         h1 = self.pr_branch(1, "b.txt", "b from 1\n")
@@ -665,7 +674,7 @@ class StepTests(unittest.TestCase):
     @staticmethod
     def review_record(head, author=FAKE_OWNER):
         """A clean review of `head` as `coord train review` posts it, authored by `author`."""
-        return {"created_at": snapshot.iso(NOW), "user": dict(author), "body": marker.compose("reviewed", {
+        return {"created_at": snapshot.iso(NOW), "user": dict(author), "body": compose_record("reviewed", {
             "kind": "review-clean", "v": 1, "agent": "claude@h:w", "by": "claude@h:reviewer", "pr": 1, "head": head})}
 
     def queue_reviewed(self, head, reviewed_head, author=FAKE_OWNER):
@@ -709,7 +718,7 @@ class StepTests(unittest.TestCase):
                     fake = FakeGitHub([node], self.main)
                     fake.repo = REPO  # trusted_attesters(REPO) is {alex-bridges}
                     fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW), "user": dict(author),
-                                               "body": marker.compose("record", payload)}]
+                                               "body": compose_record("record", payload)}]
                     fresh = snapshot.summarize_pr(node)
                     self.step(fake).train_added(fresh)
                     cached = snapshot.summarize_pr(node)
@@ -1139,11 +1148,10 @@ class StepTests(unittest.TestCase):
     def add(self, fake, number, head, minutes_ago, agent=AGENT):
         """Append a train-add record, as `coord train add` does; earlier comments stay."""
         payload = {"kind": "train-add", "pr": number, "head": head}
-        if agent:
-            payload["agent"] = agent
+        payload["agent"] = agent  # None deliberately represents an invalid old marker.
         fake.issue_comments.setdefault(number, []).append(
             {"created_at": snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago)),
-             "body": marker.compose("added", payload)})
+             "body": compose_record("added", payload)})
 
     def held(self, fake, number):
         """The held notices on PR `number` as GitHub keeps them: [(payload, text)]."""
@@ -1270,7 +1278,7 @@ class StepTests(unittest.TestCase):
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
         stale["labels"]["nodes"].append({"name": "alex-approved"})
-        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "user": FAKE_OWNER, "body": marker.compose(
+        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "user": FAKE_OWNER, "body": compose_record(
             "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
         lines = self.step(fake).run()
         self.assertTrue(any("does not name the current head" in line for line in lines), lines)
@@ -1327,7 +1335,7 @@ class StepTests(unittest.TestCase):
                   (dict(record, agent="claude@Eidolon:wt"), train_step.BOT_NAME)]
         for payload, login in forged:
             fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
-                                           "body": marker.compose("held?", payload)})
+                                           "body": compose_record("held?", payload)})
         self.step(fake).run()
         self.assertEqual(fake.posted("held"), [1], "none of those is the train's own notice")
         fake.writes.clear()
@@ -1339,7 +1347,7 @@ class StepTests(unittest.TestCase):
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
         fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
-                                       "body": marker.compose("merged?", {"kind": "train", "agent": "train@actions",
+                                       "body": compose_record("merged?", {"kind": "train", "agent": "train@actions",
                                                                          "event": "merged", "pr": 1, "batch": name})})
         self.step(fake).run()
         self.assertEqual(fake.posted("merged"), [1])
@@ -1384,7 +1392,7 @@ class StepTests(unittest.TestCase):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
         self.add(fake, 1, self.H1, 30)
         fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
-                                       "body": marker.compose("held?", {
+                                       "body": compose_record("held?", {
                                            "kind": "train", "agent": "train@actions", "event": "held", "pr": 1,
                                            "head": self.H1, "hold": "needs-alex"})})
         self.step(fake).run()
@@ -1478,7 +1486,7 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
         [(payload, text)] = self.held(fake, 1)
-        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["conductor@*"]))
+        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["codex@test:train", "conductor@*"]))
         self.assertIn("@alex-bridges", text)
 
     # MARK: Bounded light priority
@@ -1571,7 +1579,7 @@ class StepTests(unittest.TestCase):
         fake = FakeGitHub([], self.main)
         def record(kind, **fields):
             return {"created_at": snapshot.iso(NOW), "user": {"login": train_step.BOT_NAME},
-                    "body": marker.compose("x", dict(fields, kind=kind, pr=1))}
+                    "body": compose_record("x", dict(fields, kind=kind, pr=1))}
         added = record("train-add", head="a")
         overtaken = record("train", event="overtaken", batch="train/1", agent=train_step.TRAIN_AGENT)
         for comments, expected in (([added, overtaken], "train/1"), ([added, overtaken, added], None), ([added], None)):
@@ -1595,7 +1603,7 @@ class StepTests(unittest.TestCase):
                              (train_step.TRAIN_AGENT, "alex-bridges"),        # the train's name, not the bot
                              ("claude@Eidolon:wt", train_step.BOT_NAME)):     # the bot, not the train's name
             fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
-                                           "body": marker.compose("overtaken?", dict(record, agent=agent))})
+                                           "body": compose_record("overtaken?", dict(record, agent=agent))})
         self.step(fake).run()
         name, tip = self.batch_on_origin()
         self.assertEqual([m["pr"] for m in self.members(name)], [2], "no forged record gives heavy its turn")
@@ -1703,6 +1711,61 @@ class StepTests(unittest.TestCase):
         name, _ = self.batch_on_origin()
         self.assertEqual([m["pr"] for m in self.members(name)], [1, 2])
         self.assertEqual(fake.posted("overtaken"), [])
+
+    def test_full_receipt_keeps_exact_base_heads_lanes_and_attempt_after_cleanup(self):
+        self.install_selector()
+        h1 = self.pr_branch(1, LIGHT_PATH, "light\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        plan = train.read_plan(sh(self.origin, "log", "-1", "--format=%B", tip), name)
+        self.assertEqual(plan["base"], self.main)
+        self.assertEqual(plan["members"], [{"pr": 1, "head": h1, "queuedAt": snapshot.iso(NOW - dt.timedelta(minutes=50))}])
+        self.assertEqual((plan["lanePlan"]["class"], plan["lanePlan"]["lanes"]), (train.LIGHT, ["docs"]))
+        self.run_on(fake, name, tip, conclusion="success", run_attempt=2)
+        self.step(fake).run()
+        receipts = [marker.decode(comment["body"])["receipt"] for comment in fake.issue_comments[1]
+                    if (marker.decode(comment["body"]) or {}).get("event") == "merged"]
+        self.assertEqual(len(receipts), 1)
+        receipt = receipts[0]
+        self.assertEqual((receipt["base"], receipt["tip"], receipt["members"]), (self.main, tip, plan["members"]))
+        self.assertEqual((receipt["run"]["id"], receipt["run"]["attempt"], receipt["outcome"]), (77, 2, "merged"))
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_exhausted_heavy_budget_keeps_a_red_batch_without_starting_a_retry(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=1)
+        fake.dispatches_today = [{"id": number, "head_branch": f"train/{number}", "run_attempt": 2}
+                                 for number in range(1, 7)]
+        lines = self.step(fake).run()
+        self.assertTrue(any("daily budget of heavy CI attempts" in line for line in lines), lines)
+        self.assertFalse(any(path.endswith("rerun-failed-jobs") for _, path, _ in fake.writes))
+        self.assertEqual(fake.posted("ci-requested"), [])
+        self.assertEqual(sh(self.origin, "rev-parse", name), tip, "the queued retry can resume after reset")
+
+    def test_docs_batch_can_start_when_heavy_attempts_are_exhausted(self):
+        self.install_selector()
+        h1 = self.pr_branch(1, LIGHT_PATH, "light\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1", files=(LIGHT_PATH,))], self.main)
+        self.queue(fake, 1, h1, 20)
+        fake.dispatches_today = [{"id": number, "head_branch": f"train/{number}", "run_attempt": 2}
+                                 for number in range(1, 7)]
+        with mock.patch.dict(os.environ, {"COORD_TRAIN_DAILY_RUNS": "", "COORD_TRAIN_DAILY_LIGHT_ATTEMPTS": "12"}):
+            self.step(fake).run()
+        self.assertEqual(len(fake.dispatched), 1)
+        reservation = next(marker.decode(comment["body"]) for comment in fake.issue_comments[1]
+                           if (marker.decode(comment["body"]) or {}).get("event") == "ci-requested")
+        self.assertEqual(reservation["receipt"]["lanePlan"]["class"], train.LIGHT)
+
+    def test_lost_dispatches_stop_at_the_reserved_attempt_cap(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        with mock.patch.dict(os.environ, {"COORD_TRAIN_DAILY_HEAVY_ATTEMPTS": "2", "COORD_TRAIN_DAILY_RUNS": ""}):
+            fake, name, tip = self.build_batch([(1, h1)])
+            future = snapshot.now_utc() + dt.timedelta(minutes=30)
+            self.step(fake, now=future).run()
+            lines = self.step(fake, now=future + dt.timedelta(minutes=15)).run()
+        self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})], "only one redispatch after the first request")
+        self.assertTrue(any("daily budget" in line for line in lines), lines)
+        self.assertEqual(sh(self.origin, "rev-parse", name), tip)
 
 
 if __name__ == "__main__":

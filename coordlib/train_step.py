@@ -31,9 +31,10 @@ import os
 import subprocess
 import time
 import urllib.parse
+import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from . import marker, snapshot, train
+from . import marker, snapshot, train, train_metrics
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
@@ -90,6 +91,7 @@ class Step:
         self.closed_batch = False
         self.lines: List[str] = []
         self._labels_ready = False
+        self._receipt: Optional[Dict[str, Any]] = None
 
     def note(self, text: str) -> None:
         self.lines.append(text)
@@ -98,8 +100,11 @@ class Step:
     # MARK: - GitHub helpers
 
     def comment(self, number: int, text: str, event: str, **fields: Any) -> None:
-        payload = {"kind": "train", "v": 1, "agent": self.agent, "event": event, "pr": number, "mode": self.mode}
+        payload = {"kind": "train", "v": 1, "agent": self.agent, "event": event, "pr": number, "mode": self.mode,
+                   "at": snapshot.iso(self.now)}
         payload.update(fields)
+        if self._receipt and fields.get("batch") == self._receipt["batch"]:
+            payload["receipt"] = dict(self._receipt, outcome=event)
         self.gh.rest(f"repos/{{repo}}/issues/{number}/comments", method="POST",
                      body={"body": marker.compose(text, payload)})
 
@@ -127,19 +132,38 @@ class Step:
             f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
         return [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
 
-    def daily_budget_left(self) -> int:
-        """Batch CI runs the train may still start today (see train.DAILY_RUNS_DEFAULT)."""
+    def daily_budget_left(self, kind: str = train.HEAVY) -> int:
+        return train_metrics.budget_remaining(self.gh, self.now, kind)
+
+    def request_ci(self, action: str, run: Optional[Dict[str, Any]] = None) -> bool:
+        """Reserve one attempt before dispatch/retry, including ambiguous API failures.
+
+        The one batch-level record covers lost dispatches and reruns of a batch
+        created before today's window. No admission is made against unreadable state.
+        """
+        assert self._receipt is not None
+        kind = train_metrics.plan_class(self._receipt)
+        if self.daily_budget_left(kind) <= 0:
+            self.note(f"{self._receipt['batch']}: the daily budget of {kind} CI attempts is used up; waiting")
+            return False
+        self.comment(self._receipt["members"][0]["pr"],
+                     f"Merge train: reserving one {kind} CI attempt ({action}) for `{self._receipt['batch']}`.",
+                     "ci-requested", batch=self._receipt["batch"], run=(run or {}).get("id"),
+                     request={"id": str(uuid.uuid4()), "action": action,
+                              "attempt": train_metrics.attempts(run) + 1 if run else 1})
+        return True
+
+    def record_outcome(self, event: str, text: str) -> None:
+        """One durable terminal receipt for an abandoned/rebuilt batch before deletion."""
+        assert self._receipt is not None
+        number, batch = self._receipt["members"][0]["pr"], self._receipt["batch"]
         try:
-            limit = int(os.environ.get("COORD_TRAIN_DAILY_RUNS") or train.DAILY_RUNS_DEFAULT)
-        except ValueError:
-            limit = train.DAILY_RUNS_DEFAULT
-        since = snapshot.iso(self.now - dt.timedelta(hours=24))
-        pages = self.gh.rest_paginated(
-            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?event=workflow_dispatch"
-            f"&created={urllib.parse.quote('>=' + since, safe='')}&per_page=100")
-        used = sum(1 for page in pages for r in page.get("workflow_runs", [])
-                   if (r.get("head_branch") or "").startswith(train.BATCH_PREFIX))
-        return limit - used
+            if not self.already_posted(number, event, batch):
+                self.comment(number, text, event, batch=batch, run=(self._receipt.get("run") or {}).get("id"))
+        except GitHubError as error:
+            # A missing report outcome must not stop a safe rebuild. The run still
+            # carries its immutable plan; the report explicitly exposes missing receipts.
+            self.note(f"{batch}: could not record {event} receipt ({error})")
 
     def main_ci(self, main: str) -> Dict[str, Any]:
         """The newest finished ci.yml run at main's exact commit: {conclusion, failed, url}.
@@ -271,6 +295,7 @@ class Step:
                 # Only the train's own: a forged record would give heavy its turn early.
                 pr["overtakenBy"] = payload.get("batch") or "?"
         pr["trainAddedBy"] = latest.get("agent")
+        pr["trainAddedAt"] = latest.get("at")
         pr["heldNotices"] = held
         pr["sidechainBlockedHeads"] = sorted(blocked)
         return latest
@@ -518,6 +543,17 @@ class Step:
             return
         numbers = ", ".join(f"#{m['pr']}" for m in members)
         run = self.settle(name, tip, self.batch_run(name, tip))
+        message = self.git.out("log", "-1", "--format=%B", tip)
+        plan = train.read_plan(message, name) or {
+            "version": 1, "batch": name, "base": base, "batchCap": train.BATCH_CAP,
+            "builtAt": snapshot.iso(dt.datetime.fromtimestamp(int(self.git.out("log", "-1", "--format=%ct", tip)), dt.timezone.utc)),
+            "members": [{"pr": member["pr"], "head": member["sha"], "queuedAt": None} for member in members],
+            "lanePlan": {"class": train.HEAVY, "lanes": None, "source": "unavailable", "at": base,
+                         "reason": "historical batch has no persisted lane plan"},
+        }
+        self._receipt = dict(plan, tip=tip, run=None if run is None else {
+            "id": run["id"], "attempt": train_metrics.attempts(run), "status": run.get("status"),
+            "conclusion": run.get("conclusion"), "url": run.get("html_url")})
         if self.git.run("merge-base", "--is-ancestor", tip, "refs/remotes/origin/main", check=False).returncode == 0:
             # Main already holds the batch: an earlier step moved it and was interrupted.
             self.note(f"{name} ({numbers}): main already contains {tip[:9]}; finishing the clean-up")
@@ -538,8 +574,7 @@ class Step:
             if self.now - built < dt.timedelta(minutes=DISPATCH_GRACE_MINUTES):
                 self.note(f"{name} ({numbers}): CI dispatched {int((self.now - built).total_seconds())}s ago, not registered yet")
                 return
-            if self.daily_budget_left() <= 0:
-                self.note(f"{name} ({numbers}): the daily budget of batch CI runs is used up; waiting")
+            if not self.request_ci("redispatch"):
                 return
             self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
             self.note(f"{name} ({numbers}): no CI run at {tip[:9]} at all (the dispatch was lost); dispatched once more")
@@ -549,16 +584,20 @@ class Step:
             self.note(f"{name} ({numbers}): CI {run.get('status')} {url}")
             return
         if action == "rerun":
+            if not self.request_ci("rerun", run):
+                return
             try:
                 self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/rerun-failed-jobs", method="POST")
             except GitHubError as error:
                 self.note(f"{name} ({numbers}): CI red and the re-run was refused ({error}); deleting the batch")
+                self.record_outcome("abandoned", f"Merge train: retry refused for `{name}`; the batch will be rebuilt.")
                 self.delete_branch(name)
                 return
             self.note(f"{name} ({numbers}): CI red on attempt {run.get('run_attempt')}; re-running the failed jobs once {url}")
             return
         if action == "abandon":
             self.note(f"{name} ({numbers}): CI {run.get('conclusion')}; deleting the batch, the next step rebuilds")
+            self.record_outcome("abandoned", f"Merge train: `{name}` ended with {run.get('conclusion')}; rebuilding later.")
             self.delete_branch(name)
             return
         if action in ("eject", "split"):
@@ -574,6 +613,7 @@ class Step:
                 # empty the queue while main is broken (substitute review of #989).
                 self.note(f"{name} ({numbers}): CI red in {', '.join(shared[:5])}, which is red on main too "
                           f"({main_state.get('url')}); not blaming the PRs, the queue waits for main")
+                self.record_outcome("abandoned", f"Merge train: `{name}` shares failing lanes with main; waiting for main.")
                 self.delete_branch(name)
                 return
             for member in members:
@@ -598,6 +638,7 @@ class Step:
         if main != base:
             if self.mode == "live":
                 self.note(f"{name} ({numbers}): green, but main moved from {base[:9]} to {main[:9]}; rebuilding")
+                self.record_outcome("rebuilt", f"Merge train: `{name}` passed, but main moved; a new batch must be tested.")
                 self.delete_branch(name)
                 return
             # Dry run: report the green result instead of re-testing on every hand merge,
@@ -628,6 +669,7 @@ class Step:
                     problem = f"is no longer ready ({reason})"
             if problem:
                 self.note(f"{name} ({numbers}): green, but #{number} {problem}; rebuilding without it")
+                self.record_outcome("rebuilt", f"Merge train: `{name}` passed, but #{number} {problem}; rebuilding.")
                 self.delete_branch(name)  # the decision first; the notice can never stop it
                 if hold:  # still queued and now held (a DROP is commented on by the next build)
                     self.notify_held(pr, pr["head"], hold, reason)
@@ -647,6 +689,7 @@ class Step:
                     return
                 if now_main != tip:
                     self.note(f"{name} ({numbers}): green, but main could not be fast-forwarded ({error}); rebuilding")
+                    self.record_outcome("rebuilt", f"Merge train: `{name}` passed, but main could not be fast-forwarded; rebuilding.")
                     self.delete_branch(name)
                     return
                 self.note(f"{name} ({numbers}): the main update reported {error}, but main is at {tip[:9]}")
@@ -688,14 +731,12 @@ class Step:
             self.note(f"main {main[:9]} is red ({', '.join(main_state.get('failed', [])[:3]) or 'see the run'}, "
                       f"{main_state.get('url')}); not building a batch on it")
             return
-        if self.daily_budget_left() <= 0:
-            self.note("the daily budget of batch CI runs is used up; not building a batch")
-            return
         name = train.batch_name(self.now)
         identity = {"GIT_AUTHOR_NAME": BOT_NAME, "GIT_AUTHOR_EMAIL": BOT_EMAIL,
                     "GIT_COMMITTER_NAME": BOT_NAME, "GIT_COMMITTER_EMAIL": BOT_EMAIL}
         tip = main
         merged = []
+        member_heads = []
         for number in chosen["batch"]:
             pr = prs[number]
             self.git.out("fetch", "--quiet", "origin", f"+refs/pull/{number}/head:refs/coord/pr/{number}")
@@ -715,10 +756,25 @@ class Step:
                 raise GitError(f"git merge-tree: {result.stderr.strip()}")
             tree = result.stdout.split()[0]
             paragraphs = [arg for text in train.merge_message(pr, self.gh.owner, name) for arg in ("-m", text)]
-            tip = self.git.out("commit-tree", tree, "-p", tip, "-p", head, *paragraphs, env=identity)
+            last_parent = tip
+            last_head = head
+            tip = self.git.out("commit-tree", tree, "-p", last_parent, "-p", head, *paragraphs, env=identity)
             merged.append(number)
+            member_heads.append({"pr": number, "head": head, "queuedAt": pr.get("trainAddedAt")})
         if not merged:
             self.note("nothing merged cleanly; no batch")
+            return
+        paths = [path for path in self.git.run("diff", "--name-only", "--no-renames", "-z", main, tip, "--").stdout.split("\0") if path]
+        lane_plan = train.LaneClassifier(lambda path: self.git.run("show", f"{main}:{path}").stdout).lane_plan(paths)
+        lane_plan.update(source="main", at=main)
+        plan = {"version": 1, "batch": name, "base": main, "members": member_heads,
+                "builtAt": snapshot.iso(self.now), "batchCap": train.BATCH_CAP, "lanePlan": lane_plan}
+        # Add the plan to the final merge message before publishing anything. Keeping
+        # its two parents preserves parse_batch and GitHub's normal merged-PR history.
+        tip = self.git.out("commit-tree", tree, "-p", last_parent, "-p", last_head, *paragraphs[:-2],
+                           "-m", paragraphs[-1] + "\n" + train.plan_trailer(plan), env=identity)
+        self._receipt = dict(plan, tip=tip, run=None)
+        if not self.request_ci("dispatch"):
             return
         if chosen["overtakes"]:
             # Recorded BEFORE the push: a failure between the two can only give heavy work
