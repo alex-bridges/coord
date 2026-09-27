@@ -254,8 +254,9 @@ class Step:
             payload = marker.decode(comment.get("body"))
             if not payload or payload.get("pr") != number:
                 continue
-            if snapshot.sidechain_blocks(comment, payload):
-                blocked.add(payload["head"])  # the PR's whole history, not a comment window (Codex on #1049)
+            blocks = snapshot.sidechain_blocks(comment, payload)
+            if blocks:
+                blocked.add(blocks)  # a withdrawal's `head` is empty: the SHA it returns is the one  # the PR's whole history, not a comment window (Codex on #1049)
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake

@@ -1019,6 +1019,44 @@ class CodexRound7Tests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 1)
 
 
+class CodexRound8Tests(ReviewFlowTests):
+    """Codex's review of 5e8d7742 (#1049)."""
+
+    def test_j1_the_train_holds_a_head_only_a_withdrawal_names(self):
+        from coordlib import train_step
+        withdrawal = {"kind": "review-substitute", "v": 1, "pr": 7, "head": "", "revokes": HEAD, "request": 5}
+        fake = mock.Mock()
+        fake.gh.rest_paginated.return_value = [{"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-5)),
+                                                "body": marker.compose("w", withdrawal)}]
+        fake.own_record.return_value = False
+        pr = {"number": 7}
+        train_step.Step.train_added(fake, pr)
+        self.assertEqual(pr["sidechainBlockedHeads"], [HEAD])
+
+    def test_j2_the_run_is_in_its_own_heartbeats(self):
+        seen = []
+        real = reviewer.Reviews.run
+
+        def run(jobs, *args):
+            seen.append(list(jobs.extra.get("reviewRuns") or []))  # what the background beats send
+            return real(jobs, *args)
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        with mock.patch.object(reviewer.Reviews, "run", run):
+            self.tick(5)
+        self.assertEqual([len(s) for s in seen], [1], "the beat sent during the run already lists it")
+
+    def test_j6_a_run_without_findings_is_logged_as_failed(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [claude_result("no block")]
+        self.tick(5)
+        with open(os.path.join(self.config.state_dir, "reviews.jsonl")) as handle:
+            logged = [json.loads(line) for line in handle if line.strip()]
+        self.assertEqual([entry["ok"] for entry in logged], [False])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

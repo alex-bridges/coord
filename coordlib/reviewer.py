@@ -615,26 +615,33 @@ class Reviews:
         clean = clean[0] == 0 and not clean[1].strip()
         try:
             self.runs.append(snapshot.iso(now))
+            # In the heartbeats the run sends while it works, so a leader that dies mid-run has
+            # already told the others about it (the daily cap; Codex on #1049).
+            if isinstance(getattr(self, "extra", None), dict):
+                self.extra["reviewRuns"] = [r for r in self.runs if (_time(r) or now) > now - dt.timedelta(days=1)]
             completed, seconds = self.run(pr, head, request, worktree, scratch)
         finally:
             self.w.git(["worktree", "remove", "--force", worktree])
             shutil.rmtree(scratch, ignore_errors=True)
             self.restore_checkout(clean)
         from . import conductor  # the watcher's helpers; imported late, as conductor imports this module
-        result = conductor.outcome(completed.returncode, completed.stdout, completed.stderr, now)
+        # The time the run ended: a relative reset ("resets in 2h") counts from then (Codex on #1049).
+        ended = now + dt.timedelta(seconds=seconds)
+        result = conductor.outcome(completed.returncode, completed.stdout, completed.stderr, ended)
         text = str(conductor.parse_result(completed.stdout).get("result") or "")
         run = {"seconds": seconds, "turns": result["turns"], "agent": self.agent(), "usage": result["usage"],
                "cost": result["cost"], "session": result["session"]}
+        data = extract_json(text) if result["ok"] and not result["limit"] else None
         try:  # the audit log is best-effort: a full disk must not cost a rerun (Codex on #1049)
+            # ok only when the findings were read: a run that ended without them failed.
             conductor.append_review(self.config, {"at": snapshot.iso(now), "pr": request["pr"], "head": head,
-                                                  "model": request["model"], "ok": result["ok"], **run})
+                                                  "model": request["model"], "ok": data is not None, **run})
         except OSError as error:
             self.w.say(f"could not log the review of #{request['pr']} ({_clip(str(error), 100)})")
         if result["limit"]:
             self.runs.pop()  # a refused run is not a review; the job stays for after the reset
             self.w.post_outage(result["limit"])
             return None
-        data = extract_json(text) if result["ok"] else None
         if data is None:
             self.fail(request, record, "the reviewer did not finish with its findings"
                       if result["ok"] else f"the review run failed ({_clip(result['summary'], 160)})")
