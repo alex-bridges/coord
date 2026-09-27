@@ -831,12 +831,18 @@ class Watcher:
         jobs = reviewer.Reviews(self, None)
         jobs.user_ok = user_ok  # may a record be posted on Alex's identity this tick
         jobs.prune()  # every tick, not only when a request waits
-        if not jobs.pending():
+        waiting = jobs.pending()
+        if not waiting:
             return
         if not blocked:
             tampered = self.tampered()
             blocked = f"the conductor's own controls are modified in its checkout: {tampered}" if tampered else ""
         jobs.app = self.app_gh_factory()  # posting a finished review needs no run: Reviews.step decides
+        if extra is not None:
+            # So the board can show a backlog is piling up on a dead service (#1092),
+            # not only the watcher log nobody but this host can see.
+            extra["reviewer"] = {"waiting": len(waiting),
+                                 "appAvailable": jobs.app is not None and getattr(jobs.app, "app", None) is not None}
         jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
