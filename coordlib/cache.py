@@ -1,10 +1,11 @@
-"""Per-machine cache: the last board snapshot, each agent's inbox cursor, and the last
-GitHub API budget readings of each principal.
+"""Per-machine cache: the last board snapshot, each agent's inbox cursor, the last
+GitHub API budget readings of each principal, and the mailbox issue numbers seen.
 
 The snapshot is shared by every agent on one machine (same user), so ten
 sessions polling the board within a minute cost GitHub one snapshot, not ten.
 Nothing here is authoritative; deleting the directory loses only the inbox
-cursors (the next inbox shows the last 7 days again). The GitHub App's tokens are
+cursors (the next inbox shows the last 7 days again) and the mailbox numbers
+(the next board, inbox or mailbox send learns them again). The GitHub App's tokens are
 cached elsewhere (apptoken.py), never here.
 """
 
@@ -88,6 +89,26 @@ def invalidate_snapshot(repo: str) -> None:
         os.utime(snapshot_path(repo), (0, 0))
     except OSError:
         pass
+
+
+def mailboxes_path(repo: str) -> str:
+    return os.path.join(cache_dir(repo), "mailboxes.json")
+
+
+def load_mailboxes(repo: str) -> List[int]:
+    """Mailbox issue numbers an `inbox` read or a `send` on this machine has seen (#1070)."""
+    data = _read(mailboxes_path(repo))
+    numbers = (data or {}).get("numbers") if isinstance(data, dict) else None
+    return [n for n in numbers if isinstance(n, int)] if isinstance(numbers, list) else []
+
+
+def remember_mailboxes(repo: str, numbers: List[int]) -> None:
+    """Add to the known mailbox numbers. Nothing ever leaves: a retired mailbox still has
+    nobody working on it. Written only when something is new, so most reads cost no write."""
+    known = set(load_mailboxes(repo))
+    new = {n for n in numbers if isinstance(n, int)} - known
+    if new:
+        _write(mailboxes_path(repo), {"numbers": sorted(known | new)})
 
 
 def budget_path(repo: str) -> str:

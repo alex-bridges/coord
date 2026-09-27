@@ -18,7 +18,7 @@
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "ejected", "pr": 1059, "batch": "train/20260927", "run": 77, "failed": ["python"], "to": ["codex@host:task-a"]},
     {"v": 1, "kind": "outage", "agent": "conductor@host:watcher", "event": "start", "harness": "claude", "until": "2026-09-27T12:00:00Z", "reason": "usage limit"},
     {"v": 1, "kind": "outage", "agent": "conductor@host:watcher", "event": "end", "harness": "claude"},
-    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "beat", "host": "host", "beat": "2026-09-27T11:00:00Z", "seenThrough": null, "leader": false, "disk": 123, "pending": 2, "lastWake": {"at": "2026-09-27T10:00:00Z", "model": "worker", "ok": true, "summary": "done"}},
+    {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "beat", "host": "host", "beat": "2026-09-27T11:00:00Z", "seenThrough": null, "leader": false, "disk": 123, "pending": 2, "lastWake": {"at": "2026-09-27T10:00:00Z", "model": "worker", "ok": true, "summary": "done"}, "reviewer": {"waiting": 3, "appAvailable": false}},
     {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "pause", "until": "2026-09-27T12:00:00Z", "note": "maintenance"},
     {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "resume"},
     {"v": 1, "kind": "conductor", "agent": "conductor@host:watcher", "event": "escalate"}

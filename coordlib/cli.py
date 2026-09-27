@@ -108,8 +108,36 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
             raise
         mark_app_unavailable(gh, error)
         return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused, gh.app_stale)
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        return snapshot_despite_budget(gh, gh.budget_low)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
+
+
+def mark_exhausted(gh: GitHub, error: GitHubError) -> bool:
+    """The read that discovers an exhausted quota (#1052): in a cache read, a 403 or 429
+    whose recorded headers (`_http` records them before raising) put the budget below the
+    read floor marks the command budget-low, as the next call's gate would, and the caller
+    serves its cache. False for any other error, or outside a cache read."""
+    low = exhausted_words(gh, error) if getattr(gh, "cache_read", False) else None
+    if low is None:
+        return False
+    gh.budget_low = low  # type: ignore[attr-defined]
+    return True
+
+
+def exhausted_words(gh: GitHub, error: GitHubError) -> Optional[str]:
+    """The budget-low line when `error` is a 403 or 429 and the recorded reading of the
+    budget it spent, this command's principal's, is now below the read floor; else None."""
+    principal = gh.principal()
+    if getattr(error, "status", None) not in (403, 429) or not getattr(error, "resource", None) or not principal:
+        return None
+    reading = budget.current(gh.repo, error.resource, principal=principal)
+    if reading is None or budget.left(reading) >= budget.read_floor():
+        return None
+    return budget.low_words(reading)
 
 
 def mark_app_unavailable(gh: GitHub, error: Exception) -> None:
@@ -408,11 +436,17 @@ def cmd_release(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
+    if args.on is not None and not args.to and args.on in known_mailboxes(gh.repo):
+        # --on N alone reaches whoever works on N; nobody works on the mailbox (#1070).
+        raise UsageError(f"#{args.on} is the mailbox issue: nobody works on it, so --on alone reaches no one. "
+                         "Name the recipient with --to <agent> (the sender of the message you answer).")
     recipients = args.to or (["all"] if args.on is None else [f"#{args.on}"])
     target = args.on if args.on is not None else find_or_create_mailbox(gh)
     payload = {"kind": "msg", "v": 1, "agent": me, "to": recipients}
     if args.on is not None:
         payload["on"] = args.on
+    else:
+        cache.remember_mailboxes(gh.repo, [target])
     heading = f"**From** `{me}` **to** " + ", ".join(f"`{r}`" for r in recipients)
     posted = post_comment(gh, target, f"{heading}\n\n{args.text}", payload)
     cache.invalidate_snapshot(gh.repo)
@@ -420,6 +454,22 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     for line in down_warnings(gh.repo, recipients):
         print(line)
     return EXIT_OK
+
+
+def known_mailboxes(repo: str) -> set:
+    """Mailbox issue numbers this machine has seen: on its cached board, or remembered by an
+    `inbox` read or a `send` (a message sent without --on lands on the mailbox). The board
+    alone misses a mailbox whose first message in its 14-day window arrived after it was
+    cached, which `inbox` then read directly (Codex on #1098). No call (`send` must stay
+    cheap and always run), so a cold cache knows none."""
+    cached = cache.load_snapshot(repo, float("inf"))
+    return mailbox_numbers((cached or {}).get("messages") or []) | set(cache.load_mailboxes(repo))
+
+
+def mailbox_numbers(messages: List[Dict[str, Any]]) -> set:
+    """Issues carrying a message record without `on`: `send` put it on the mailbox."""
+    return {m.get("on") for m in messages if isinstance(m.get("on"), int)
+            and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:
@@ -541,6 +591,9 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         since = snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
     started = snapshot.now_utc()
     snap = get_snapshot(gh, args.max_age)
+    if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
+        # The snapshot build was the refused read (#1052): reading comments would cost more.
+        return inbox_from_snapshot(args, gh, me, snap)
     try:
         issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
         review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
@@ -548,6 +601,11 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         if not getattr(gh, "app_unavailable", None):  # get_snapshot served a fresh cache and said nothing
             mark_app_unavailable(gh, error)
             print(f"coord: {gh.app_unavailable}; counting from the cached snapshot", file=sys.stderr)
+        return inbox_from_snapshot(args, gh, me, snap)
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        print(f"coord: {gh.budget_low}; counting from the cached snapshot", file=sys.stderr)
         return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
     if args.json:
@@ -564,6 +622,9 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
             text = text if args.full else render._clip(text, 400)
             print("  " + text.replace("\n", "\n  "))
             print(f"  {item['url']}")
+    cache.remember_mailboxes(gh.repo, sorted(mailbox_numbers(
+        [{"on": _number_from_url(c.get("issue_url", "")), "payload": marker.decode(c.get("body"))}
+         for c in issue_comments])))
     if not args.peek and not args.all and not args.since:
         window = started - CURSOR_OVERLAP
         # Earlier ids matter only while the earlier read's window overlaps the new one.
@@ -731,6 +792,12 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         low = gh.app_unavailable
         print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
         refs = []
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        low = gh.budget_low
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        refs = []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
     try:
@@ -747,6 +814,12 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     except AppAuthError as error:  # the read token failed after the refs (on any page of the runs)
         mark_app_unavailable(gh, error)
         low = gh.app_unavailable
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        batches = []
+    except GitHubError as error:  # the budget ran out on a page of the runs
+        if not mark_exhausted(gh, error):
+            raise
+        low = gh.budget_low
         print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
         batches = []
     queue = []
