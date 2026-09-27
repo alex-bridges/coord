@@ -424,7 +424,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(len(self.gh.records("outage", "end")), 1, "the end is posted once")
 
     def test_a_standby_leaves_github_to_the_leader(self):
-        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",
+        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:c",
                                                      "beat": snapshot.iso(at(-1))}), -600, comment_id=1)
         self.gh.issue_comments.append(leader)
         self.message(-1)
@@ -434,7 +434,7 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("standby", self.gh.issue_comments[-1]["body"])
 
     def test_a_standby_takes_over_when_the_leader_goes_quiet(self):
-        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",
+        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:c",
                                                      "leader": True, "beat": snapshot.iso(at(-30)),
                                                      "seenThrough": snapshot.iso(at(-40))}), -600, comment_id=1)
         self.gh.issue_comments.append(leader)
@@ -448,7 +448,7 @@ class WatcherTests(unittest.TestCase):
 
     def test_a_pause_and_the_daily_cap_hold_wakes(self):
         self.tick(0)
-        self.gh.post(900, "paused", {"kind": "conductor", "event": "pause", "agent": "claude@E:x",
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
                                      "until": snapshot.iso(at(60))}, 1)
         self.message(2)
         lines = self.tick(5)
@@ -484,7 +484,7 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(any("board only" in line for line in lines))
 
     def test_1_a_standby_run_is_told_to_leave_the_inbox_and_its_cursor_is_not_adopted(self):
-        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@Old:c",
+        leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:c",
                                                      "leader": True, "beat": snapshot.iso(at(-1))}), -600, comment_id=1)
         self.gh.issue_comments.append(leader)
         watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner, disk=lambda path: 5.0)
@@ -497,7 +497,7 @@ class WatcherTests(unittest.TestCase):
     def test_1_a_leader_ignores_a_standbys_newer_cursor(self):
         self.tick(0)
         mine = cli.cache.load_cursor("o/r", self.config.agent)
-        standby = self.gh.raw(marker.compose("beat", {"kind": "conductor", "event": "beat", "agent": "conductor@B:c",
+        standby = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@B:c",
                                                       "leader": False, "beat": snapshot.iso(at(4)),
                                                       "seenThrough": snapshot.iso(at(4))}), 1)
         self.gh.issue_comments.append(standby)

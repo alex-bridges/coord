@@ -20,7 +20,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apptestkit import INSTALLATION, REPO, AppTestCase, FakeResponse  # noqa: E402
-from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli  # noqa: E402
+from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli, conductor  # noqa: E402
 
 USER_TOKEN = "user-token-that-must-never-be-sent"
 DEEP_JSON = "[" * 1_000_000 + "]" * 1_000_000  # too deep for 3.9 and 3.14's parsers alike
@@ -138,12 +138,12 @@ class RoutingTests(AppCliTestCase):
             seen[budget.command_name(args)] = gh.app is not None
             return EXIT_OK
 
-        argvs = [["board"], ["whoami"], ["claim", "5", "--branch", "b"], ["release", "5"], ["send", "x"],
-                 ["inbox"], ["ci", "mk4"], ["train", "add", "7"], ["train", "remove", "7"], ["train", "status"],
+        argvs = [["board"], ["whoami"], ["doctor"], ["claim", "5", "--branch", "b"], ["release", "5"], ["send", "x"],
+                 ["inbox"], ["ci", "mk4"], ["train", "report"], ["train", "add", "7"], ["train", "remove", "7"], ["train", "status"],
                  ["train", "approve", "7", "--head", "a" * 40, "--note", "n"],
                  ["train", "review", "7", "--head", "a" * 40, "--by", "x", "--note", "n"],
                  ["train", "substitute-review", "7", "--head", "a" * 40, "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
-                 ["conductor", "tick"], ["conductor", "status"], ["conductor", "pause", "--for", "1h"],
+                 ["conductor", "tick"], ["conductor", "status"], ["conductor", "diagnose"], ["conductor", "pause", "--for", "1h"],
                  ["conductor", "resume"], ["conductor", "escalate", "x"],
                  ["token", "status"], ["token", "exec", "--", "true"]]
         self.assertEqual({tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
@@ -858,19 +858,52 @@ class NoLeakTests(AppCliTestCase):
     success and on failure: no `ghs_`, no JWT-shaped string, no key material, and none of
     the tokens or JWTs the fake saw, in stdout or stderr."""
 
+    def setUp(self):
+        super().setUp()
+        self.diagnosis_fails = False
+        self.diagnosis_calls = []
+        self.context = os.path.join(self.root, "diagnosis.json")
+        with open(self.context, "w", encoding="utf-8") as handle:
+            handle.write("{}")
+        which = cli.shutil.which
+        self.patch(cli.shutil, "which", lambda name: f"/fake/{name}" if name in ("codex", "claude") else which(name))
+        # The every-command sweep must never start an installed model CLI. Exercise
+        # both protocol success and failure using only synthetic JSON responses.
+        self.patch(conductor, "default_runner", self.diagnose)
+
+    def diagnose(self, command, cwd, env, timeout):
+        self.diagnosis_calls.append(command)
+        secret = "ghs_" + "x" * 60
+        report = {"summary": "diagnosis " + secret, "needsRepair": False, "reason": "checked input"}
+        if command[0].endswith("codex"):
+            events = ([{"type": "error", "message": "runtime failure " + secret}] if self.diagnosis_fails else [
+                {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(report)}},
+                {"type": "turn.completed", "usage": {}},
+            ])
+            output = "\n".join(json.dumps(event) for event in events)
+        else:
+            output = json.dumps({"type": "result", "is_error": self.diagnosis_fails,
+                                 "result": "runtime failure " + secret if self.diagnosis_fails else json.dumps(report)})
+        return subprocess.CompletedProcess(command, int(self.diagnosis_fails), output, "")
+
     def argvs(self):
         return [
             ["board"], ["board", "--brief"], ["board", "--json"], ["board", "--fresh"], ["whoami"], ["whoami", "--json"],
+            ["doctor"], ["doctor", "--json"],
             ["claim", "55", "--branch", "feature/x"], ["claim", "56", "--branch", "feature/y", "--dry-run"],
             ["release", "55", "--everyone"], ["release", "57"], ["send", "hello"], ["send", "hi", "--on", "101"],
             ["inbox"], ["inbox", "--json", "--all"], ["ci", "mk4", "--ref", "feature/x"],
             ["train", "add", "101"], ["train", "remove", "101"], ["train", "status"], ["train", "status", "--json"],
+            ["train", "report"], ["train", "report", "--json"],
             ["train", "approve", "101", "--head", "a" * 40, "--note", "n"],
             ["train", "review", "101", "--head", "a" * 40, "--by", "x", "--note", "n"],
             ["train", "substitute-review", "101", "--head", "a" * 40, "--note", "n"],
             ["train", "step", "--repo-dir", self.no_repo],
             ["outage", "start", "claude", "--note", "limit"], ["outage", "end", "claude"],
             ["conductor", "tick", "--dry-run", "--no-wake"], ["conductor", "status"],
+            ["conductor", "diagnose", "--input", self.context],
+            ["conductor", "diagnose", "--input", self.context, "--json"],
+            ["conductor", "diagnose", "--input", self.context, "--runtime", "claude", "--json"],
             ["conductor", "pause", "--for", "1h"], ["conductor", "resume"], ["conductor", "escalate", "look"],
             ["token", "status"], ["token", "exec", "--", "true"], ["token", "exec", "--kind", "ops", "--", "true"],
         ]
@@ -879,6 +912,7 @@ class NoLeakTests(AppCliTestCase):
         commands = {tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
                     for argv in self.argvs()}
         for scenario in ("minting", "cached", "mint refused", "keychain fails"):
+            self.diagnosis_fails = scenario in ("mint refused", "keychain fails")
             self.server.mint_status = None
             if scenario in ("mint refused", "keychain fails"):
                 for name in os.listdir(self.token_dir):
@@ -901,6 +935,7 @@ class NoLeakTests(AppCliTestCase):
             if scenario in ("mint refused", "keychain fails"):
                 self.assertGreater(len(self.security_calls()), calls_before, "the failing passes really tried")
         self.assertEqual(parser_commands() - commands, set(), "a subcommand is missing from the no-leak sweep")
+        self.assertEqual(len(self.diagnosis_calls), 12, "both runtime protocols exercised without a real model")
 
     def test_redact_catches_every_shape(self):
         from coordlib.gh import redact

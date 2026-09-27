@@ -7,14 +7,16 @@ import datetime as dt
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import apptoken, budget, cache, identity, lease, marker, outage, render, review, snapshot, train, train_step
+from . import apptoken, budget, cache, doctor, identity, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
 from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
 
 # Which identity each command uses in app mode. Every command not in USER_IDENTITY runs on
@@ -147,6 +149,10 @@ def gate(args: argparse.Namespace, gh: GitHub) -> Optional[int]:
     (`send`, `whoami`, `train step`, `token status`) are never checked and never probe.
     """
     command = budget.command_name(args)
+    if command == "doctor" and not args.online:
+        return None
+    if command == "conductor diagnose" and args.input and not args.handoff:
+        return None
     if command in budget.UNGATED or (command.startswith("token ") and gh.app is None):
         return None  # a `token` command with app mode off refuses by itself, without a probe
     try:
@@ -158,9 +164,10 @@ def gate(args: argparse.Namespace, gh: GitHub) -> Optional[int]:
         gh.probe_budget()
     reading = budget.current(gh.repo, principal=principal) if principal else None
     verdict, message = budget.decision(command, reading)
+    if command in ("doctor", "train report", "conductor diagnose") and verdict == budget.LOW:
+        verdict = budget.REFUSE  # explicit probes/reports cannot be reconstructed from the board cache
     if verdict == budget.REFUSE:
-        print(f"coord: {message}", file=sys.stderr)
-        return EXIT_BUDGET
+        return report_error(args, EXIT_BUDGET, "budget", message)
     if verdict == budget.LOW:
         gh.budget_low = message  # type: ignore[attr-defined]
     return None
@@ -226,6 +233,12 @@ def find_or_create_mailbox(gh: GitHub) -> int:
 
 
 # MARK: - Commands
+
+
+def cmd_doctor(args: argparse.Namespace, gh: GitHub) -> int:
+    report = doctor.inspect(gh, online=args.online)
+    print(json.dumps(report, indent=2) if args.json else doctor.render(report), end="\n" if args.json else "")
+    return EXIT_BACKEND if report["status"] == "unavailable" else EXIT_OK
 
 
 def identity_words(gh: GitHub) -> str:
@@ -506,6 +519,12 @@ def inbox_from_snapshot(args: argparse.Namespace, gh: GitHub, me: str,
     unread = unread_direct(snap, me, cache.load_cursor(gh.repo, me), identity.git_branch(),
                            cache.load_seen_ids(gh.repo, me))
     after = "after the reset" if getattr(gh, "budget_low", None) else "once the app token is back"
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "stale", "me": me, "items": None,
+                          "unreadDirectMessages": unread, "markedRead": False,
+                          "generatedAt": snap.get("generatedAt"), "stale": snap.get("stale"),
+                          "reason": getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None)}, indent=2))
+        return EXIT_OK
     print(f"inbox for {me}: {unread} new in that snapshot; run `coord inbox` {after} to read them "
           "(nothing was marked read)")
     return EXIT_OK
@@ -532,7 +551,8 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
     if args.json:
-        print(json.dumps({"me": me, "since": snapshot.iso(since), "items": items}, indent=2))
+        print(json.dumps({"schema": 1, "status": "ok", "me": me,
+                          "since": snapshot.iso(since), "items": items}, indent=2))
     else:
         print(f"inbox for {me} since {snapshot.iso(since)}: {len(items)} item" + ("s" if len(items) != 1 else ""))
         for item in items:
@@ -735,7 +755,9 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
         queue.append(dict(entry, verdict=verdict, reason=reason))
     if args.json:
-        print(json.dumps({"batches": None if low else batches, "queue": queue}, indent=2))
+        print(json.dumps({"schema": 1, "status": "stale" if low else "ok", "reason": low or None,
+                          "generatedAt": snap.get("generatedAt"), "stale": snap.get("stale"),
+                          "batches": None if low else batches, "queue": queue}, indent=2))
         return EXIT_OK
     why = "API budget low" if getattr(gh, "budget_low", None) else "GitHub App token unavailable"
     print("batch: " + (f"not read ({why})" if low else "none" if not batches else ""))
@@ -747,6 +769,14 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     print("queue: " + ("empty" if not queue else ""))
     for position, entry in enumerate(queue, start=1):
         print(f"  {position}. #{entry['pr']} {entry['verdict']}" + ("" if entry["verdict"] == train.READY else f": {entry['reason']}"))
+    return EXIT_OK
+
+
+def cmd_train_report(args: argparse.Namespace, gh: GitHub) -> int:
+    if not 1 <= args.days <= 30:
+        raise UsageError("--days must be between 1 and 30")
+    report = train_metrics.report(gh, days=args.days)
+    print(json.dumps(report, indent=2) if args.json else train_metrics.render(report))
     return EXIT_OK
 
 
@@ -885,6 +915,67 @@ def cmd_conductor_tick(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def cmd_conductor_diagnose(args: argparse.Namespace, gh: GitHub) -> int:
+    """One explicitly requested diagnosis. It cannot approve, merge or mark work done."""
+    from . import conductor, runtime
+    if not 1 <= args.timeout <= 3600:
+        raise UsageError("--timeout must be between 1 and 3600 seconds")
+    executable = shutil.which(args.runtime)
+    if executable is None:
+        raise UsageError(f"{args.runtime} is not installed or is not on PATH")
+    if args.input:
+        try:
+            with open(args.input, encoding="utf-8") as handle:
+                context = handle.read(160_001)
+        except (OSError, UnicodeError) as error:
+            raise UsageError(f"cannot read diagnosis input: {error}") from error
+    else:
+        snap = get_snapshot(gh, DEFAULT_MAX_AGE)
+        context = json.dumps({key: value for key, value in snap.items() if key != "claimComments"})
+    if len(context) > 160_000:
+        raise UsageError("diagnosis input exceeds 160,000 characters; provide a focused --input file")
+    prompt = runtime.diagnosis_prompt(context)
+    # Linux limits each argv string to about 128 KiB, independently of ARG_MAX.
+    # JSON escaping can expand a small Unicode input twelvefold (surrogate pairs).
+    if len(prompt.encode("utf-8")) > 120_000:
+        raise UsageError("diagnosis prompt exceeds 120,000 encoded bytes; provide a focused --input file")
+    # A clean cwd avoids loading this checkout's agent/configuration files. Model
+    # authentication stays with its CLI; no credential is read or copied by coord.
+    with tempfile.TemporaryDirectory(prefix="coord-diagnose-") as scratch:
+        command = (runtime.codex_command(executable, prompt, args.model) if args.runtime == "codex"
+                   else runtime.claude_command(executable, prompt, args.model, scratch, [], role="diagnose"))
+        env = {key: value for key, value in os.environ.items()
+               if key not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+                              "CONDUCTOR_WAKE", "COORD_AGENT", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")}
+        started = time.monotonic()
+        completed = conductor.default_runner(command, scratch, env, args.timeout)
+        result = runtime.diagnosis_outcome(args.runtime, completed.returncode, completed.stdout, completed.stderr)
+    if not result["ok"]:
+        return report_error(args, EXIT_BACKEND, "runtime", result["error"])
+    report = {"schema": 1, "status": "ok", "runtime": args.runtime,
+              "model": args.model or "runtime default", "seconds": round(time.monotonic() - started, 2),
+              "diagnosis": result["diagnosis"], "usage": result["usage"], "handoff": None}
+    if args.handoff and result["diagnosis"]["needsRepair"]:
+        diagnosis = result["diagnosis"]
+        me = identity.agent_id()
+        target = find_or_create_mailbox(gh)
+        body = (f"**Read-only diagnosis from** `{me}` using {args.runtime}. This is advisory analysis, "
+                "not an approval or a verified repair. Recheck the current evidence under your standing orders.\n\n"
+                + diagnosis["summary"] + "\n\n" + diagnosis["reason"])
+        posted = post_comment(gh, target, body, {"kind": "msg", "v": 1, "agent": me, "to": ["conductor@*"]})
+        cache.invalidate_snapshot(gh.repo)
+        report["handoff"] = {"to": "conductor@*", "url": posted.get("html_url")}
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(report["diagnosis"]["summary"])
+        print("Repair needed: " + ("yes" if report["diagnosis"]["needsRepair"] else "no"))
+        print(report["diagnosis"]["reason"])
+        if report["handoff"]:
+            print(f"Sent to conductor: {report['handoff']['url']}")
+    return EXIT_OK
+
+
 def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
     from . import conductor
     config = conductor.Config.from_env()
@@ -973,6 +1064,11 @@ def parser() -> argparse.ArgumentParser:
     whoami.add_argument("--json", action="store_true")
     whoami.set_defaults(func=cmd_whoami)
 
+    preflight = sub.add_parser("doctor", help="read-only environment, identity, transport and cache preflight")
+    preflight.add_argument("--json", action="store_true")
+    preflight.add_argument("--online", action="store_true", help="verify repository read access (no writes or model runs)")
+    preflight.set_defaults(func=cmd_doctor)
+
     claim = sub.add_parser("claim", help="announce that you are working on an issue")
     claim.add_argument("issue", type=int)
     claim.add_argument("--branch", help="default: the current branch")
@@ -1044,6 +1140,11 @@ def parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
     status.set_defaults(func=cmd_train_status)
+
+    report = train_sub.add_parser("report", help="on-demand train efficiency and CI attempt report")
+    report.add_argument("--days", type=int, default=7, help="report window, 1 to 30 days (default 7)")
+    report.add_argument("--json", action="store_true")
+    report.set_defaults(func=cmd_train_report)
     step = train_sub.add_parser("step", help="advance the train by one step (merge-train.yml runs this)")
     step.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
     step.add_argument("--repo-dir", default=".", help="a clone with push access (default: current directory)")
@@ -1067,6 +1168,15 @@ def parser() -> argparse.ArgumentParser:
     tick.add_argument("--dry-run", action="store_true", help="show what it would wake for; write nothing")
     tick.add_argument("--no-wake", action="store_true", help="beat and record, but start no model run")
     tick.set_defaults(func=cmd_conductor_tick)
+
+    diagnose = conductor_sub.add_parser("diagnose", help="one read-only model diagnosis; optional repair handoff")
+    diagnose.add_argument("--runtime", choices=("codex", "claude"), default="codex")
+    diagnose.add_argument("--model", help="use this model; omitted uses the runtime's default")
+    diagnose.add_argument("--input", help="read a focused context file instead of the board")
+    diagnose.add_argument("--timeout", type=int, default=300, help="maximum run seconds (1 to 3600)")
+    diagnose.add_argument("--handoff", action="store_true", help="send a repair diagnosis to the existing conductor")
+    diagnose.add_argument("--json", action="store_true")
+    diagnose.set_defaults(func=cmd_conductor_diagnose)
     cstatus = conductor_sub.add_parser("status", help="hosts, pause, outages, escalations, and this machine's wakes")
     cstatus.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
     cstatus.add_argument("--last", type=int, default=5, help="how many recent wakes to list")
@@ -1096,12 +1206,17 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    try:
+        args = parser().parse_args(argv)
+    except SystemExit as error:
+        if error.code and "--json" in argv:
+            return report_error(argparse.Namespace(json=True), EXIT_USAGE, "usage", "invalid arguments; see stderr")
+        raise
     try:
         gh = GitHub(args.repo)
     except GitHubError as error:
-        print(f"coord: GitHub error: {redact(str(error))}", file=sys.stderr)
-        return EXIT_BACKEND
+        return report_error(args, EXIT_BACKEND, "github", f"GitHub error: {error}")
     attach_app(gh)
     return run(args, gh)
 
@@ -1112,6 +1227,16 @@ def attach_app(gh: GitHub) -> None:
     mode = apptoken.detect(gh.repo)
     gh.app_mode = mode
     gh.app = apptoken.for_mode(mode) if mode.on else None
+
+
+def report_error(args: argparse.Namespace, code: int, kind: str, message: str) -> int:
+    """Machine clients get one parseable failure object; diagnostics remain on stderr."""
+    message = redact(message)
+    print(f"coord: {message}", file=sys.stderr)
+    if getattr(args, "json", False):
+        print(json.dumps({"schema": 1, "status": "error", "error": {
+            "code": code, "kind": kind, "message": message}}, indent=2))
+    return code
 
 
 def run(args: argparse.Namespace, gh: GitHub) -> int:
@@ -1131,20 +1256,18 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
             return refused
         return args.func(args, gh)
     except BudgetRefused as error:
-        print(f"coord: {error}", file=sys.stderr)
-        return EXIT_BUDGET
+        return report_error(args, EXIT_BUDGET, "budget", str(error))
     except AppRefused as error:
-        print(f"coord: {redact(str(error))}", file=sys.stderr)
-        return EXIT_BACKEND
+        return report_error(args, EXIT_BACKEND, "authentication", str(error))
     except UsageError as error:
-        print(f"coord: {error}", file=sys.stderr)
-        return EXIT_USAGE
+        return report_error(args, EXIT_USAGE, "usage", str(error))
+    except identity.IdentityError as error:
+        return report_error(args, EXIT_USAGE, "identity", str(error))
+    except train_metrics.BudgetConfigurationError as error:
+        return report_error(args, EXIT_USAGE, "configuration", str(error))
     except AppAuthError as error:
-        print(f"coord: {app_words(error)}; not running `coord {command}`", file=sys.stderr)
-        return EXIT_BACKEND
+        return report_error(args, EXIT_BACKEND, "authentication", f"{app_words(error)}; not running `coord {command}`")
     except NotFound as error:
-        print(f"coord: not found: {redact(str(error))}", file=sys.stderr)
-        return EXIT_NOT_FOUND
+        return report_error(args, EXIT_NOT_FOUND, "not_found", f"not found: {error}")
     except GitHubError as error:
-        print(f"coord: GitHub error: {redact(str(error))}", file=sys.stderr)
-        return EXIT_BACKEND
+        return report_error(args, EXIT_BACKEND, "github", f"GitHub error: {error}")
