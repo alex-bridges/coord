@@ -147,6 +147,10 @@ def conductor_lines(snapshot: Dict[str, Any], now: dt.datetime) -> List[str]:
             words += f" · disk {host['disk']} GB free"
         if host.get("pending"):
             words += f" · {host['pending']} pending"
+        reviewer = host.get("reviewer")
+        if reviewer:
+            state = "on" if reviewer.get("appAvailable") else f"off (app not available on {host.get('host') or host['agent']})"
+            words += f" · reviewer {state}, {reviewer['waiting']} waiting"
         if wake.get("at"):
             words += f" · last wake {ago(wake['at'], now)} ago" + (f": {_clip(wake.get('summary') or '', 60)}" if wake.get("summary") else "")
         lines.append(words)

@@ -146,6 +146,19 @@ class LeaseTests(unittest.TestCase):
         bad = record(1, 0, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "beat": "now"})
         self.assertEqual(lease.hosts([bad], NOW)[0]["alive"], False)
 
+    def test_a_reviewer_backlog_rides_the_beat(self):
+        beat = record(1, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "host": "A",
+                                "beat": snapshot.iso(at(-1)), "reviewer": {"waiting": 3, "appAvailable": False}})
+        self.assertEqual(lease.hosts([beat], NOW)[0]["reviewer"], {"waiting": 3, "appAvailable": False})
+
+    def test_no_backlog_or_a_malformed_one_shows_nothing(self):
+        empty = record(1, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "host": "A",
+                                 "beat": snapshot.iso(at(-1)), "reviewer": {"waiting": 0, "appAvailable": True}})
+        self.assertIsNone(lease.hosts([empty], NOW)[0]["reviewer"])
+        odd = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@B:c", "host": "B",
+                               "beat": snapshot.iso(at(-1)), "reviewer": "off"})
+        self.assertIsNone(lease.hosts([odd], NOW)[0]["reviewer"])
+
     def test_pause_and_resume(self):
         pause = record(5, -10, {"kind": "conductor", "event": "pause", "agent": "claude@E:x",
                                 "until": snapshot.iso(at(60)), "note": "driving it myself"})
@@ -579,6 +592,27 @@ class BoardTests(unittest.TestCase):
                 "runs": {"running": [], "queued": []}, "train": []}
         self.assertIn("no watcher running", render.board(snap, "me", 0))
         self.assertNotIn("conductor", render.brief(snap, "me").split("\n")[0])
+
+    def test_the_board_shows_a_stalled_reviewer_backlog(self):
+        """The reviewer piling up requests with the app unavailable (#1092) shows on the
+        board, not only in the watcher log only this host can read."""
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@Tycho:conductor",
+                                "host": "Tycho", "beat": snapshot.iso(at(-1)),
+                                "reviewer": {"waiting": 19, "appAvailable": False}})
+        snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
+                "runs": {"running": [], "queued": []}, "train": [], "outages": [],
+                "conductor": {"hosts": lease.hosts([beat], NOW), "pause": None, "escalations": []}}
+        text = render.board(snap, "codex@E:x", 0)
+        self.assertIn("reviewer off (app not available on Tycho), 19 waiting", text)
+
+    def test_the_board_shows_a_running_reviewer(self):
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@Tycho:conductor",
+                                "host": "Tycho", "beat": snapshot.iso(at(-1)),
+                                "reviewer": {"waiting": 1, "appAvailable": True}})
+        snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
+                "runs": {"running": [], "queued": []}, "train": [], "outages": [],
+                "conductor": {"hosts": lease.hosts([beat], NOW), "pause": None, "escalations": []}}
+        self.assertIn("reviewer on, 1 waiting", render.board(snap, "codex@E:x", 0))
 
 
 class ReviewRegressionTests(unittest.TestCase):
