@@ -569,6 +569,9 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         since = snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
     started = snapshot.now_utc()
     snap = get_snapshot(gh, args.max_age)
+    if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
+        # The snapshot build was the refused read (#1052): reading comments would cost more.
+        return inbox_from_snapshot(args, gh, me, snap)
     try:
         issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
         review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")

@@ -109,6 +109,19 @@ class QuotaFallbackTests(AppTestCase):
         self.assertEqual(code, EXIT_OK, err)
         self.assertIn("batch: not read (API budget low)", out)
 
+    # Codex on 5e880ae: when the snapshot build is the exhausting read, inbox must not go
+    # on to read the comments; it counts from the stale snapshot it was just served.
+
+    def test_inbox_stops_after_the_snapshot_build_exhausts(self):
+        self.refuse_first_read()  # the 2h-old seed: the snapshot build is the first read
+        code, out, err = self.main(["inbox"])
+        self.assertEqual(len(self.refused), 1, "the first app read was refused")
+        self.assertNotIn("comments", self.refused[0])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertIn("GitHub API budget low: 0 left on the GitHub App", err)
+        self.assertIn("run `coord inbox` after the reset", out)
+        self.assertEqual(self.server.api_requests(), [], "no request after the refused one reached GitHub")
+
     def test_a_403_that_leaves_budget_still_errors_after_the_snapshot(self):
         for argv in (["inbox"], ["train", "status"]):
             with self.subTest(argv=argv):
