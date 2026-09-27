@@ -109,6 +109,7 @@ _FENCE = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,}).*?(^[ \t]{0,3}(?P=mark)|\
 _INLINE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)", re.S)
 _INDENTED = re.compile(r"^(?: {4}|\t)")
 # Raw HTML that GitHub renders as code or a quote (Codex on #1049); an unclosed one runs to the end.
+_HTML_COMMENT = re.compile(r"<!--.*?(-->|\Z)", re.S)  # GitHub renders none of it
 _HTML = re.compile(r"<(code|pre|kbd|samp|tt|blockquote|q)\b[^>]*>.*?(</\1\s*>|\Z)", re.S | re.I)
 # Markdown container prefixes: list markers and quote markers, nested in any order (Codex on #1049).
 _CONTAINER = re.compile(r"^(?:[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+|[ \t]*>[ \t]?)*[ \t]*")
@@ -139,7 +140,7 @@ def find_tag(body: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
     call it one: missing a request costs a re-ask, a false one a 45-minute run.
     """
     kept = []
-    for line in _HTML.sub("", body or "").splitlines():
+    for line in _HTML.sub("", _HTML_COMMENT.sub("", body or "")).splitlines():
         prefix = _CONTAINER.match(line).group(0)
         if ">" in prefix or _INDENTED.match(line):
             kept.append("")  # quoted, at any depth or inside a list item, or indented code
@@ -195,11 +196,20 @@ def extract_json(text: str) -> Optional[Dict[str, Any]]:
     blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", re.S)
     candidates = blocks[::-1]
     if not candidates:
-        start = (text or "").rfind('{"findings"')
-        if start < 0:
-            start = (text or "").rfind("{")
-        if start >= 0:
-            candidates = [text[start:]]
+        # Unfenced: decode a whole object from every `{`, and take the last outer one that has
+        # findings (not a finding nested inside it; Codex on #1049).
+        decoder, found = json.JSONDecoder(), None
+        index = (text or "").find("{")
+        while index >= 0:
+            try:
+                data, end = decoder.raw_decode(text, index)
+            except ValueError:
+                index = text.find("{", index + 1)
+                continue
+            if isinstance(data, dict) and isinstance(data.get("findings"), list):
+                found = data
+            index = text.find("{", end)
+        return found
     for candidate in candidates:
         try:
             data = json.loads(candidate)
@@ -319,7 +329,8 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
                      "accepts it." if counts_for_train else
                      f"This does not count for the train: an earlier review of this head requested changes "
                      f"({blocked_by}). Push a fix; a pass by another model does not answer those findings."
-                     if blocked_by else
+                     if blocked_by and blocked_by.startswith("http") else
+                     f"This does not count for the train: {blocked_by}." if blocked_by else
                      "This is advice: Codex is not out of quota for this head, so the PR still needs Codex's 👍.")
     lines.append("")
     if result.get("summary"):
@@ -482,6 +493,12 @@ class Reviews:
         cursor past them, before it died with them in its own state (Codex on #1049)."""
         done = answered(issue_comments)
         self.remember([c for c in issue_comments if c.get("id") not in done])
+        for key, record in self.state.items():
+            # Answered on GitHub but still pending here (a crash after the post, before the state
+            # was saved): done, never a fourth run (Codex on #1049).
+            if isinstance(record, dict) and record.get("status") == "pending" and record.get("id") in done:
+                record.update(status="done", at=snapshot.iso(self.w.now))
+                record.pop("unsent", None)
 
 
     def pending(self, issue_comments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -637,9 +654,11 @@ class Reviews:
                windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Run the reviewer on `head`; the rendered review to post, or None (retry or given up)."""
         now = self.w.now
+        began = snapshot.now_utc()  # the clock for "when did the run end": checkout included
+        base = base_of(pr)  # the base the diff is taken against, fixed before the run
         worktree = os.path.join(self.config.state_dir, "reviews", f"pr-{request['pr']}-{head[:10]}")
         scratch = worktree + "-scratch"
-        if not self.checkout(request["pr"], head, worktree, scratch, base_of(pr)):
+        if not self.checkout(request["pr"], head, worktree, scratch, base):
             shutil.rmtree(scratch, ignore_errors=True)
             self.fail(request, record, "could not check out the PR's head on the CI box")
             return None
@@ -663,7 +682,7 @@ class Reviews:
             self.restore_checkout(clean)
         from . import conductor  # the watcher's helpers; imported late, as conductor imports this module
         # The time the run ended: a relative reset ("resets in 2h") counts from then (Codex on #1049).
-        ended = now + dt.timedelta(seconds=seconds)
+        ended = now + (snapshot.now_utc() - began)  # the tick's clock, advanced by everything since
         result = conductor.outcome(completed.returncode, completed.stdout, completed.stderr, ended)
         text = str(conductor.parse_result(completed.stdout).get("result") or "")
         run = {"seconds": seconds, "turns": result["turns"], "agent": self.agent(), "usage": result["usage"],
@@ -684,7 +703,8 @@ class Reviews:
                       if result["ok"] else f"the review run failed ({_clip(result['summary'], 160)})")
             return None
         found = normalize(data)
-        return {"head": head, "found": found, "verdict": verdict(found["findings"]), "run": run}
+        return {"head": head, "found": found, "verdict": verdict(found["findings"]), "run": run,
+                "base": base}
 
     def compose(self, request: Dict[str, Any], pr: Dict[str, Any], finished: Dict[str, Any],
                 windows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -696,6 +716,11 @@ class Reviews:
         head_time = pushed_at(suites.get("check_suites") or [], (pr.get("head") or {}).get("ref") or "")
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
+        # The diff reviewed was head against this base. If the PR's base moved or it was
+        # retargeted since, the pass covers another diff: advice only (Codex on #1049).
+        current = self.app.rest(f"repos/{{repo}}/pulls/{request['pr']}") or {}
+        if outcome == "pass" and finished.get("base") and base_of(current) != finished["base"]:
+            blocked_by = blocked_by or f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
         # The time and outages as they are now, after a run that may have taken 45 minutes, not
         # at the tick's start; and only outages declared by a trusted author (Codex on #1049).
         records = self.outage_records()

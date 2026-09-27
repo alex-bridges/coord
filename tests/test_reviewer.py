@@ -1227,6 +1227,47 @@ class CodexRound14Tests(ReviewFlowTests):
         self.assertEqual(self.reviews(), [])
 
 
+class CodexRound15Tests(ReviewFlowTests):
+    def test_q1_a_pass_over_a_base_that_moved_does_not_count(self):
+        self.app.pr["base"] = {"ref": "claude/parent", "sha": "b" * 40}
+        self.app.pr_comments = [{"user": {"login": "chatgpt-codex-connector[bot]"}, "body": CODEX_NOTICE,
+                                 "created_at": snapshot.iso(at(-60))}]
+        runner = self.runner
+
+        def moving(cmd, cwd, env, timeout):
+            self.app.pr["base"] = {"ref": "claude/parent", "sha": "c" * 40}  # the parent moved mid-run
+            return runner(cmd, cwd, env, timeout)
+        self.runner = moving
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        self.assertEqual(self.app.markers("review")[0]["countsForTrain"], False)
+        self.assertEqual(self.app.markers("review-substitute"), [])
+        self.assertIn("base moved", self.app.posts[-1])
+
+    def test_q3_html_comments_hide_the_tag(self):
+        self.assertIsNone(reviewer.find_tag("<!-- @inisa-sidechain review -->"))
+        self.assertIsNone(reviewer.find_tag("<!--\n@inisa-sidechain review"))
+        self.assertEqual(reviewer.find_tag("<!-- x --> @inisa-sidechain review")["model"], "opus")
+
+    def test_q4_unfenced_json_with_nested_findings_is_read_whole(self):
+        text = 'Done. {"summary": "s", "findings": [{"severity": "P2", "summary": "bug"}], "checked": ["a"]} bye'
+        data = reviewer.extract_json(text)
+        self.assertEqual(data["findings"][0]["summary"], "bug")
+        self.assertEqual(data["summary"], "s")
+
+    def test_q5_a_rescan_closes_a_pending_request_the_app_answered(self):
+        watcher = mock.Mock(state={"reviews": {"5": {"id": 5, "pr": 7, "status": "pending", "attempts": 2,
+                                                     "unsent": "gave up"}}}, config=self.config, now=at(0))
+        jobs = reviewer.Reviews(watcher, self.app)
+        reply = {"id": 9, "user": {"login": reviewer.APP_LOGIN},
+                 "body": marker.compose("gave up", {"kind": "review", "v": 1, "pr": 7, "request": 5, "verdict": "none"})}
+        jobs.rescan([reply])
+        self.assertEqual(watcher.state["reviews"]["5"]["status"], "done")
+        self.assertEqual(jobs.pending(), [])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
