@@ -446,7 +446,8 @@ def coord_comments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         payload = marker.decode(comment.get("body"))
         if payload is not None:
             out.append({"id": comment.get("id"), "createdAt": comment.get("created_at"), "url": comment.get("html_url"),
-                        "text": marker.strip(comment.get("body") or ""), "payload": payload})
+                        "text": marker.strip(comment.get("body") or ""), "payload": payload,
+                        "author": snapshot.comment_author(comment)})
     return sorted(out, key=lambda c: c["id"] or 0)
 
 

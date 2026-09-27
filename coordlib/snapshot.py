@@ -20,7 +20,7 @@ import os
 import posixpath
 import re
 import urllib.parse
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from . import lease, marker, outage, review
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
@@ -374,6 +374,7 @@ def fetch_coord_comments(gh: GitHub, since: dt.datetime) -> List[Dict[str, Any]]
             "url": comment.get("html_url"),
             "text": marker.strip(comment.get("body") or ""),
             "payload": payload,
+            "author": comment_author(comment),  # attestations count only from a trusted user
         })
     out.sort(key=lambda c: c["id"] or 0)
     return out
@@ -727,20 +728,54 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
     return out
 
 
-HEAD_RECORDS = {"review-substitute": "substituteReviewHead", "alex-approve": "alexApprovedHead"}
+# Attestations: records that name one head, and the PR field each sets. `review-clean`
+# is what `coord train review` writes; `review-substitute` is what `train
+# substitute-review` wrote before 2026-09-26, and still counts for the head it names.
+#
+# Anyone who can comment can write a marker, bots included: the Codex connector, whose
+# text a PR can steer, and coord's own app, which has issues:write. So an attestation
+# counts only when GitHub names a trusted user as its comment's author (Codex P1 on
+# #1054). The attestation commands always post as Alex (cli.ATTESTATIONS never run on
+# the app), so every real record passes.
+HEAD_RECORDS = {"review-clean": "reviewedHead", "review-substitute": "reviewedHead", "alex-approve": "alexApprovedHead"}
 
 
-def attach_substitute_reviews(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> None:
-    """Set each PR's `substituteReviewHead` and `alexApprovedHead`: the head its newest
-    review-substitute / alex-approve comment names."""
+def trusted_attesters(repo: str) -> FrozenSet[str]:
+    """The logins, lower-cased, whose attestation records count: the repository's owner
+    (alex-bridges for example-owner/example-repo). The one place this set is decided."""
+    return frozenset({repo.split("/", 1)[0].lower()})
+
+
+def comment_author(comment: Dict[str, Any]) -> Dict[str, str]:
+    """A REST comment's author: its login and account type ("User", "Bot"; "" if absent)."""
+    user = comment.get("user") or {}
+    return {"login": str(user.get("login") or ""), "type": str(user.get("type") or "")}
+
+
+def trusted_attestation(author: Optional[Dict[str, Any]], repo: str) -> bool:
+    """Whether an attestation posted by `author` counts: a user, never a bot, whose
+    login is in trusted_attesters(repo)."""
+    login = str((author or {}).get("login") or "")
+    account = str((author or {}).get("type") or "")
+    if not login or login.endswith("[bot]") or account not in ("", "User"):
+        return False
+    return login.lower() in trusted_attesters(repo)
+
+
+def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]], repo: str) -> None:
+    """Set each PR's `reviewedHead` and `alexApprovedHead`: the head its newest
+    review-clean or review-substitute / alex-approve comment names, counting only
+    comments a trusted user posted (trusted_attestation) on the PR the record names,
+    as train_step.train_added does."""
     latest: Dict[Tuple[int, str], str] = {}
     for comment in comments:  # oldest first
         payload = comment["payload"]
         field = HEAD_RECORDS.get(payload.get("kind"))
-        if field and isinstance(payload.get("pr"), int):
+        on_its_pr = isinstance(payload.get("pr"), int) and comment.get("on") == payload["pr"]
+        if field and on_its_pr and trusted_attestation(comment.get("author"), repo):
             latest[(payload["pr"], field)] = payload.get("head")
     for pr in prs:
-        for field in HEAD_RECORDS.values():
+        for field in set(HEAD_RECORDS.values()):
             pr[field] = latest.get((pr["number"], field))
 
 
@@ -779,7 +814,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p["issue"] for p in claim_payloads if isinstance(p.get("issue"), int)],
         [p.get("branch") or "" for p in claim_payloads],
     )
-    attach_substitute_reviews(prs, comments)
+    attach_head_records(prs, comments, gh.repo)
     outage_windows = outage.windows(comments)
     claims = resolve_claims(comments, targets, prs, now, outage_windows)
     # A `send` message, or any other record addressed to someone (the train's held notice).

@@ -6,6 +6,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -20,8 +21,10 @@ from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
 # the app: its reads on the read token, its writes on the ops token.
 #
 # Attestations, not operations: they record that Alex approved, or that a named reviewer
-# reviewed, a head.
-ATTESTATIONS = frozenset({"train approve", "train substitute-review"})
+# reviewed, a head. `train substitute-review` is the old name of `train review`. The train
+# counts an attestation only when Alex's login posted it (snapshot.trusted_attestation),
+# so these must never move to the app.
+ATTESTATIONS = frozenset({"train approve", "train review", "train substitute-review"})
 # Commands that need what the app does not have:
 # - a hand-run `train step` moves and deletes branches (Contents write; in Actions app mode
 #   is off and the step uses GITHUB_TOKEN);
@@ -622,27 +625,69 @@ def cmd_train_remove(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
-def cmd_train_substitute_review(args: argparse.Namespace, gh: GitHub) -> int:
-    """Codex out of quota (Alex's rule): record that a substitute review covered THIS head."""
+FULL_SHA_WORDS = "give the full 40-character SHA of the head you reviewed or approved"
+
+
+def head_sha(text: str) -> str:
+    """argparse type for `--head`: a full 40-hex commit SHA, case-folded. Never a prefix:
+    an author can grind a commit that shares a short prefix with the reviewed head
+    (about 2^28 hashes for 7 digits; Codex P1 on #1054)."""
+    value = text.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", value):
+        raise argparse.ArgumentTypeError(f"{FULL_SHA_WORDS} (got {text!r})")
+    return value
+
+
+def attested_head(gh: GitHub, number: int, given: str) -> Optional[str]:
+    """The PR's current head when it EQUALS the head the attestation names (`--head`);
+    otherwise None, after saying why. The head is read when the command runs, not when the
+    review or approval happened, so without this a push in between would be recorded as
+    reviewed or approved (review of #1054)."""
+    pr = gh.rest(f"repos/{{repo}}/pulls/{number}")
+    head = str((pr.get("head") or {}).get("sha") or "").lower()
+    if not head or head != given:
+        if head.startswith(given):
+            why = f"{FULL_SHA_WORDS}, not a prefix"
+        else:
+            why = "its head moved after what you are recording was done; review or approve the new head"
+        print(f"coord: #{number} is at {head or 'an unknown head'}, not {given}: {why}. Nothing was recorded.",
+              file=sys.stderr)
+        return None
+    return head
+
+
+def cmd_train_review(args: argparse.Namespace, gh: GitHub) -> int:
+    """Record that a clean review of the PR's head `--head` was done, and by which agent
+    (Alex, 2026-09-26: a clean review counts no matter what agent does it). Refuses unless
+    `--head` is still the PR's head. The train counts it for this head only. `train
+    substitute-review` runs this too, `--by` optional."""
     me = identity.agent_id()
-    pr = gh.rest(f"repos/{{repo}}/pulls/{args.pr}")
-    head = (pr.get("head") or {}).get("sha", "")
-    text = (f"**Substitute review** recorded by `{me}` for head `{head[:9]}` (Codex unavailable).\n\n{args.note}\n\n"
-            "This stands in for Codex's 👍 on this head only; a new push needs a new review.")
-    post_comment(gh, args.pr, text, {"kind": "review-substitute", "v": 1, "agent": me, "pr": args.pr, "head": head})
+    head = attested_head(gh, args.pr, args.head)
+    if head is None:
+        return EXIT_CONFLICT
+    by = f" by `{args.by}`" if args.by else ""
+    text = (f"**Clean review** of head `{head[:9]}`{by}, recorded by `{me}`.\n\n{args.note}\n\n"
+            "It counts as the review of this head only; a new push needs a new review.")
+    payload = {"kind": "review-clean", "v": 1, "agent": me, "pr": args.pr, "head": head}
+    if args.by:
+        payload["by"] = args.by
+    # The record first, the label second: the record is what the train reads.
+    post_comment(gh, args.pr, text, payload)
     train_step.ensure_labels(gh)
-    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.REVIEWED_LABEL]})
     cache.invalidate_snapshot(gh.repo)
-    print(f"recorded a substitute review of #{args.pr} at {head[:9]}")
+    print(f"recorded a clean review of #{args.pr} at {head[:9]}" + (f" by {args.by}" if args.by else ""))
     return EXIT_OK
 
 
 def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
-    """Alex approves a needs-alex PR at its CURRENT head. Every agent posts as Alex's
-    login, so this is procedure, not authentication: run it only on Alex's word."""
+    """Alex approves a needs-alex PR at the head he approved (`--head`), which must still
+    be its head. Every agent posts as Alex's login, so this is procedure, not
+    authentication: run it only on Alex's word."""
     me = identity.agent_id()
-    pr = gh.rest(f"repos/{{repo}}/pulls/{args.pr}")
-    head = (pr.get("head") or {}).get("sha", "")
+    head = attested_head(gh, args.pr, args.head)
+    if head is None:
+        return EXIT_CONFLICT
     text = (f"**Approved by Alex** for head `{head[:9]}` (recorded by `{me}`).\n\n{args.note}\n\n"
             "This covers this head only; a new push needs a new approval.")
     post_comment(gh, args.pr, text, {"kind": "alex-approve", "v": 1, "agent": me, "pr": args.pr, "head": head})
@@ -976,13 +1021,23 @@ def parser() -> argparse.ArgumentParser:
     remove.add_argument("pr", type=int)
     remove.add_argument("--note")
     remove.set_defaults(func=cmd_train_remove)
-    substitute = train_sub.add_parser("substitute-review",
-                                      help="Codex out of quota: record a substitute review of the PR's current head")
+    head_help = "the full 40-character SHA of the head that was reviewed or approved; refused unless it is the PR's head"
+    reviewed = train_sub.add_parser("review", help="record a clean review of a PR's head by an agent")
+    reviewed.add_argument("pr", type=int)
+    reviewed.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
+    reviewed.add_argument("--by", required=True, metavar="AGENT", help="the agent that did the review")
+    reviewed.add_argument("--note", required=True, help="where the review is and what it covered")
+    reviewed.set_defaults(func=cmd_train_review)
+    # The old name, kept for the sessions and docs that still use it; its callers pass no --by.
+    substitute = train_sub.add_parser("substitute-review", help="the old name of `train review`; --by is optional here")
     substitute.add_argument("pr", type=int)
+    substitute.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
+    substitute.add_argument("--by", metavar="AGENT", help="the agent that did the review")
     substitute.add_argument("--note", required=True, help="who reviewed and where the review is")
-    substitute.set_defaults(func=cmd_train_substitute_review)
-    approve = train_sub.add_parser("approve", help="record Alex's approval of a needs-alex PR at its current head")
+    substitute.set_defaults(func=cmd_train_review)
+    approve = train_sub.add_parser("approve", help="record Alex's approval of a needs-alex PR at a head")
     approve.add_argument("pr", type=int)
+    approve.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
     approve.add_argument("--note", required=True, help="Alex's words, or where he approved")
     approve.set_defaults(func=cmd_train_approve)
     status = train_sub.add_parser("status", help="the current batch and every queued PR's readiness")

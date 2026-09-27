@@ -14,8 +14,8 @@ Two identities (#1035):
   nothing falls back to Alex's token.
 - **Alex's login** (alex-bridges) for everything else: all of coord when app mode is off
   (cloud sessions, other machines, COORD_APP=off), and, in app mode, the attestations
-  (`train approve`, `train substitute-review`) and a hand-run `train step`
-  (`GitHub.as_user`).
+  (`train approve`, `train review` and its old name `train substitute-review`) and a
+  hand-run `train step` (`GitHub.as_user`).
 
 Each identity has its own hourly budget; budget.py records every reading under the
 principal whose token made the call. `calls` counts what a command spent so the board
