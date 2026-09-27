@@ -135,6 +135,8 @@ class FakeApp:
     def rest_paginated(self, path):
         if path.startswith("repos/{repo}/issues/7/comments"):
             return list(self.pr_comments)
+        if path.startswith("repos/{repo}/issues/") and "/comments" in path:
+            return list(getattr(self, "conductor_comments", []))  # the conductor issue, read fresh
         raise AssertionError(f"unexpected app paginated call {path}")
 
     def markers(self, kind):
@@ -929,6 +931,52 @@ class CodexRound5Tests(ReviewFlowTests):
         watcher.review_step([], None, None, True, {}, "Alex's API budget is under the read floor")
         self.assertEqual(len(self.app.markers("review")), 1)
         self.assertEqual(len(self.reviews()), 1)
+
+
+class CodexRound6Tests(ReviewFlowTests):
+    """Codex's review of a9732170 (#1049)."""
+
+    def outage(self, event, minutes, login="alex-bridges"):
+        payload = {"kind": "outage", "v": 1, "event": event, "harness": "codex-review", "until": snapshot.iso(at(300))}
+        return {"id": 100 + minutes, "user": {"login": login}, "created_at": snapshot.iso(at(minutes)),
+                "body": marker.compose("outage", payload)}
+
+    def test_h1_an_outage_ended_during_the_run_is_read_fresh(self):
+        watcher = mock.Mock(state={}, config=self.config, now=at(0), issue=900,
+                            records=[{"id": 1, "createdAt": snapshot.iso(at(-10)), "author": {"login": "alex-bridges"},
+                                      "payload": {"kind": "outage", "v": 1, "event": "start", "harness": "codex-review",
+                                                  "until": snapshot.iso(at(300))}}])
+        self.app.conductor_comments = [self.outage("start", -10), self.outage("end", 20)]
+        jobs = reviewer.Reviews(watcher, self.app)
+        finished = {"head": HEAD, "found": reviewer.normalize({"findings": []}), "verdict": "pass", "run": {}}
+        with mock.patch.object(reviewer.snapshot, "now_utc", return_value=at(40)):
+            posting = jobs.compose({"pr": 7, "id": 1, "url": "", "model": "opus"}, self.app.pr, finished, [])
+        self.assertFalse(posting["counts"], "the tick's copy still showed it open")
+
+    def test_h2_a_substitute_record_alone_answers_its_request(self):
+        payload = {"kind": "review-substitute", "v": 1, "pr": 7, "head": HEAD, "model": "opus", "request": 42}
+        comment = {"id": 43, "user": {"login": reviewer.APP_LOGIN}, "body": marker.compose("sub", payload)}
+        self.assertIn(42, reviewer.answered([comment]))
+        self.assertIsNotNone(reviewer.posted_review([comment], 7, HEAD, "opus"))
+
+    def test_h3_the_daily_cap_follows_the_lead(self):
+        reviews = [{"id": 200 + n, "user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-60 * n)),
+                    "body": marker.compose("r", {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "verdict": "pass"})}
+                   for n in range(10)]
+        watcher = mock.Mock(state={}, config=self.config, now=at(0))
+        jobs = reviewer.Reviews(watcher, self.app)
+        jobs.rescan(reviews)
+        jobs.rescan(reviews)
+        self.assertEqual(jobs.runs_today(at(0)), 10, "each posted review once, all within 24 h")
+        self.assertIn("the cap", jobs.may_run())
+
+    def test_h4_nothing_but_the_allowlist_reaches_the_run(self):
+        env = reviewer.isolated_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "sk-ant-x",
+                                     "AWS_SECRET_ACCESS_KEY": "a", "NPM_TOKEN": "n", "CLAUDE_CODE_OAUTH_TOKEN": "o",
+                                     "LC_ALL": "C", "GH_TOKEN": "g"}, "/tmp/empty")
+        for name in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "NPM_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN"):
+            self.assertNotIn(name, env)
+        self.assertEqual((env["PATH"], env["HOME"], env["LC_ALL"]), ("/bin", "/h", "C"))
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):

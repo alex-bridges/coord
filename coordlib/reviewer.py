@@ -242,8 +242,8 @@ def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: 
         if (comment.get("user") or {}).get("login") != APP_LOGIN:
             continue
         payload = marker.decode(comment.get("body")) or {}
-        if payload.get("kind") == "review" and payload.get("pr") == pr and payload.get("head") == head \
-                and payload.get("model") == model:
+        if payload.get("kind") in ("review", "review-substitute") and payload.get("pr") == pr \
+                and payload.get("head") == head and payload.get("model") == model:
             return comment.get("html_url") or ""
     return None
 
@@ -267,7 +267,9 @@ def answered(comments: List[Dict[str, Any]]) -> set:
     for comment in comments:
         if (comment.get("user") or {}).get("login") == APP_LOGIN:
             payload = marker.decode(comment.get("body")) or {}
-            if payload.get("kind") == "review" and payload.get("request") is not None:
+            # A substitute record names its request too: posted before the review, it is the
+            # one durable trace if a leader died between the two (Codex on #1049).
+            if payload.get("kind") in ("review", "review-substitute") and payload.get("request") is not None:
                 ids.add(payload["request"])
     return ids
 
@@ -357,17 +359,19 @@ def prompt(pr: Dict[str, Any], head: str, worktree: str, scratch: str, request: 
     ])
 
 
+ENV_ALLOWED = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "DEVELOPER_DIR")
+
+
 def isolated_env(base: Dict[str, str], empty_dir: str) -> Dict[str, str]:
     """The review run's environment, with no GitHub credential in reach of gh or git (review
     of #1049): gh gets an empty config directory (it is not logged in), git reads no system
     or global config (no osxkeychain helper) and cannot prompt, and no token variables
     remain. Prefix deny rules cannot stop `/opt/homebrew/bin/gh pr comment` or a test that
     shells out; an unauthenticated gh and git can."""
-    env = {k: v for k, v in base.items()
-           if k not in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
-                        "SSH_AUTH_SOCK", "GIT_ASKPASS", "SSH_ASKPASS", "GH_HOST",
-                        # it would load CLAUDE.md and .claude/rules from the PR's added tree
-                        "CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD")}
+    # An allowlist, not a denylist: nothing else in the host's environment (a model key, a
+    # cloud or npm token) reaches the run or the PR's tests (Codex on #1049). Claude Code signs
+    # in from the Keychain, which the sandboxed children cannot read.
+    env = {k: v for k, v in base.items() if k in ENV_ALLOWED or k.startswith("LC_")}
     # No app config either: with COORD_AGENT=reviewer@… apptoken.detect refuses anyway, and a
     # nested process that resets COORD_AGENT still finds no config to mint with (Codex on #1049).
     env.update({"COORD_APP_CONFIG": os.path.join(empty_dir, "no-app-config"),
@@ -443,6 +447,15 @@ class Reviews:
         cursor past them, before it died with them in its own state (Codex on #1049)."""
         done = answered(issue_comments)
         self.remember([c for c in issue_comments if c.get("id") not in done])
+        # The daily cap follows the lead: every review the app posted in the last 24 h was a run
+        # (Codex on #1049). Runs are kept as times; one per posted review, not counted twice.
+        for comment in issue_comments:
+            payload = marker.decode(comment.get("body")) or {}
+            posted = _time(comment.get("created_at"))
+            if (comment.get("user") or {}).get("login") == APP_LOGIN and payload.get("kind") == "review" \
+                    and payload.get("verdict") in ("pass", "changes") and posted is not None \
+                    and self.w.now - posted < dt.timedelta(days=1) and comment.get("created_at") not in self.runs:
+                self.runs.append(comment["created_at"])
 
     def pending(self, issue_comments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         if issue_comments:
@@ -500,6 +513,17 @@ class Reviews:
             self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
         except GitHubError as error:
             self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
+
+    def outage_records(self) -> List[Dict[str, Any]]:
+        """The conductor issue's records as they are now, read with the app: an outage ended
+        during the run must not count (Codex on #1049). The tick's copy only if there is no
+        issue to read."""
+        from . import conductor
+        issue = getattr(self.w, "issue", None)
+        if isinstance(issue, int):
+            return conductor.coord_comments(self.app.rest_paginated(f"repos/{{repo}}/issues/{issue}/comments?per_page=100"))
+        records = getattr(self.w, "records", None)
+        return records if isinstance(records, list) else []
 
     def may_run(self) -> str:
         """Why a new model run may not start now, or ""."""
@@ -630,9 +654,8 @@ class Reviews:
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
         # The time and outages as they are now, after a run that may have taken 45 minutes, not
         # at the tick's start; and only outages declared by a trusted author (Codex on #1049).
-        records = getattr(self.w, "records", None)
-        trusted = [c for c in (records if isinstance(records, list) else [])
-                   if ((c.get("author") or {}).get("login")) in OUTAGE_AUTHORS]
+        records = self.outage_records()
+        trusted = [c for c in records if ((c.get("author") or {}).get("login")) in OUTAGE_AUTHORS]
         counts = outcome == "pass" and not blocked_by and codex_out(comments, head_time, outage.windows(trusted),
                                                                     snapshot.now_utc())
         # A blocking review of a head that a substitute review passed withdraws that pass;
@@ -666,7 +689,7 @@ class Reviews:
                 f"requested in {request.get('url') or 'a comment'}.\n\n"
                 "This stands in for Codex's 👍 on this head only; a new push needs a new review.",
                 {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
-                 "request": request["id"]})})
+                 "model": request["model"], "request": request["id"]})})
             posting.update(recorded=True, started=True)
         if posting["counts"] and not posting.get("labelled"):
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
