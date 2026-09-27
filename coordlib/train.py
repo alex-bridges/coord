@@ -34,11 +34,14 @@ both are ready at most one light batch goes ahead of ready heavy work (plan).
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import re
 import tempfile
 import types
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from . import marker
 
 TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
@@ -58,10 +61,10 @@ WORKFLOW_DIR = ".github/workflows/"
 # (substitute review of #1043), so all of it is guarded, this list included.
 ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md")
 MAX_ATTEMPTS = 2
-# The most batch CI runs the train will start in 24 hours, whatever goes wrong: a
-# loop, a red main, a lost dispatch. At ~1 h of heavy runner time each, 12 is the
-# heavy runner's whole day. `COORD_TRAIN_DAILY_RUNS` (a repository variable passed by
-# merge-train.yml) overrides it.
+# Each light/heavy pool admits at most twelve attempts per 24 hours by default.
+# The former twelve-run bound assumed ~1 h per heavy run; counting retries makes
+# that bound honest, and a separate light pool keeps cheap docs moving. An explicit
+# COORD_TRAIN_DAILY_RUNS still imposes its combined cap (now including attempts).
 DAILY_RUNS_DEFAULT = 12
 
 READY, HOLD, DROP = "ready", "hold", "drop"
@@ -240,20 +243,32 @@ class LaneClassifier:
     def classify(self, paths: Optional[Sequence[str]]) -> Tuple[str, str]:
         """(LIGHT | HEAVY, reason) for a PR whose diff from main's merge base is `paths`
         (None when it could not be established)."""
+        plan = self.lane_plan(paths)
+        return plan["class"], plan["reason"]
+
+    def lane_plan(self, paths: Optional[Sequence[str]]) -> Dict[str, Any]:
+        """Main's planned lane names, not a claim about what a later CI run executed.
+
+        App scope does not affect whether the apps lane is heavy. Unknown plans have
+        null lanes and charge the heavy budget, never the cheap one.
+        """
         if self.error:
-            return HEAVY, self.error
+            return {"class": HEAVY, "lanes": None, "reason": self.error}
         if not paths:
-            return HEAVY, "its diff is unknown or empty"
+            return {"class": HEAVY, "lanes": None, "reason": "its diff is unknown or empty"}
         try:
             selection = self.selector.Selection([])
             self.selector.select_for_paths(selection, list(paths), self.rules, None, _EveryApp)
             lanes = [lane for lane, on in selection.lanes.items() if on]
             heavy = [lane for lane in lanes if lane not in self.light_lanes]
             if heavy:
-                return HEAVY, f"it selects {', '.join(heavy)} ({selection.why[heavy[0]]})"
+                return {"class": HEAVY, "lanes": lanes,
+                        "reason": f"it selects {', '.join(heavy)} ({selection.why[heavy[0]]})"}
         except Exception as error:  # noqa: BLE001
-            return HEAVY, f"lane selection failed ({type(error).__name__}: {error})"
-        return LIGHT, "it selects " + (", ".join(lanes) if lanes else "no lane")
+            return {"class": HEAVY, "lanes": None,
+                    "reason": f"lane selection failed ({type(error).__name__}: {error})"}
+        return {"class": LIGHT, "lanes": lanes,
+                "reason": "it selects " + (", ".join(lanes) if lanes else "no lane")}
 
 
 def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],
@@ -298,8 +313,72 @@ def plan(queue: Sequence[Dict[str, Any]], verdicts: Dict[int, Tuple[str, str]],
 
 _MERGE_SUBJECT = re.compile(r"^Merge pull request #(\d+) ")
 BATCH_TRAILER = "Train-Batch"
+PLAN_TRAILER = "Train-Plan"
 # One line per first-parent commit: sha, parents, the Train-Batch trailer, subject.
 LOG_FORMAT = "%H%x09%P%x09%(trailers:key=Train-Batch,valueonly,separator=%x2C)%x09%s"
+
+
+def plan_trailer(plan: Dict[str, Any]) -> str:
+    """Persist the batch plan in its final merge commit, including failed batches.
+
+    Actions exposes this message in head_commit, so accounting does not need a git
+    fetch or a separate comment read for every historical run. The tip cannot be in
+    its own commit message; the full event receipt supplies it from the actual ref.
+    """
+    return PLAN_TRAILER + ": " + json.dumps(plan, separators=(",", ":"), sort_keys=True)
+
+
+def read_plan(message: str, batch: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not isinstance(message, str):
+        return None
+    lines = [line[len(PLAN_TRAILER) + 2:] for line in message.splitlines()
+             if line.startswith(PLAN_TRAILER + ": ")]
+    if len(lines) != 1:
+        return None
+    try:
+        plan = marker.parse_json(lines[0])
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return plan if valid_plan(plan, batch) else None
+
+
+def valid_plan(plan: Any, batch: Optional[str] = None) -> bool:
+    """Validate external receipt/trailer fields before accounting interprets them."""
+    if not isinstance(plan, dict) or type(plan.get("version")) is not int or plan["version"] != 1 \
+            or not isinstance(plan.get("batch"), str) or not plan["batch"].startswith(BATCH_PREFIX) \
+            or (batch is not None and plan["batch"] != batch) \
+            or not isinstance(plan.get("base"), str) or not re.fullmatch(r"[0-9a-f]{40}", plan["base"]):
+        return False
+    members, lanes = plan.get("members"), plan.get("lanePlan")
+    if not isinstance(members, list) or not members or not isinstance(lanes, dict):
+        return False
+    for member in members:
+        if not isinstance(member, dict) or type(member.get("pr")) is not int or member["pr"] <= 0 \
+                or not isinstance(member.get("head"), str) or not re.fullmatch(r"[0-9a-f]{40}", member["head"]) \
+                or (member.get("queuedAt") is not None and not isinstance(member["queuedAt"], str)):
+            return False
+    selected = lanes.get("lanes")
+    if lanes.get("class") not in (LIGHT, HEAVY) \
+            or (selected is not None and (not isinstance(selected, list)
+                                         or any(not isinstance(lane, str) for lane in selected))) \
+            or (lanes.get("class") == LIGHT and selected is None):
+        return False
+    if len({member["pr"] for member in members}) != len(members):
+        return False
+    if "batchCap" in plan and (type(plan["batchCap"]) is not int or plan["batchCap"] < len(members)):
+        return False
+    for name in ("builtAt", "outcome"):
+        if name in plan and not isinstance(plan[name], str):
+            return False
+    if "tip" in plan and (not isinstance(plan["tip"], str) or not re.fullmatch(r"[0-9a-f]{40}", plan["tip"])):
+        return False
+    run = plan.get("run")
+    if run is not None:
+        if not isinstance(run, dict) or any(type(run.get(name)) is not int or run[name] < 1 for name in ("id", "attempt")):
+            return False
+        if any(run.get(name) is not None and not isinstance(run[name], str) for name in ("status", "conclusion", "url")):
+            return False
+    return True
 
 
 def parse_batch(log: str, name: str) -> Tuple[Optional[str], List[Dict[str, Any]]]:

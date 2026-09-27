@@ -78,7 +78,7 @@ APP_PREFIX = cache.APP_PREFIX  # budget-app.json: each app principal under "app:
 # an agent can always report. `train step` runs in Actions on the Actions token, a
 # separate budget, and `whoami` and `token status` make no call.
 CACHE_READS = frozenset({"board", "inbox", "train status", "conductor status"})  # below the read floor: served from the cache, no call
-READS = CACHE_READS | {"ci", "token exec"}
+READS = CACHE_READS | {"ci", "token exec", "doctor", "train report", "conductor diagnose"}
 # `conductor tick` keeps its own floors (conductor.Watcher): it must beat and check the
 # machine even when reads are refused.
 UNGATED = frozenset({"send", "whoami", "train step", "conductor tick", "token status"})
