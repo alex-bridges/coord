@@ -857,21 +857,30 @@ class GuardHookTests(unittest.TestCase):
 
     def test_the_token_cache_is_blocked(self):
         # Codex on 141d38f62 (P1): a path has spellings no pattern keeps up with, so the rule is
-        # co-occurrence, like apptoken's: `inisa` and `cache` anywhere in the case-folded command.
+        # co-occurrence, like apptoken's: `inisa-coord` and `cache` anywhere in the case-folded command.
         for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
                         "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
                         "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/",
                         "cat ~/library/caches/INISA-COORD/ops.json", "cat ~/Library//Caches/inisa-coord/read.json",
-                        "cat ~/Library/Caches/./inisa-coord/ops.json", "cat ~/Library/Caches/inisa*/ops.json",
+                        "cat ~/Library/Caches/./inisa-coord/ops.json",
                         "cat ~/Library/Caches/INISA-COORD/ops.json", "cd ~/Library/Caches && cat inisa-coord/ops.json",
                         # The cost, as for apptoken: any command that names both, the budget cache and
                         # prose included. The way out is the Write tool.
                         "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json"):
             result = self.run_guard("Bash", {"command": command}, full=True)
             self.assertEqual(result.returncode, 2, command)
-            self.assertIn("`inisa` and `cache` in one command", result.stderr, command)
+            self.assertIn("`inisa-coord` and `cache` in one command", result.stderr, command)
             self.assertIn("write such text with the Write tool", result.stderr, command)
-        for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json"):
+        # The repo's own name beside a cache word is not the token cache (#1051, Alex: narrow the
+        # rule): the false positives of #1046's fresh review. The last is the conductor's disk-low
+        # `du -xhd1` of the CI trees and caches. A glob (`inisa*`) now passes: the spelling class
+        # #1051 accepts.
+        for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json",
+                        "git -C /Users/dev/Projects/INISA diff --cached", "gh cache list --repo example-owner/example-repo",
+                        "gh api repos/example-owner/example-repo/actions/caches",
+                        "python3 /Users/dev/Projects/INISA/scripts/test-ci-cache-preservation.py",
+                        "du -xhd1 ~/actions-runner*/_work/INISA ~/Library/Caches 2>/dev/null | sort -h",
+                        "cat ~/Library/Caches/inisa*/ops.json"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):

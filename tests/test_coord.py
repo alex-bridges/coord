@@ -106,8 +106,14 @@ def with_checks(*contexts):
     return node
 
 
-def coord_comment(comment_id: int, on: int, minutes_ago: float, payload):
-    return {"id": comment_id, "on": on, "createdAt": t(minutes_ago), "url": f"u/{comment_id}", "text": "", "payload": payload}
+REPO = "example-owner/example-repo"
+ALEX = {"login": "alex-bridges", "type": "User"}  # the repository owner: the one trusted attester
+
+
+def coord_comment(comment_id: int, on: int, minutes_ago: float, payload, author=None):
+    """A comment as snapshot.fetch_coord_comments shapes it, posted by `author` (default: Alex)."""
+    return {"id": comment_id, "on": on, "createdAt": t(minutes_ago), "url": f"u/{comment_id}", "text": "",
+            "payload": payload, "author": dict(author or ALEX)}
 
 
 class MarkerTests(unittest.TestCase):
@@ -635,14 +641,161 @@ class CodexRoundThreeTests(unittest.TestCase):
         from coordlib import cache
         self.assertNotEqual(cache._cursor_path("o/r", "codex@h:foo+bar"), cache._cursor_path("o/r", "codex@h:foo_bar"))
 
-    def test_substitute_review_heads_come_from_the_newest_comment(self):
+    def test_reviewed_heads_come_from_the_newest_comment(self):
         prs = [{"number": 7}, {"number": 8}]
         comments = [
             coord_comment(1, 7, 30, {"kind": "review-substitute", "pr": 7, "head": "old"}),
             coord_comment(2, 7, 10, {"kind": "review-substitute", "pr": 7, "head": "new"}),
         ]
-        snapshot.attach_substitute_reviews(prs, comments)
-        self.assertEqual([p["substituteReviewHead"] for p in prs], ["new", None])
+        snapshot.attach_head_records(prs, comments, REPO)
+        self.assertEqual([p["reviewedHead"] for p in prs], ["new", None])
+
+    def test_only_a_trusted_user_can_attest(self):
+        self.assertEqual(snapshot.trusted_attesters("example-owner/example-repo"), frozenset({"alex-bridges"}))
+        self.assertTrue(snapshot.trusted_attestation(ALEX, REPO))
+        self.assertTrue(snapshot.trusted_attestation({"login": "Alex-Bridges"}, REPO), "logins are case-insensitive")
+        for author in ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"},
+                       {"login": "inisa-sidechain[bot]", "type": "Bot"},
+                       {"login": "github-actions[bot]", "type": "Bot"},
+                       {"login": "mallory", "type": "User"},
+                       {"login": "alex-bridges", "type": "Bot"},
+                       {"login": "alex-bridges[bot]"},
+                       {"login": ""}, {}, None):
+            with self.subTest(author=author):
+                self.assertFalse(snapshot.trusted_attestation(author, REPO))
+
+    def test_the_snapshot_keeps_each_comment_s_author(self):
+        class Fake:
+            def rest_paginated(self, path):
+                return [{"id": 3, "issue_url": "https://api.github.com/repos/o/r/issues/7", "created_at": t(5),
+                         "html_url": "u", "user": {"login": "inisa-sidechain[bot]", "type": "Bot"},
+                         "body": marker.compose("x", {"kind": "review-clean", "pr": 7, "head": "h"})}]
+
+        [comment] = snapshot.fetch_coord_comments(Fake(), NOW)
+        self.assertEqual(comment["author"], {"login": "inisa-sidechain[bot]", "type": "Bot"})
+
+    HEAD = "abc" + "0" * 37  # the fake PR's current head
+
+    def run_attestation(self, argv):
+        """Run an attestation command against a fake PR whose head is HEAD; return
+        (exit code, the calls made, stderr)."""
+        calls = []
+
+        class Fake:
+            repo, owner, name = "o/r", "o", "r"
+
+            def rest(self, path, method="GET", body=None):
+                calls.append((method, path, body))
+                return {"head": {"sha": CodexRoundThreeTests.HEAD}} if method == "GET" else {"html_url": "h"}
+
+        args = cli.parser().parse_args(argv)
+        out, err = io.StringIO(), io.StringIO()
+        saved = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = out, err
+        try:
+            code = args.func(args, Fake())
+        finally:
+            sys.stdout, sys.stderr = saved
+        return code, calls, err.getvalue()
+
+    def run_review(self, argv):
+        """Run an attestation that must succeed; return the calls made and the posted
+        record's payload and text."""
+        code, calls, err = self.run_attestation(argv)
+        self.assertEqual(code, 0, err)
+        [body] = [body["body"] for method, path, body in calls if path == "repos/{repo}/issues/101/comments"]
+        return calls, marker.decode(body), marker.strip(body)
+
+    def test_every_attestation_records_the_full_head_it_names(self):
+        for argv, kind in ((["train", "review", "101", "--by", "x", "--note", "n"], "review-clean"),
+                           (["train", "substitute-review", "101", "--note", "n"], "review-clean"),
+                           (["train", "approve", "101", "--note", "n"], "alex-approve")):
+            for given in (self.HEAD, self.HEAD.upper()):
+                with self.subTest(command=argv[1], head=given):
+                    _, payload, _ = self.run_review(argv[:3] + ["--head", given] + argv[3:])
+                    self.assertEqual((payload["kind"], payload["head"]), (kind, self.HEAD))
+
+    def test_every_attestation_refuses_a_head_the_pr_has_moved_past(self):
+        moved = "def" + "1" * 37
+        for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
+                     ["train", "substitute-review", "101", "--note", "n"],
+                     ["train", "approve", "101", "--note", "n"]):
+            with self.subTest(command=argv[1]):
+                code, calls, err = self.run_attestation(argv[:3] + ["--head", moved] + argv[3:])
+                self.assertEqual(code, cli.EXIT_CONFLICT)
+                self.assertEqual([c for c in calls if c[0] != "GET"], [], "nothing posted, no label")
+                self.assertIn(self.HEAD, err)
+                self.assertIn(moved, err)
+                self.assertIn("head moved", err)
+
+    def test_every_attestation_needs_the_full_head(self):
+        # A prefix can be matched by a commit ground to share it (about 2^28 hashes for 7
+        # digits; Codex P1 on #1054), so only the full 40-character SHA is accepted.
+        for argv in (["train", "review", "101", "--by", "x", "--note", "n"],
+                     ["train", "substitute-review", "101", "--note", "n"],
+                     ["train", "approve", "101", "--note", "n"]):
+            for head in (None, "abc0000", self.HEAD[:39], self.HEAD + "0", "not-a-sha"):
+                with self.subTest(command=argv[1], head=head):
+                    full = argv if head is None else argv[:3] + ["--head", head] + argv[3:]
+                    err = io.StringIO()
+                    saved, sys.stderr = sys.stderr, err
+                    try:
+                        with self.assertRaises(SystemExit) as raised:
+                            cli.parser().parse_args(full)
+                    finally:
+                        sys.stderr = saved
+                    self.assertEqual(raised.exception.code, cli.EXIT_USAGE)
+                    if head is not None:
+                        self.assertIn("give the full 40-character SHA", err.getvalue())
+
+    def test_a_prefix_never_matches_the_head_even_past_the_parser(self):
+        calls = []
+
+        class Fake:
+            def rest(self, path, method="GET", body=None):
+                calls.append((method, path))
+                return {"head": {"sha": CodexRoundThreeTests.HEAD}}
+
+        err = io.StringIO()
+        saved, sys.stderr = sys.stderr, err
+        try:
+            self.assertIsNone(cli.attested_head(Fake(), 101, "abc0000"))
+            self.assertEqual(cli.attested_head(Fake(), 101, self.HEAD), self.HEAD)
+        finally:
+            sys.stderr = saved
+        self.assertIn("give the full 40-character SHA of the head you reviewed or approved, not a prefix",
+                      err.getvalue())
+
+    def test_train_review_records_the_head_and_the_reviewing_agent(self):
+        calls, payload, text = self.run_review(["train", "review", "101", "--head", self.HEAD, "--by", "agy@h:gemini",
+                                                "--note", "all clear"])
+        self.assertEqual((payload["kind"], payload["pr"], payload["head"], payload["by"]),
+                         ("review-clean", 101, "abc" + "0" * 37, "agy@h:gemini"))
+        self.assertIn("by `agy@h:gemini`", text)
+        self.assertIn("all clear", text)
+        self.assertNotIn("quota", text)
+        comment = calls.index(("POST", "repos/{repo}/issues/101/comments",
+                               {"body": marker.compose(text, payload)}))
+        label = calls.index(("POST", "repos/{repo}/issues/101/labels", {"labels": ["reviewed"]}))
+        self.assertLess(comment, label, "the record the train reads comes before the label")
+        self.assertFalse(any("codex-unavailable" in json.dumps(body) for _, _, body in calls), "a retired label")
+
+    def test_substitute_review_is_the_same_command_by_its_old_name(self):
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", self.HEAD, "--note", "by X"])
+        self.assertEqual((payload["kind"], payload["head"]), ("review-clean", "abc" + "0" * 37))
+        self.assertNotIn("by", payload, "no --by, so no reviewer is named in the record")
+        _, payload, _ = self.run_review(["train", "substitute-review", "101", "--head", self.HEAD, "--by", "codex",
+                                         "--note", "n"])
+        self.assertEqual(payload["by"], "codex")
+
+    def test_train_review_needs_the_reviewing_agent(self):
+        with open(os.devnull, "w") as quiet:
+            saved, sys.stderr = sys.stderr, quiet
+            try:
+                with self.assertRaises(SystemExit):
+                    cli.parser().parse_args(["train", "review", "101", "--head", self.HEAD, "--note", "n"])
+            finally:
+                sys.stderr = saved
 
     def test_release_refuses_when_you_hold_no_claim(self):
         posted = []

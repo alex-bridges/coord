@@ -1,10 +1,10 @@
 """Reviews on request: `@inisa-sidechain review` in a PR comment gets a review from an
 agent on the CI box, posted by the inisa-sidechain GitHub App.
 
-Why: Codex reviews every PR, and when its quota runs out the train stops (a PR needs
-Codex's 👍 on its head, or a substitute review of that head). Until now a substitute review
-was an agent's own adversarial pass, recorded by hand (`coord train substitute-review`).
-This makes it a service (Alex, 2026-09-25):
+Why: a PR reaches the train with Codex's 👍 on its head or a clean review of that head by
+any agent (#1054). Codex runs out of quota; until now the other review was an agent's own
+adversarial pass, recorded by hand (`coord train review`). This makes it a service (Alex,
+2026-09-25):
 
     @inisa-sidechain review              Opus, the default
     @inisa-sidechain review fable        or sonnet, haiku; `model=fable` works too
@@ -27,15 +27,18 @@ This makes it a service (Alex, 2026-09-25):
 - **The verdict is code's.** Pass means no P0, P1 or P2 finding (Alex, 2026-09-25); P3
   notes are listed and do not block. A finding with an unknown severity counts as P2.
 - **Posting.** The app posts the review as `inisa-sidechain[bot]`, with a `review` marker
-  naming the PR, head, model and verdict. Nothing about a review is ever posted as Alex:
-  when the app cannot mint a token the job waits and is retried, never sent another way
-  (#1035's no-fallback rule).
-- **When a pass counts for the train.** Only while Codex is out: Codex posted its quota
-  notice on this PR after the reviewed head was pushed (`pushed_at`), or a `codex-review` outage is
-  in force. Then the app also posts the `review-substitute` record for that head and
-  labels the PR `codex-unavailable`, which is what the train accepts today
-  (train.assess). Otherwise the review is advice and the PR still needs Codex's 👍, so a
-  tag can never route round Codex while Codex works.
+  naming the PR, head, model and verdict. When the app cannot mint a token the job waits
+  and is retried, never sent another way (#1035's no-fallback rule).
+- **A pass is a clean review.** The train counts a clean review of the head by any agent
+  (#1054), recorded as a `review-clean` comment that only a trusted user's comment makes
+  count, never a bot's. So for a pass, this code (not the model) records it the way
+  `coord train review` does, on Alex's identity (`GitHub.as_user`), `by` the reviewer. A
+  pass does not count when an earlier review of the same head by this app requested
+  changes, or when the PR's base moved during the run.
+- **A blocking verdict holds the head.** Any `changes` review this app posted holds that
+  head in the train, Codex's 👍 notwithstanding (train.assess, train_step.train_added).
+  If a clean review of that head was recorded, a newer record naming no head withdraws it,
+  posted after the blocking review so the head is never left merely unreviewed.
 - **Bounds.** One review per (PR, head, model); at most CONDUCTOR_MAX_REVIEWS_PER_DAY (8)
   runs a day; a run is stopped after CONDUCTOR_REVIEW_TIMEOUT (45 min); a job that fails
   three times gets a reply saying so; none run while Claude is out of usage or the
@@ -59,7 +62,7 @@ import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import marker, outage, review, snapshot, train
+from . import marker, review, snapshot, train
 from .gh import AppAuthError, GitHub, GitHubError, redact
 
 APP_LOGIN = snapshot.SIDECHAIN_LOGIN
@@ -72,12 +75,6 @@ SEVERITIES = ("P0", "P1", "P2", "P3")
 MAX_REVIEWS_PER_DAY = 8
 REVIEW_TIMEOUT_SECONDS = 45 * 60
 MAX_ATTEMPTS = 3
-CODEX_OUT = "reached your Codex usage limits"
-CODEX_LOGINS = ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector")
-CODEX_HARNESS = "codex-review"
-# Who may declare a codex-review outage that authorizes a substitute: Alex's login (every
-# agent posts as it) and this app (coord in app mode). Not any commenter (Codex on #1049).
-OUTAGE_AUTHORS = ("alex-bridges", snapshot.SIDECHAIN_LOGIN)
 KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
 # Directories never copied into the reviewer's view of the PR: Claude Code loads agents,
@@ -247,36 +244,26 @@ def verdict(findings: List[Dict[str, Any]]) -> str:
     return "changes" if any(f["severity"] in BLOCKING for f in findings) else "pass"
 
 
-def codex_out(pr_comments: List[Dict[str, Any]], head_time: Optional[dt.datetime],
-              windows: List[Dict[str, Any]], now: dt.datetime) -> bool:
-    """Is Codex out for this head? Its quota notice on the PR after the head was
-    committed (the notice's author is Codex's bot, which no agent can post as), or a
-    `codex-review` outage in force."""
-    if any(w["harness"] == CODEX_HARNESS for w in outage.active(windows, now)):
-        return True
-    if head_time is None:
-        return False  # we cannot tell when the head arrived: never count on a guess
-    for comment in pr_comments:
-        login = (comment.get("user") or {}).get("login") or ""
-        posted = _time(comment.get("created_at"))
-        if login in CODEX_LOGINS and CODEX_OUT in (comment.get("body") or "") and posted is not None \
-                and posted >= head_time:
-            return True
-    return False
-
-
-def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: str) -> Optional[str]:
+def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: str, repo: str) -> Optional[str]:
     """The link to a review this app already posted for (pr, head, model), or None. Read
     from the PR, not local state, so a conductor that takes over the lead does not run
     and bill the same review again (Codex on #1049)."""
     for comment in pr_comments:
-        if (comment.get("user") or {}).get("login") != APP_LOGIN:
-            continue
         payload = marker.decode(comment.get("body")) or {}
-        if payload.get("kind") in ("review", "review-substitute") and payload.get("pr") == pr \
-                and payload.get("head") == head and payload.get("model") == model:
+        if ours(comment, payload, repo) and payload.get("pr") == pr and payload.get("head") == head \
+                and payload.get("model") == model:
             return comment.get("html_url") or ""
     return None
+
+
+def ours(comment: Dict[str, Any], payload: Dict[str, Any], repo: str) -> bool:
+    """A record this module wrote: a `review` the app posted, or a `review-clean` it recorded
+    on Alex's identity for a pass (it names the request; `coord train review` does not)."""
+    login = (comment.get("user") or {}).get("login")
+    if payload.get("kind") == "review":
+        return login == APP_LOGIN
+    return payload.get("kind") == "review-clean" and payload.get("request") is not None \
+        and snapshot.trusted_attestation(snapshot.comment_author(comment), repo)
 
 
 def blocked_head(pr_comments: List[Dict[str, Any]], pr: int, head: str) -> Optional[str]:
@@ -292,27 +279,28 @@ def blocked_head(pr_comments: List[Dict[str, Any]], pr: int, head: str) -> Optio
     return None
 
 
-def answered(comments: List[Dict[str, Any]]) -> set:
+def answered(comments: List[Dict[str, Any]], repo: str) -> set:
     """Request ids this app has already answered (every reply names its request)."""
     ids = set()
     for comment in comments:
-        if (comment.get("user") or {}).get("login") == APP_LOGIN:
-            payload = marker.decode(comment.get("body")) or {}
-            # A substitute record names its request too: posted before the review, it is the
-            # one durable trace if a leader died between the two (Codex on #1049).
-            # Not a withdrawal (head ""): it precedes a blocking review still to be posted.
-            if payload.get("request") is not None and (payload.get("kind") == "review" or (
-                    payload.get("kind") == "review-substitute" and payload.get("head"))):
-                ids.add(payload["request"])
+        payload = marker.decode(comment.get("body")) or {}
+        # A pass's review-clean record names its request too: posted before the review, it is
+        # the one durable trace if a leader died between the two (Codex on #1049). Not a
+        # withdrawal (head ""), which follows its blocking review.
+        if ours(comment, payload, repo) and payload.get("request") is not None \
+                and (payload.get("kind") == "review" or payload.get("head")):
+            ids.add(payload["request"])
     return ids
 
 
-def substitute_head(pr_comments: List[Dict[str, Any]], pr: int) -> Optional[str]:
-    """The head the PR's newest review-substitute record names (what the train reads)."""
+def reviewed_head(pr_comments: List[Dict[str, Any]], pr: int, repo: str) -> Optional[str]:
+    """The head the PR's newest trusted clean-review record names: what the train reads
+    (snapshot.attach_head_records' rule)."""
     head = None
     for comment in pr_comments:  # oldest first
         payload = marker.decode(comment.get("body")) or {}
-        if payload.get("kind") == "review-substitute" and payload.get("pr") == pr:
+        if snapshot.HEAD_RECORDS.get(payload.get("kind")) == "reviewedHead" and payload.get("pr") == pr \
+                and snapshot.trusted_attestation(snapshot.comment_author(comment), repo):
             head = payload.get("head")
     return head
 
@@ -325,13 +313,12 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
     if request.get("url"):
         lines.append(f"Requested in {request['url']}. Pass means no P0, P1 or P2 finding; P3 notes do not block.")
     if passed:
-        lines.append("This counts as the substitute review for this head (Codex is out of quota), so the train "
-                     "accepts it." if counts_for_train else
+        lines.append("Recorded as a clean review of this head (`review-clean`), which the train accepts like "
+                     "Codex's 👍; a new push needs a new review." if counts_for_train else
                      f"This does not count for the train: an earlier review of this head requested changes "
                      f"({blocked_by}). Push a fix; a pass by another model does not answer those findings."
                      if blocked_by and blocked_by.startswith("http") else
-                     f"This does not count for the train: {blocked_by}." if blocked_by else
-                     "This is advice: Codex is not out of quota for this head, so the PR still needs Codex's 👍.")
+                     f"This does not count for the train: {blocked_by}.")
     lines.append("")
     if result.get("summary"):
         lines += [result["summary"], ""]
@@ -449,19 +436,6 @@ def run_settings(home: str, deny: List[str], reviews_root: str = "") -> Dict[str
     }
 
 
-def pushed_at(check_suites: List[Dict[str, Any]], branch: str) -> Optional[dt.datetime]:
-    """When the head last reached this PR's branch: the latest check suite GitHub created
-    for the sha ON THAT BRANCH (a push starts them). Not the committer date, which the author sets,
-    and not a suite from another branch the same commit was pushed to earlier (reviews of
-    #1049). None when there is none: then a pass does not count for the train."""
-    times = [t for t in (_time(s.get("created_at")) for s in check_suites if s.get("head_branch") == branch)
-             if t is not None]
-    # The latest, not the first: a head pushed, replaced and pushed again keeps its old suite,
-    # and a quota notice from between the two pushes must not count (Codex on #1049). A later
-    # suite from a dispatch only makes a notice count less, never more.
-    return max(times) if times else None
-
-
 # MARK: - The job (run by the watcher)
 
 
@@ -491,7 +465,7 @@ class Reviews:
         """On taking the lead: remember the requests of the last FRESH hours that this app has
         not answered. The last leader may have seen them, and a wake moved the shared inbox
         cursor past them, before it died with them in its own state (Codex on #1049)."""
-        done = answered(issue_comments)
+        done = answered(issue_comments, self.w.gh.repo)
         self.remember([c for c in issue_comments if c.get("id") not in done])
         for key, record in self.state.items():
             # Answered on GitHub but still pending here (a crash after the post, before the state
@@ -559,21 +533,6 @@ class Reviews:
         except GitHubError as error:
             self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
 
-    def outage_records(self) -> List[Dict[str, Any]]:
-        """The conductor issue's records as they are now, read with the app: an outage ended
-        during the run must not count (Codex on #1049). The tick's copy only if there is no
-        issue to read."""
-        from . import conductor
-        issue = getattr(self.w, "issue", None)
-        if not isinstance(issue, int):
-            # Below the hard floor the watcher reads nothing, but it remembers the issue.
-            state = getattr(self.w, "state", None)
-            issue = state.get("issue") if isinstance(state, dict) else None
-        if isinstance(issue, int):
-            return conductor.coord_comments(self.app.rest_paginated(f"repos/{{repo}}/issues/{issue}/comments?per_page=100"))
-        records = getattr(self.w, "records", None)
-        return records if isinstance(records, list) else []
-
     def may_run(self) -> str:
         """Why a new model run may not start now, or ""."""
         if getattr(self, "blocked", ""):
@@ -619,7 +578,7 @@ class Reviews:
             return
         if not record.get("posting"):
             comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
-            earlier = posted_review(comments, request["pr"], head, request["model"])
+            earlier = posted_review(comments, request["pr"], head, request["model"], self.app.repo)
             if earlier is not None:
                 self.reply(request, f"`{head[:9]}` was already reviewed with {request['model']}: {earlier}. "
                                     f"Push a new head or name another model. ({request['url']})")
@@ -645,7 +604,7 @@ class Reviews:
                 # on from here instead of running the review again (review of 58ac99de; Codex).
                 record["finished"] = finished
             # Composed again on every attempt until something is posted, so whether a pass
-            # counts is decided on the outage and notices as they are then (Codex on #1049).
+            # counts is decided on the PR's state as it is then (Codex on #1049).
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
         self.publish(request, record, posting, key)
@@ -708,12 +667,9 @@ class Reviews:
 
     def compose(self, request: Dict[str, Any], pr: Dict[str, Any], finished: Dict[str, Any],
                 windows: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """The finished review as it will be posted: does it count for the train, and does it
-        withdraw an earlier substitute record?"""
-        now = self.w.now
+        """The finished review as it will be posted: does a pass count as the head's clean
+        review, and does a blocking verdict withdraw one already recorded?"""
         head, found, outcome, run = finished["head"], finished["found"], finished["verdict"], finished["run"]
-        suites = self.app.rest(f"repos/{{repo}}/commits/{head}/check-suites?per_page=100") or {}
-        head_time = pushed_at(suites.get("check_suites") or [], (pr.get("head") or {}).get("ref") or "")
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
         # The diff reviewed was head against this base. If the PR's base moved or it was
@@ -721,61 +677,62 @@ class Reviews:
         current = self.app.rest(f"repos/{{repo}}/pulls/{request['pr']}") or {}
         if outcome == "pass" and finished.get("base") and base_of(current) != finished["base"]:
             blocked_by = blocked_by or f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
-        # The time and outages as they are now, after a run that may have taken 45 minutes, not
-        # at the tick's start; and only outages declared by a trusted author (Codex on #1049).
-        records = self.outage_records()
-        trusted = [c for c in records if ((c.get("author") or {}).get("login")) in OUTAGE_AUTHORS]
-        counts = outcome == "pass" and not blocked_by and codex_out(comments, head_time, outage.windows(trusted),
-                                                                    snapshot.now_utc())
-        # A blocking review of a head that a substitute review passed withdraws that pass;
-        # otherwise the train would still take the head (Codex on #1049).
-        revoke = outcome != "pass" and substitute_head(comments, request["pr"]) == head
+        counts = outcome == "pass" and not blocked_by
+        # A blocking review of a head whose clean review is recorded withdraws that record;
+        # the blocking marker holds the head in the train either way (Codex on #1049).
+        revoke = outcome != "pass" and reviewed_head(comments, request["pr"], self.app.repo) == head
         body, payload = render(request["pr"], head, request["model"], found, outcome, request, counts, run,
                                blocked_by or "")
         return {"head": head, "body": body, "payload": payload, "counts": counts, "verdict": outcome,
                 "revoke": revoke}
 
     def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
-        """Post a finished review. Order: a withdrawal of an older substitute first (a blocking
-        verdict is never out while it stands); for a pass that counts, the label and the
-        substitute record; the review itself last, so a posted review means every step before
-        it happened, which is what a new leader's rescan relies on (Codex on #1049). Each step
-        is remembered, so a retry repeats none that succeeded; once one has, the decision is
-        frozen (`started`)."""
+        """Post a finished review. For a pass that counts: the `reviewed` label, the
+        `review-clean` record (on Alex's identity: the train counts no bot's), then the review
+        (so a posted review means every step before it happened, which a new leader's rescan
+        relies on). For a blocking verdict: the review first (its marker holds the head),
+        then the withdrawal of a recorded clean review of that head. Each step is remembered,
+        so a retry repeats none that succeeded; once one has, the decision is frozen
+        (`started`)."""
         now = self.w.now
         head = posting["head"]
-        comments = f"repos/{{repo}}/issues/{request['pr']}/comments"
-        if posting.get("revoke") and not posting.get("revoked"):
-            self.app.rest(comments, method="POST", body={"body": marker.compose(
-                f"**Substitute review withdrawn** for head `{head[:9]}`: a later review found blocking "
-                "findings (posted next). The train holds this head until a new push is reviewed.",
-                {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
-                 "revokes": head, "request": request["id"]})})
-            posting.update(revoked=True, started=True)
         if posting["counts"] and not posting.get("labelled"):
-            # First, and not `started`: the label alone lets the train take nothing, and a
-            # substitute record then always has its label (a takeover in between; Codex).
+            # Informational (#1054), and not `started`: the label alone lets the train take nothing.
             self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
-                          body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
+                          body={"labels": [train.REVIEWED_LABEL]})
             posting["labelled"] = True
         if posting["counts"] and not posting.get("recorded"):
-            self.app.rest(comments, method="POST", body={"body": marker.compose(
-                f"**Substitute review** of head `{head[:9]}` (Codex out of quota): the review follows, "
-                f"requested in {request.get('url') or 'a comment'}.\n\n"
-                "This stands in for Codex's 👍 on this head only; a new push needs a new review.",
-                {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
-                 "model": request["model"], "request": request["id"]})})
+            self.attest(request, head, f"**Clean review** of head `{head[:9]}` by `{self.agent()}` "
+                                       f"({request['model']}), recorded by coord's reviewer: the review follows, "
+                                       f"requested in {request.get('url') or 'a comment'}.\n\n"
+                                       "It counts as the review of this head only; a new push needs a new review.",
+                        {"head": head, "model": request["model"]})
             posting.update(recorded=True, started=True)
         if not posting.get("url"):
             posted = self.reply(request, posting["body"], posting["payload"])
             posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"), started=True)
         link = posting["url"]
+        if posting.get("revoke") and not posting.get("revoked"):
+            self.attest(request, head, f"**Clean review withdrawn** for head `{head[:9]}`: a later review "
+                                       f"requested changes ({link}). A new push needs a new review.",
+                        {"head": "", "revokes": head})
+            posting.update(revoked=True)
         self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
         record.pop("posting", None)
         record.pop("finished", None)
         record.update(status="done", at=snapshot.iso(now), url=link, verdict=posting["verdict"])
         self.w.say(f"reviewed #{request['pr']} at {head[:9]} with {request['model']}: {posting['verdict']}"
-                   + (" (counts for the train)" if posting["counts"] else "") + f" {link}")
+                   + (" (recorded as the head's clean review)" if posting["counts"] else "") + f" {link}")
+
+    def attest(self, request: Dict[str, Any], head: str, text: str, fields: Dict[str, Any]) -> None:
+        """A `review-clean` record on Alex's identity, as `coord train review` posts it: the
+        train counts attestations only from a trusted user (#1054). The verdict behind it is
+        this module's rule applied to a real run, never the model's say."""
+        gh = self.w.user_gh_factory()
+        payload = {"kind": "review-clean", "v": 1, "agent": self.agent(), "pr": request["pr"],
+                   "by": self.agent(), "request": request["id"], **fields}
+        gh.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST",
+                body={"body": marker.compose(text, payload)})
 
     def restore_checkout(self, was_clean: bool) -> None:
         """Undo whatever a review run left in the conductor's checkout. The guard confines its

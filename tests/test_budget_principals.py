@@ -391,7 +391,7 @@ class GateTests(PrincipalTestCase):
         self.feed(now + 1803, 2500)  # the app is spent; Alex is not
         self.feed(now + 1800, 100, principal=budget.USER)
         gh = GitHub(REPO, app=FakeApp(self.server), transport="gh")
-        code, _, err = self.run_cli(["train", "approve", "101", "--note", "Alex said so"], gh)
+        code, _, err = self.run_cli(["train", "approve", "101", "--head", "a" * 40, "--note", "Alex said so"], gh)
         self.assertEqual(code, EXIT_OK, err)
         self.assertEqual(self.server.requests, [], "an attestation never goes through the app")
 

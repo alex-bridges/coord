@@ -241,10 +241,12 @@ class Step:
 
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
         """The newest train-add marker on the PR (when it joined, at which head, by whom).
-        Also sets on `pr` the heads its newest review-substitute and alex-approve comments
-        name, who added it (`trainAddedBy`), the (head, hold class) of every `held`
-        notice the train has posted on it (`heldNotices`), and `overtakenBy`: the light
-        batch that went ahead of it since it joined, if any."""
+        Also sets on `pr` the heads its newest clean-review (review-clean, or the older
+        review-substitute) and alex-approve comments name, counting only those a trusted
+        user posted (snapshot.trusted_attestation, the snapshot's own rule), who added it
+        (`trainAddedBy`), the (head, hold class) of every `held` notice the train has
+        posted on it (`heldNotices`), and `overtakenBy`: the light batch that went ahead
+        of it since it joined, if any."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
         held = set()
@@ -256,12 +258,13 @@ class Step:
                 continue
             blocks = snapshot.sidechain_blocks(comment, payload)
             if blocks:
-                blocked.add(blocks)  # a withdrawal's `head` is empty: the SHA it returns is the one  # the PR's whole history, not a comment window (Codex on #1049)
+                blocked.add(blocks)  # from the PR's whole history, not a comment window (Codex on #1049)
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
-                pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
+                if snapshot.trusted_attestation(snapshot.comment_author(comment), self.gh.repo):
+                    pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
             elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
             elif payload.get("event") == train.OVERTAKEN_EVENT and self.own_record(comment, payload):
@@ -619,7 +622,7 @@ class Step:
             elif train.TRAIN_LABEL not in pr["labels"]:
                 problem = "was taken out of the train"
             else:
-                self.train_added(pr)  # refresh the substitute-review head for the final check
+                self.train_added(pr)  # refresh the recorded-review and approval heads for the final check
                 verdict, hold, reason = train.assess(pr, all_files=self.all_files(pr))
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"

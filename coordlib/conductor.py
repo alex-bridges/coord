@@ -458,7 +458,7 @@ def coord_comments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if payload is not None:
             out.append({"id": comment.get("id"), "createdAt": comment.get("created_at"), "url": comment.get("html_url"),
                         "text": marker.strip(comment.get("body") or ""), "payload": payload,
-                        "author": {"login": (comment.get("user") or {}).get("login")}})
+                        "author": snapshot.comment_author(comment)})
     return sorted(out, key=lambda c: c["id"] or 0)
 
 
@@ -523,6 +523,7 @@ class Watcher:
         self.dry_run = False
         self.issue_comments: Optional[List[Dict[str, Any]]] = None
         self.app_gh_factory: Callable[[], Optional[GitHub]] = self.default_app_gh
+        self.user_gh_factory: Callable[[], GitHub] = self.default_user_gh
 
     def say(self, text: str) -> None:
         self.lines.append(text)
@@ -809,6 +810,12 @@ class Watcher:
         app_gh = GitHub(self.gh.repo)
         cli.attach_app(app_gh)
         return app_gh if app_gh.app is not None else None
+
+    def default_user_gh(self) -> GitHub:
+        """A GitHub on Alex's identity, for the one record a review makes as him: a pass's
+        `review-clean`, which the train counts only from a trusted user (#1054), as the
+        attestation commands post it (cli.ATTESTATIONS)."""
+        return GitHub(self.gh.repo)
 
     def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
                     pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None,

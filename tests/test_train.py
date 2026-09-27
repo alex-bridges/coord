@@ -25,13 +25,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
-from test_coord import BOT, NOW, REAL_FAILURE, check, codex_summary, pr_node, reaction, refused_check  # noqa: E402
+from test_coord import (ALEX, BOT, NOW, REAL_FAILURE, REPO, check, codex_summary, coord_comment, pr_node,  # noqa: E402
+                        reaction, refused_check)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
 LIGHT_PATH = ".claude/skills/x.md"  # the docs lane only, and not one of train.ALEX_ONLY_PATHS
+# Who posted an attestation record, and whether it counts (snapshot.trusted_attestation):
+# only the repository's owner, never a bot or another user (Codex P1 on #1054).
+ATTESTERS = ((ALEX, True),
+             ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"}, False),
+             ({"login": "inisa-sidechain[bot]", "type": "Bot"}, False),
+             ({"login": "mallory", "type": "User"}, False))
+FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
 
 
 def checkout_file(path: str) -> str:
@@ -84,17 +92,91 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
-        unavailable = dict(pr, codex={"approved": False, "reviewing": False}, labels=["train", "codex-unavailable"])
-        self.assertEqual(train.eligibility(dict(unavailable, substituteReviewHead=pr["head"]))[0], train.READY)
-        verdict, reason = train.eligibility(dict(unavailable, substituteReviewHead="0" * 40))
-        self.assertEqual(verdict, train.HOLD, "a substitute review of an OLDER head does not cover a new push")
-        self.assertIn("substitute review", reason)
-        self.assertEqual(train.eligibility(unavailable)[0], train.HOLD, "the label alone is not a review")
         self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings")
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": ["Android"], "pending": [], "verdict": "failure"}))[0],
                          train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": [], "pending": ["x"], "verdict": "pending"}))[0],
                          train.READY)
+
+    def unreviewed(self, **fields):
+        """A summary with no Codex 👍, no labels but `train`, and `fields` on top."""
+        return dict(dict(self.summary(), codex={"approved": False, "reviewing": False}, labels=["train"]), **fields)
+
+    def test_a_clean_review_by_any_agent_at_the_head_counts_without_a_label(self):
+        pr = self.unreviewed()
+        self.assertEqual(train.eligibility(dict(pr, reviewedHead=pr["head"])), (train.READY, "ready"))
+
+    def test_a_clean_review_of_an_older_head_does_not_count(self):
+        pr = self.unreviewed(reviewedHead="0" * 40)
+        verdict, hold, reason = train.assess(pr)
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW), "a new push needs a new review")
+        self.assertIn("covers 000000000, an older head", reason)
+
+    def test_no_codex_thumbs_up_and_no_recorded_review_holds(self):
+        verdict, hold, reason = train.assess(self.unreviewed())
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NO_REVIEW))
+        self.assertIn("no clean review of it recorded", reason)
+        self.assertIn("coord train review 1 --head <full-reviewed-sha> --by <agent>", reason)
+        self.assertIn("current head aaaaaaaaa", reason, "the held head is named, outside the command")
+        self.assertNotIn("--head aaaaaaa", reason, "never pre-filled with the current head")
+        self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
+
+    def test_codex_re_reviewing_still_holds_a_recorded_review(self):
+        pr = dict(self.unreviewed(), codex={"approved": False, "reviewing": True})
+        self.assertEqual(train.eligibility(dict(pr, reviewedHead=pr["head"])), (train.HOLD, "Codex is re-reviewing it"))
+
+    def test_a_record_of_either_kind_sets_the_reviewed_head(self):
+        head = "a" * 40
+        for kind, labels in (("review-clean", ["train"]),
+                             # Recorded by `substitute-review` before 2026-09-26, with the old label.
+                             ("review-substitute", ["train", "codex-unavailable"])):
+            with self.subTest(kind=kind):
+                pr = self.unreviewed(labels=labels)
+                snapshot.attach_head_records([pr], [coord_comment(1, 1, 5, {"kind": kind, "pr": 1, "head": head})], REPO)
+                self.assertEqual(pr["reviewedHead"], head)
+                self.assertEqual(train.eligibility(pr), (train.READY, "ready"))
+
+    def test_the_newest_record_of_either_kind_wins(self):
+        pr = self.unreviewed()
+        snapshot.attach_head_records([pr], [
+            coord_comment(1, 1, 30, {"kind": "review-clean", "pr": 1, "head": pr["head"]}),
+            coord_comment(2, 1, 10, {"kind": "review-substitute", "pr": 1, "head": "0" * 40})], REPO)
+        self.assertEqual(train.eligibility(pr)[0], train.HOLD, "the newer record names an older head")
+
+    def test_only_the_owner_s_records_attest_in_the_snapshot(self):
+        head = "a" * 40
+        for author, counts in ATTESTERS:
+            with self.subTest(author=author["login"]):
+                review = self.unreviewed()
+                snapshot.attach_head_records([review], [coord_comment(
+                    1, 1, 5, {"kind": "review-clean", "pr": 1, "head": head}, author)], REPO)
+                self.assertEqual(train.eligibility(review)[0], train.READY if counts else train.HOLD)
+                # Alex's approval: the same code path, and the same rule.
+                approval = dict(self.summary(), labels=["train", "needs-alex", "alex-approved"])
+                snapshot.attach_head_records([approval], [coord_comment(
+                    1, 1, 5, {"kind": "alex-approve", "pr": 1, "head": head}, author)], REPO)
+                self.assertEqual(train.assess(approval)[:2], (train.READY, "") if counts else
+                                 (train.HOLD, train.HOLD_NEEDS_ALEX))
+
+    def test_a_record_counts_only_on_the_pr_it_names(self):
+        # A trusted record posted on #5 that names #7 is not a record on #7 (the step
+        # reads only #7's own comments, so the snapshot must agree).
+        for kind, labels in (("review-clean", ["train"]), ("alex-approve", ["train", "needs-alex", "alex-approved"])):
+            with self.subTest(kind=kind):
+                pr = self.unreviewed(number=7, labels=labels)
+                if kind == "alex-approve":
+                    pr["codex"] = {"approved": True}
+                snapshot.attach_head_records([pr], [coord_comment(
+                    1, 5, 5, {"kind": kind, "pr": 7, "head": pr["head"]})], REPO)
+                self.assertEqual((pr["reviewedHead"], pr["alexApprovedHead"]), (None, None))
+                self.assertEqual(train.eligibility(pr)[0], train.HOLD)
+
+    def test_an_untrusted_record_never_displaces_a_trusted_one(self):
+        pr = self.unreviewed()
+        snapshot.attach_head_records([pr], [
+            coord_comment(1, 1, 30, {"kind": "review-clean", "pr": 1, "head": pr["head"]}),
+            coord_comment(2, 1, 10, {"kind": "review-clean", "pr": 1, "head": "0" * 40}, ATTESTERS[2][0])], REPO)
+        self.assertEqual(pr["reviewedHead"], pr["head"])
 
     def summary_with_checks(self, *checks):
         node = ready_node(1, "a" * 40, "b")
@@ -580,6 +662,79 @@ class StepTests(unittest.TestCase):
                 if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
                                                                                      "state_reason": "completed"}]
 
+    @staticmethod
+    def review_record(head, author=FAKE_OWNER):
+        """A clean review of `head` as `coord train review` posts it, authored by `author`."""
+        return {"created_at": snapshot.iso(NOW), "user": dict(author), "body": marker.compose("reviewed", {
+            "kind": "review-clean", "v": 1, "agent": "claude@h:w", "by": "claude@h:reviewer", "pr": 1, "head": head})}
+
+    def queue_reviewed(self, head, reviewed_head, author=FAKE_OWNER):
+        """PR 1 queued at `head` with no Codex 👍 and no label but `train`, and a clean
+        review recorded by `coord train review` naming `reviewed_head`."""
+        node = ready_node(1, head, "pr1")
+        node["reactions"] = {"nodes": []}
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        fake.issue_comments[1].append(self.review_record(reviewed_head, author))
+        return fake
+
+    def test_a_bot_s_record_at_the_head_is_held(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        lines = self.step(self.queue_reviewed(h1, h1, {"login": "inisa-sidechain[bot]", "type": "Bot"})).run()
+        self.assertEqual(self.batch_on_origin(), ("", ""), lines)
+        self.assertTrue(any("#1 held: no Codex" in line and "no clean review" in line for line in lines), lines)
+
+    def test_the_final_check_ignores_a_bot_s_record(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])  # built on Codex's 👍
+        self.run_on(fake, name, tip, conclusion="success")
+        node = ready_node(1, h1, "pr1")
+        node["reactions"] = {"nodes": []}  # the 👍 is gone; only a bot's record remains
+        fake.nodes = [node]
+        fake.issue_comments[1].append(self.review_record(h1, {"login": "chatgpt-codex-connector[bot]", "type": "Bot"}))
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertTrue(any("#1 is no longer ready" in line for line in lines), lines)
+
+    def test_the_final_check_trusts_the_same_authors_as_the_snapshot(self):
+        head = "a" * 40
+        for kind, labels in (("review-clean", ("train",)), ("review-substitute", ("train",)),
+                             ("alex-approve", ("train", "needs-alex", "alex-approved"))):
+            for author, counts in ATTESTERS:
+                with self.subTest(kind=kind, author=author["login"]):
+                    node = ready_node(1, head, "pr1", labels=labels)
+                    if kind != "alex-approve":
+                        node["reactions"] = {"nodes": []}  # the record is its only review
+                    payload = {"kind": kind, "pr": 1, "head": head}
+                    fake = FakeGitHub([node], self.main)
+                    fake.repo = REPO  # trusted_attesters(REPO) is {alex-bridges}
+                    fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW), "user": dict(author),
+                                               "body": marker.compose("record", payload)}]
+                    fresh = snapshot.summarize_pr(node)
+                    self.step(fake).train_added(fresh)
+                    cached = snapshot.summarize_pr(node)
+                    snapshot.attach_head_records([cached], [coord_comment(1, 1, 5, payload, author)], REPO)
+                    self.assertEqual(train.assess(fresh)[0], train.READY if counts else train.HOLD)
+                    self.assertEqual(train.assess(cached), train.assess(fresh))
+
+    def test_a_recorded_clean_review_lands_without_codex_or_a_label(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = self.queue_reviewed(h1, h1)
+        lines = self.step(fake).run()
+        name, tip = self.batch_on_origin()
+        self.assertTrue(name, lines)
+        self.assertEqual([m["pr"] for m in self.members(name)], [1])
+        sh(self.clone, "fetch", "-q", "origin", "+refs/heads/train/*:refs/remotes/origin/train/*")
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()  # the final check reads the record again
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes, lines)
+
+    def test_a_recorded_clean_review_of_an_older_head_is_held(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        lines = self.step(self.queue_reviewed(h1, "0" * 40)).run()
+        self.assertEqual(self.batch_on_origin(), ("", ""), lines)
+        self.assertTrue(any("#1 held: no Codex" in line and "an older head" in line for line in lines), lines)
+
     def test_a_merged_batch_closes_the_issues_its_prs_close(self):
         # pr_node names #55 in closingIssuesReferences; GitHub does not close it for a ref update.
         h1 = self.pr_branch(1, "c.txt", "c\n")
@@ -957,6 +1112,8 @@ class StepTests(unittest.TestCase):
     def test_the_train_creates_the_carve_out_labels(self):
         self.assertIn(train.NEEDS_ALEX_LABEL, train.LABELS)
         self.assertIn(train.ALEX_APPROVED_LABEL, train.LABELS)
+        self.assertIn(train.REVIEWED_LABEL, train.LABELS)
+        self.assertNotIn("codex-unavailable", train.LABELS, "retired: the train no longer reads it")
 
     def test_branch_names_are_encoded_in_run_queries(self):
         fake = FakeGitHub([], self.main)
@@ -1027,7 +1184,9 @@ class StepTests(unittest.TestCase):
         self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
         self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
         self.assertIn("waits for Alex", text, "the reason")
-        self.assertIn("coord train approve 1", text, "the action that clears it")
+        self.assertIn("coord train approve 1 --head <full-sha-Alex-approved>", text, "the action that clears it")
+        self.assertIn(f"at head `{self.H1[:9]}`", text, "the held head is named, outside the command")
+        self.assertNotIn(f"--head {self.H1[:7]}", text, "never pre-filled with the current head")
         [(payload, _)] = self.held(fake, 2)
         self.assertEqual(payload["to"], ["conductor@*"], "no agent on record: the conductor still hears")
 
@@ -1080,6 +1239,22 @@ class StepTests(unittest.TestCase):
             self.assertEqual("@alex-bridges" in text, hold in train.OWNER_HOLDS, hold)
         self.assertEqual(train.OWNER_HOLDS, {"needs-alex", "partial-data"})
 
+    def test_no_notice_pre_fills_the_current_head_into_an_attestation(self):
+        # Copying a pre-filled current head would attest whatever is there now, not the
+        # head that was reviewed or approved (review of #1054 at 7d9213923).
+        fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NO_REVIEW),
+                           self.held_node(2, self.H2, train.HOLD_NEEDS_ALEX)], self.main)
+        self.add(fake, 1, self.H1, 30)
+        self.add(fake, 2, self.H2, 20)
+        self.step(fake).run()
+        for number, head, command in ((1, self.H1, "coord train review 1 --head <full-reviewed-sha> --by <agent>"),
+                                      (2, self.H2, "coord train approve 2 --head <full-sha-Alex-approved>")):
+            with self.subTest(pr=number):
+                [(_, text)] = self.held(fake, number)
+                self.assertIn(command, text)
+                self.assertIn(f"at head `{head[:9]}`", text, "the held head is still named, for comparison")
+                self.assertNotIn(f"--head {head[:7]}", text)
+
     def test_new_wording_or_a_later_step_is_not_a_new_notice(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_CI_RED, "Android")], self.main)
         self.add(fake, 1, self.H1, 30)
@@ -1095,7 +1270,7 @@ class StepTests(unittest.TestCase):
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
         stale["labels"]["nodes"].append({"name": "alex-approved"})
-        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "body": marker.compose(
+        fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "user": FAKE_OWNER, "body": marker.compose(
             "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
         lines = self.step(fake).run()
         self.assertTrue(any("does not name the current head" in line for line in lines), lines)
@@ -1109,7 +1284,7 @@ class StepTests(unittest.TestCase):
                  (dict(base, labels=["train", "needs-alex"]), "needs-alex"),
                  (dict(base, codex={"reviewing": True}), "no-review"),
                  (dict(base, codex={}), "no-review"),
-                 (dict(base, codex={}, labels=["train", "codex-unavailable"]), "no-review"),
+                 (dict(base, codex={}, reviewedHead="0" * 40), "no-review"),
                  (dict(base, unansweredFindings=1), "unanswered-findings"),
                  (dict(base, ci={"failing": ["Android"]}), "ci-red")]
         for pr, hold in cases:
