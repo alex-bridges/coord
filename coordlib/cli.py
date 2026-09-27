@@ -417,6 +417,8 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     payload = {"kind": "msg", "v": 1, "agent": me, "to": recipients}
     if args.on is not None:
         payload["on"] = args.on
+    else:
+        cache.remember_mailboxes(gh.repo, [target])
     heading = f"**From** `{me}` **to** " + ", ".join(f"`{r}`" for r in recipients)
     posted = post_comment(gh, target, f"{heading}\n\n{args.text}", payload)
     cache.invalidate_snapshot(gh.repo)
@@ -427,11 +429,19 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
 
 
 def known_mailboxes(repo: str) -> set:
-    """Mailbox issue numbers seen on this machine's cached board: a message sent without --on
-    lands there. No call (`send` must stay cheap and always run), so a cold cache knows none."""
+    """Mailbox issue numbers this machine has seen: on its cached board, or remembered by an
+    `inbox` read or a `send` (a message sent without --on lands on the mailbox). The board
+    alone misses a mailbox whose first message in its 14-day window arrived after it was
+    cached, which `inbox` then read directly (Codex on #1098). No call (`send` must stay
+    cheap and always run), so a cold cache knows none."""
     cached = cache.load_snapshot(repo, float("inf"))
-    return {m.get("on") for m in (cached or {}).get("messages") or []
-            if m.get("payload", {}).get("kind") == "msg" and "on" not in m.get("payload", {})}
+    return mailbox_numbers((cached or {}).get("messages") or []) | set(cache.load_mailboxes(repo))
+
+
+def mailbox_numbers(messages: List[Dict[str, Any]]) -> set:
+    """Issues carrying a message record without `on`: `send` put it on the mailbox."""
+    return {m.get("on") for m in messages if isinstance(m.get("on"), int)
+            and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:
@@ -576,6 +586,9 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
             text = text if args.full else render._clip(text, 400)
             print("  " + text.replace("\n", "\n  "))
             print(f"  {item['url']}")
+    cache.remember_mailboxes(gh.repo, sorted(mailbox_numbers(
+        [{"on": _number_from_url(c.get("issue_url", "")), "payload": marker.decode(c.get("body"))}
+         for c in issue_comments])))
     if not args.peek and not args.all and not args.since:
         window = started - CURSOR_OVERLAP
         # Earlier ids matter only while the earlier read's window overlaps the new one.
