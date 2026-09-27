@@ -1180,6 +1180,36 @@ class CodexRound12Tests(ReviewFlowTests):
                 reviewer.strip_agent_config(tree, root)
 
 
+class CodexRound13Tests(ReviewFlowTests):
+    def test_o1_the_reviewer_has_only_bash(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        cmd = self.reviews()[0]["cmd"]
+        deny = json.loads(cmd[cmd.index("--settings") + 1])["permissions"]["deny"]
+        for tool in ("Read", "Grep", "Glob", "LS", "Edit", "Write", "WebFetch", "Agent"):
+            self.assertIn(tool, deny)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "agents",
+                            "reviewer.md")
+        with open(path, encoding="utf-8") as handle:
+            front = handle.read().split("---")[1]
+        self.assertIn("\ntools: Bash\n", front)
+
+    def test_o2_no_model_starts_when_the_pre_run_beat_fails(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        with mock.patch.object(conductor.Watcher, "beat", side_effect=reviewer.GitHubError("HTTP 502")):
+            lines = self.tick(5)
+        self.assertEqual(self.reviews(), [])
+        self.assertTrue(any("GitHub error" in line for line in lines))
+        with open(os.path.join(self.config.state_dir, "state.json")) as handle:
+            state = json.load(handle)
+        self.assertEqual(state.get("reviewRuns"), [], "a run that never started is not counted")
+        self.assertEqual([r["status"] for r in state["reviews"].values()], ["pending"])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

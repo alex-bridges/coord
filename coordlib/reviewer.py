@@ -93,6 +93,11 @@ REVIEW_DENY = [
     "Bash(gh api * -f *)", "Bash(gh api * -F *)", "Bash(gh workflow run:*)", "Bash(gh run rerun:*)",
     "Bash(* coord send*)", "Bash(* coord claim*)", "Bash(* coord release*)", "Bash(* coord train*)",
     "Bash(* coord outage*)", "Bash(* coord conductor*)", "Bash(* coord ci*)",
+    # Every tool that opens a file or the network outside Bash's sandbox. A path check before
+    # the call cannot stop a PR's test swapping a symlink under it; the sandbox checks at open
+    # time (Codex on #1049). The agent definition also lists Bash as its only tool.
+    "Read", "Grep", "Glob", "LS", "NotebookRead", "Edit", "Write", "MultiEdit", "NotebookEdit",
+    "WebFetch", "WebSearch", "Agent", "Task",
 ]
 
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
@@ -639,11 +644,16 @@ class Reviews:
         clean = clean[0] == 0 and not clean[1].strip()
         try:
             self.runs.append(snapshot.iso(now))
+            started = len(self.runs)
             # In the heartbeats the run sends while it works, so a leader that dies mid-run has
             # already told the others about it (the daily cap; Codex on #1049).
             if isinstance(getattr(self, "extra", None), dict):
                 self.extra["reviewRuns"] = [r for r in self.runs if (_time(r) or now) > now - dt.timedelta(days=1)]
             completed, seconds = self.run(pr, head, request, worktree, scratch)
+        except GitHubError:
+            if len(self.runs) == started:
+                self.runs.pop()  # the pre-run beat failed: no model ran, so no run is counted
+            raise
         finally:
             self.w.git(["worktree", "remove", "--force", worktree])
             shutil.rmtree(scratch, ignore_errors=True)
@@ -809,10 +819,9 @@ class Reviews:
         beating = threading.Thread(target=self.w._beat_while_running, args=(stop, getattr(self, "extra", {}), True),
                                    daemon=True)
         if self.w.issue is not None:
-            try:  # one beat now, so the run is on record before the first five-minute beat (Codex)
-                self.w.beat(True, dict(getattr(self, "extra", {}), live=True))
-            except GitHubError:
-                pass
+            # One beat now, so the run is on record before the first five-minute beat. If it
+            # cannot be posted, nothing starts: the GitHubError leaves the request pending (Codex).
+            self.w.beat(True, dict(getattr(self, "extra", {}), live=True))
             beating.start()
         started = snapshot.now_utc()
         try:
