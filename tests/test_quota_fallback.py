@@ -52,7 +52,7 @@ class QuotaFallbackTests(AppTestCase):
         self.assertIn("GitHub API budget low: 0 left on the GitHub App", err)
         self.assertIn("showing the snapshot from 2h00m ago", err)
         self.assertIn("STALE: snapshot from 2h00m ago", out.splitlines()[0])
-        self.assertEqual(self.server.api_requests(), [], "nothing after the refused read")
+        self.assertEqual(self.server.api_requests(), [], "no request after the refused one reached GitHub")
         self.assertEqual(self.runner.calls, [], "nothing as Alex")
 
     def test_a_403_that_leaves_budget_still_errors(self):

@@ -121,16 +121,15 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
 
 
 def exhausted_words(gh: GitHub, error: GitHubError) -> Optional[str]:
-    """The budget-low line when `error` is a 403 or 429 and the recorded reading of this
-    command's principal (core or GraphQL) is now below the read floor; else None."""
+    """The budget-low line when `error` is a 403 or 429 and the recorded reading of the
+    budget it spent, this command's principal's, is now below the read floor; else None."""
     principal = gh.principal()
-    if error.status not in (403, 429) or not principal:
+    if error.status not in (403, 429) or not error.resource or not principal:
         return None
-    for resource in ("core", "graphql"):
-        reading = budget.current(gh.repo, resource, principal=principal)
-        if reading is not None and budget.left(reading) < budget.read_floor():
-            return budget.low_words(reading)
-    return None
+    reading = budget.current(gh.repo, error.resource, principal=principal)
+    if reading is None or budget.left(reading) >= budget.read_floor():
+        return None
+    return budget.low_words(reading)
 
 
 def mark_app_unavailable(gh: GitHub, error: Exception) -> None:
