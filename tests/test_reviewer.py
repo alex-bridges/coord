@@ -1057,6 +1057,19 @@ class CodexRound8Tests(ReviewFlowTests):
         self.assertEqual([entry["ok"] for entry in logged], [False])
 
 
+class CodexRound9Tests(unittest.TestCase):
+    def comment(self, login, association):
+        return {"id": 1, "user": {"login": login}, "author_association": association, "body": "@inisa-sidechain review",
+                "html_url": "https://github.com/o/r/pull/7#issuecomment-1", "created_at": "2026-09-26T00:00:00Z"}
+
+    def test_k1_only_trusted_commenters_can_ask(self):
+        self.assertEqual(len(reviewer.requests([self.comment("alex-bridges", "OWNER")])), 1)
+        self.assertEqual(len(reviewer.requests([self.comment("helper", "COLLABORATOR")])), 1)
+        self.assertEqual(len(reviewer.requests([self.comment("alex-bridges", None)])), 1, "Alex's login however read")
+        for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
+            self.assertEqual(reviewer.requests([self.comment("stranger", association)]), [], association)
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

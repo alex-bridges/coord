@@ -95,6 +95,9 @@ REVIEW_DENY = [
     "Bash(* coord outage*)", "Bash(* coord conductor*)", "Bash(* coord ci*)",
 ]
 
+TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
+TRUSTED_LOGINS = ("alex-bridges",)
+
 _TAG = re.compile(r"(?<![\w@/.-])@inisa-sidechain\s+review\b(?P<rest>[^\n]*)", re.IGNORECASE)
 _MODEL = re.compile(r"^\s*(?:model\s*[=:]\s*(?P<explicit>[\w.-]+)|(?P<bare>[\w.-]+))", re.IGNORECASE)
 _FENCE = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,}).*?(^[ \t]{0,3}(?P=mark)|\Z)", re.S | re.M)
@@ -152,6 +155,10 @@ def requests(issue_comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for comment in issue_comments:
         login = ((comment.get("user") or {}).get("login") or "")
         if login.endswith("[bot]") or (comment.get("user") or {}).get("type") == "Bot":
+            continue
+        if comment.get("author_association") not in TRUSTED_ASSOCIATIONS and login not in TRUSTED_LOGINS:
+            # A review costs a model run, and a blocking verdict holds the head in the train:
+            # only Alex, his agents (they post as him) and collaborators may ask (Codex on #1049).
             continue
         pr = _PR_URL.search(comment.get("html_url") or "")
         if not pr:
