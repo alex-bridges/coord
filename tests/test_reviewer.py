@@ -824,7 +824,7 @@ class CodexRound4Tests(ReviewFlowTests):
         self.ask(1)
         self.replies = [review_reply()]
         self.tick(5)
-        self.assertEqual(order, ["review-substitute", "label", "review"])
+        self.assertEqual(order, ["label", "review-substitute", "review"])
 
     def test_f4_a_finished_review_is_posted_during_a_pause(self):
         self.tick(0)
@@ -882,7 +882,7 @@ class CodexRound4Tests(ReviewFlowTests):
             self.tick(10)  # Codex is back
         self.assertEqual(self.app.markers("review-substitute"), [])
         self.assertEqual(self.app.markers("review")[0]["countsForTrain"], False)
-        self.assertNotIn(train.CODEX_UNAVAILABLE_LABEL, self.app.labels)
+        # The label from the first attempt may stay: alone it lets the train take nothing.
 
     def test_f7_an_unwritable_audit_log_costs_no_rerun(self):
         self.tick(0)
@@ -959,15 +959,20 @@ class CodexRound6Tests(ReviewFlowTests):
         self.assertIn(42, reviewer.answered([comment]))
         self.assertIsNotNone(reviewer.posted_review([comment], 7, HEAD, "opus"))
 
-    def test_h3_the_daily_cap_follows_the_lead(self):
-        reviews = [{"id": 200 + n, "user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-60 * n)),
-                    "body": marker.compose("r", {"kind": "review", "v": 1, "pr": 7, "head": HEAD, "verdict": "pass"})}
-                   for n in range(10)]
-        watcher = mock.Mock(state={}, config=self.config, now=at(0))
+    def test_h3_i2_the_daily_cap_follows_the_lead_failed_runs_included(self):
+        from coordlib import lease
+        runs = [snapshot.iso(at(-60 * n)) for n in range(10)] + [snapshot.iso(at(-60 * 30))]
+        beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
+                "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:conductor",
+                            "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": runs}}
+        hosts = lease.hosts([beat], at(0))
+        watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
+                                    disk=lambda path: 100.0, git=self.git)
+        watcher.state = {}
+        watcher.adopt_review_runs(hosts)
+        watcher.adopt_review_runs(hosts)
         jobs = reviewer.Reviews(watcher, self.app)
-        jobs.rescan(reviews)
-        jobs.rescan(reviews)
-        self.assertEqual(jobs.runs_today(at(0)), 10, "each posted review once, all within 24 h")
+        self.assertEqual(jobs.runs_today(at(0)), 10, "each once; the 30-hour-old run is past the window")
         self.assertIn("the cap", jobs.may_run())
 
     def test_h4_nothing_but_the_allowlist_reaches_the_run(self):
@@ -977,6 +982,41 @@ class CodexRound6Tests(ReviewFlowTests):
         for name in ("ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY", "NPM_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "GH_TOKEN"):
             self.assertNotIn(name, env)
         self.assertEqual((env["PATH"], env["HOME"], env["LC_ALL"]), ("/bin", "/h", "C"))
+
+
+class CodexRound7Tests(ReviewFlowTests):
+    """Codex's review of 7b12a561 (#1049)."""
+
+    def test_i1_the_sandbox_reads_nothing_under_home_but_the_review(self):
+        settings = reviewer.run_settings("/Users/x/conductor/INISA", [], "/Users/x/.local/state/c/reviews")
+        files = settings["sandbox"]["filesystem"]
+        self.assertIn(os.path.realpath(os.path.expanduser("~")), files["denyRead"])
+        self.assertEqual(files["allowRead"], [os.path.realpath("/Users/x/.local/state/c/reviews"),
+                                              os.path.realpath("/Users/x/conductor/INISA")])
+
+    def test_i3_a_withdrawal_blocks_its_head_and_does_not_answer_the_request(self):
+        withdrawal = {"kind": "review-substitute", "v": 1, "pr": 7, "head": "", "revokes": HEAD, "request": 5}
+        comment = {"user": {"login": reviewer.APP_LOGIN}, "body": marker.compose("w", withdrawal)}
+        self.assertEqual(snapshot.sidechain_blocks(comment, withdrawal), HEAD)
+        self.assertNotIn(5, reviewer.answered([comment]))
+        forged = dict(comment, user={"login": "mallory"})
+        self.assertIsNone(snapshot.sidechain_blocks(forged, withdrawal))
+
+    def test_i4_a_finished_review_posts_on_a_wake_tick(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        watcher = conductor.Watcher(self.config, self.gh, now=at(10), runner=self.runner,
+                                    disk=lambda path: 100.0, git=self.git)
+        watcher.app_gh_factory = lambda: self.app
+        with open(os.path.join(self.config.state_dir, "state.json")) as handle:
+            watcher.state = json.load(handle)
+        watcher.review_step([], None, None, True, {}, "a conductor wake ran this tick")
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.reviews()), 1)
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):

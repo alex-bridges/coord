@@ -738,9 +738,12 @@ def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Option
     else is said of it (Codex's 👍 included); only a new head answers it."""
     author = comment.get("author")
     login = author.get("login") if isinstance(author, dict) else ((comment.get("user") or {}).get("login"))
-    if login == SIDECHAIN_LOGIN and payload.get("kind") == "review" and payload.get("verdict") == "changes" \
-            and isinstance(payload.get("head"), str):
+    if login != SIDECHAIN_LOGIN:
+        return None
+    if payload.get("kind") == "review" and payload.get("verdict") == "changes" and isinstance(payload.get("head"), str):
         return payload["head"]
+    if payload.get("kind") == "review-substitute" and payload.get("revokes") and isinstance(payload["revokes"], str):
+        return payload["revokes"]  # a withdrawal is posted just before its blocking review: it blocks too
     return None
 
 

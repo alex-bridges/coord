@@ -269,7 +269,9 @@ def answered(comments: List[Dict[str, Any]]) -> set:
             payload = marker.decode(comment.get("body")) or {}
             # A substitute record names its request too: posted before the review, it is the
             # one durable trace if a leader died between the two (Codex on #1049).
-            if payload.get("kind") in ("review", "review-substitute") and payload.get("request") is not None:
+            # Not a withdrawal (head ""): it precedes a blocking review still to be posted.
+            if payload.get("request") is not None and (payload.get("kind") == "review" or (
+                    payload.get("kind") == "review-substitute" and payload.get("head"))):
                 ids.add(payload["request"])
     return ids
 
@@ -382,7 +384,7 @@ def isolated_env(base: Dict[str, str], empty_dir: str) -> Dict[str, str]:
     return env
 
 
-def run_settings(home: str, deny: List[str]) -> Dict[str, Any]:
+def run_settings(home: str, deny: List[str], reviews_root: str = "") -> Dict[str, Any]:
     """The review run's settings. Its Bash runs in Claude Code's OS sandbox (macOS Seatbelt,
     inherited by every child a PR's test starts): no network, so nothing it starts can mint a
     token or reach GitHub whatever it does to its environment; no writes to the conductor's
@@ -396,8 +398,14 @@ def run_settings(home: str, deny: List[str]) -> Dict[str, Any]:
             "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
             "filesystem": {
                 "denyWrite": [os.path.realpath(home)],
-                "denyRead": [os.path.dirname(apptoken.default_config_path()), apptoken.token_cache_dir({}),
+                # Nothing under the home folder but the PR's tree, scratch and the conductor's
+                # checkout: no ~/.aws, ~/.npmrc, ~/.netrc or anything else a test could print
+                # (Codex on #1049). The named paths are inside it, and stay named.
+                "denyRead": [os.path.realpath(os.path.expanduser("~")),
+                             os.path.dirname(apptoken.default_config_path()), apptoken.token_cache_dir({}),
                              os.path.join(os.path.expanduser("~"), "Library", "Keychains")],
+                "allowRead": [p for p in (os.path.realpath(reviews_root) if reviews_root else "",
+                                          os.path.realpath(home)) if p],
             },
         },
     }
@@ -447,15 +455,7 @@ class Reviews:
         cursor past them, before it died with them in its own state (Codex on #1049)."""
         done = answered(issue_comments)
         self.remember([c for c in issue_comments if c.get("id") not in done])
-        # The daily cap follows the lead: every review the app posted in the last 24 h was a run
-        # (Codex on #1049). Runs are kept as times; one per posted review, not counted twice.
-        for comment in issue_comments:
-            payload = marker.decode(comment.get("body")) or {}
-            posted = _time(comment.get("created_at"))
-            if (comment.get("user") or {}).get("login") == APP_LOGIN and payload.get("kind") == "review" \
-                    and payload.get("verdict") in ("pass", "changes") and posted is not None \
-                    and self.w.now - posted < dt.timedelta(days=1) and comment.get("created_at") not in self.runs:
-                self.runs.append(comment["created_at"])
+
 
     def pending(self, issue_comments: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
         if issue_comments:
@@ -668,8 +668,8 @@ class Reviews:
 
     def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
         """Post a finished review. Order: a withdrawal of an older substitute first (a blocking
-        verdict is never out while it stands); for a pass that counts, the substitute record
-        and the label; the review itself last, so a posted review means every step before
+        verdict is never out while it stands); for a pass that counts, the label and the
+        substitute record; the review itself last, so a posted review means every step before
         it happened, which is what a new leader's rescan relies on (Codex on #1049). Each step
         is remembered, so a retry repeats none that succeeded; once one has, the decision is
         frozen (`started`)."""
@@ -683,6 +683,12 @@ class Reviews:
                 {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": "",
                  "revokes": head, "request": request["id"]})})
             posting.update(revoked=True, started=True)
+        if posting["counts"] and not posting.get("labelled"):
+            # First, and not `started`: the label alone lets the train take nothing, and a
+            # substitute record then always has its label (a takeover in between; Codex).
+            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
+                          body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
+            posting["labelled"] = True
         if posting["counts"] and not posting.get("recorded"):
             self.app.rest(comments, method="POST", body={"body": marker.compose(
                 f"**Substitute review** of head `{head[:9]}` (Codex out of quota): the review follows, "
@@ -691,10 +697,6 @@ class Reviews:
                 {"kind": "review-substitute", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
                  "model": request["model"], "request": request["id"]})})
             posting.update(recorded=True, started=True)
-        if posting["counts"] and not posting.get("labelled"):
-            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
-                          body={"labels": [train.CODEX_UNAVAILABLE_LABEL]})
-            posting["labelled"] = True
         if not posting.get("url"):
             posted = self.reply(request, posting["body"], posting["payload"])
             posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"), started=True)
@@ -765,7 +767,8 @@ class Reviews:
         command = [self.config.claude, "-p", prompt(pr, head, worktree, scratch, request), "--agent", "reviewer",
                    "--model", model, "--output-format", "json", "--permission-mode", "auto",
                    "--add-dir", worktree, "--add-dir", scratch,
-                   "--settings", json.dumps(run_settings(self.config.home, conductor.DENY + REVIEW_DENY))]
+                   "--settings", json.dumps(run_settings(self.config.home, conductor.DENY + REVIEW_DENY,
+                                                         os.path.join(self.config.state_dir, "reviews")))]
         empty = tempfile.mkdtemp(prefix="gh-none-", dir=scratch)
         env = isolated_env(dict(os.environ), empty)
         # CONDUCTOR_WAKE turns on the conductor guard hook for this run.

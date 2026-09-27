@@ -603,6 +603,15 @@ class Watcher:
             posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
             self.state["beatComment"] = posted.get("id")
 
+    def adopt_review_runs(self, hosts: List[Dict[str, Any]]) -> None:
+        """Every host's review runs of the last 24 h (from its heartbeat) count toward this
+        host's daily cap: failed runs included, so a takeover cannot start a fresh eight
+        (Codex on #1049)."""
+        runs = self.state.setdefault("reviewRuns", [])
+        for host in hosts:
+            if host["agent"] != self.config.agent:
+                runs.extend(r for r in host.get("reviewRuns") or [] if r not in runs)
+
     def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> None:
         """A new leader starts reading where the last leader had read to. Only beats posted
         as leader count: a standby's cursor says nothing about the conductor's inbox. On a
@@ -702,6 +711,7 @@ class Watcher:
             self.say("no inbox cursor: starting from now")
         if leader and can_read:
             self.adopt_cursor(hosts)
+            self.adopt_review_runs(hosts)
             try:
                 reasons += self.github_reasons(slow)
                 if slow:
@@ -771,14 +781,18 @@ class Watcher:
                 self.post_outage(result["limit"])
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
-        if leader and github_ok and not woke:
-            # Below the read floor, or when this tick's read failed, a finished review or a
-            # reply still posts: that uses the app's own budget (Codex on #1049). New runs wait.
+        if leader and github_ok:
+            # A finished review or a reply posts on any tick: below the read floor, after a
+            # failed read, or after a wake (Codex on #1049). Only a new run waits for a tick
+            # with none of those (a wake and a review never share one).
             reading = can_read and self.issue_comments is not None
             self.review_step(windows, down, pause, wake, extra,
+                             "a conductor wake ran this tick" if woke else
                              "" if reading else "Alex's API budget is under the read floor, or this tick's read failed")
         if github_ok and can_write:
             try:
+                runs = self.state.get("reviewRuns") or []
+                extra["reviewRuns"] = [r for r in runs if (_time(r) or self.now) > self.now - dt.timedelta(days=1)] or None
                 self.beat(leader, extra)
             except GitHubError as error:
                 self.say(f"heartbeat failed: {_clip(str(error), 120)}")
