@@ -58,6 +58,8 @@ import os
 import re
 import secrets
 import shutil
+import signal
+import subprocess
 import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -485,7 +487,7 @@ class Reviews:
     def prune(self) -> None:
         now = self.w.now
         for key in [k for k, v in self.state.items()
-                    if not isinstance(v, dict) or (v.get("status") != "pending"
+                    if not isinstance(v, dict) or (v.get("status") != "pending" and not v.get("unsent")
                                                    and now - (_time(v.get("at") or v.get("seen")) or now) > KEEP)]:
             self.state.pop(key)  # a pending request is kept until it is handled, however long that takes
         for key in [k for k, v in self.done_heads.items()
@@ -636,6 +638,7 @@ class Reviews:
                 self.runs.pop()  # the pre-run beat failed: no model ran, so no run is counted
             raise
         finally:
+            kill_holders([worktree, scratch])  # anything the run left running in its trees
             self.w.git(["worktree", "remove", "--force", worktree])
             shutil.rmtree(scratch, ignore_errors=True)
             self.restore_checkout(clean)
@@ -687,8 +690,8 @@ class Reviews:
                 "revoke": revoke}
 
     def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
-        """Post a finished review. For a pass that counts: the `reviewed` label, the
-        `review-clean` record (on Alex's identity: the train counts no bot's), then the review
+        """Post a finished review. For a pass that counts: the `review-clean` record (on
+        Alex's identity: the train counts no bot's), the `reviewed` label, then the review
         (so a posted review means every step before it happened, which a new leader's rescan
         relies on). For a blocking verdict: the review first (its marker holds the head),
         then the withdrawal of a recorded clean review of that head. Each step is remembered,
@@ -696,23 +699,31 @@ class Reviews:
         (`started`)."""
         now = self.w.now
         head = posting["head"]
-        if posting["counts"] and not posting.get("labelled"):
-            # Informational (#1054), and not `started`: the label alone lets the train take nothing.
-            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
-                          body={"labels": [train.REVIEWED_LABEL]})
-            posting["labelled"] = True
         if posting["counts"] and not posting.get("recorded"):
+            if not getattr(self, "user_ok", True):
+                # Alex's budget is under the hard floor: his identity posts nothing until it
+                # recovers; the app-backed steps wait with it (Codex on #1049).
+                self.w.say(f"review of #{request['pr']} waits to record its clean review: Alex's API budget is low")
+                return
             self.attest(request, head, f"**Clean review** of head `{head[:9]}` by `{self.agent()}` "
                                        f"({request['model']}), recorded by coord's reviewer: the review follows, "
                                        f"requested in {request.get('url') or 'a comment'}.\n\n"
                                        "It counts as the review of this head only; a new push needs a new review.",
                         {"head": head, "model": request["model"]})
             posting.update(recorded=True, started=True)
+        if posting["counts"] and not posting.get("labelled"):
+            # After the record, the durable trace a rescan reads; the label is informational (#1054).
+            self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/labels", method="POST",
+                          body={"labels": [train.REVIEWED_LABEL]})
+            posting["labelled"] = True
         if not posting.get("url"):
             posted = self.reply(request, posting["body"], posting["payload"])
             posting.update(url=(posted or {}).get("html_url") or "", id=(posted or {}).get("id"), started=True)
         link = posting["url"]
         if posting.get("revoke") and not posting.get("revoked"):
+            if not getattr(self, "user_ok", True):
+                self.w.say(f"review of #{request['pr']} waits to withdraw a clean review: Alex's API budget is low")
+                return  # the blocking review is out and holds the head meanwhile
             self.attest(request, head, f"**Clean review withdrawn** for head `{head[:9]}`: a later review "
                                        f"requested changes ({link}). A new push needs a new review.",
                         {"head": "", "revokes": head})
@@ -814,6 +825,24 @@ class Reviews:
         finally:
             stop.set()
         return completed, int((snapshot.now_utc() - started).total_seconds())
+
+
+def kill_holders(paths: List[str]) -> None:
+    """SIGKILL every process with a file open or its working directory under `paths`: a
+    PR's test that escaped the run's process group (setsid) must not outlive the review
+    (Codex on #1049). Best-effort: lsof missing or failing kills nothing."""
+    for path in paths:
+        if not os.path.isdir(path):
+            continue
+        try:
+            listed = subprocess.run(["lsof", "-t", "+D", path], capture_output=True, text=True, timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for pid in {int(p) for p in listed.split() if p.isdigit()} - {os.getpid()}:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def strip_agent_config(tree: str, reviews_root: str) -> None:

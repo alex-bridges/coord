@@ -41,6 +41,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -423,22 +424,34 @@ Runner = Callable[[Sequence[str], str, Dict[str, str], int], "subprocess.Complet
 
 def default_runner(cmd: Sequence[str], cwd: str, env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess[str]":
     """The run in its own process group, so a timeout also stops the builds and tests it
-    started. stdin is closed: `claude -p` otherwise waits 3 s for piped input."""
-    try:
-        process = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
-    except OSError as error:
-        return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
-    try:
-        out, err = process.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(list(cmd), process.returncode, out, err)
-    except subprocess.TimeoutExpired:
+    started. stdin is closed: `claude -p` otherwise waits 3 s for piped input.
+
+    Output goes to files, not pipes, and only the run itself is waited for: a descendant
+    that left the group (setsid) and kept stdout open would otherwise hold a pipe forever
+    and wedge the watcher (Codex on #1049)."""
+    with tempfile.TemporaryFile("w+") as out_file, tempfile.TemporaryFile("w+") as err_file:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            process = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out_file,
+                                       stderr=err_file, text=True, start_new_session=True)
+        except OSError as error:
+            return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
+        try:
+            code = process.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # what the run left behind in its group, either way
         except OSError:
             pass
-        out, _ = process.communicate()
-        return subprocess.CompletedProcess(list(cmd), 124, out or "", f"timed out after {timeout}s")
+        if timed_out:
+            process.wait()
+        out_file.seek(0)
+        err_file.seek(0)
+        out, err = out_file.read(), err_file.read()
+    if timed_out:
+        return subprocess.CompletedProcess(list(cmd), 124, out, f"timed out after {timeout}s")
+    return subprocess.CompletedProcess(list(cmd), code, out, err)
 
 
 def model_command(config: Config, prompt: str, model: str) -> List[str]:
@@ -794,7 +807,7 @@ class Watcher:
             # checked; the host that led last goes on posting finished reviews with the app's
             # own token (Codex on #1049). No new run starts until leadership is known again.
             self.review_step(windows, down, pause, wake, extra,
-                             "Alex's API budget is under the hard floor (leadership unknown)")
+                             "Alex's API budget is under the hard floor (leadership unknown)", user_ok=False)
         if github_ok and can_write:
             try:
                 runs = self.state.get("reviewRuns") or []
@@ -819,13 +832,14 @@ class Watcher:
 
     def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
                     pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None,
-                    unread: str = "") -> None:
+                    unread: str = "", user_ok: bool = True) -> None:
         """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
         from . import reviewer
         blocked = (unread if unread else "waking is off (--no-wake)" if not wake
                    else f"Claude is down until {iso(down['end'])}" if down
                    else f"paused until {pause['until']}" if pause else "")
         jobs = reviewer.Reviews(self, None)
+        jobs.user_ok = user_ok  # may a record be posted on Alex's identity this tick
         jobs.prune()  # every tick, not only when a request waits
         if not jobs.pending():
             return

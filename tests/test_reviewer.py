@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -170,8 +171,11 @@ class ReviewFlowTests(unittest.TestCase):
         self.runs, self.replies, self.git_calls = [], [], []
         self.snap = mock.patch.object(cli, "get_snapshot", return_value={"prs": [], "claims": [], "train": []})
         self.snap.start()
+        self.holders = mock.patch.object(reviewer, "kill_holders")  # lsof is slow; tested on its own below
+        self.holders.start()
 
     def tearDown(self):
+        self.holders.stop()
         self.snap.stop()
         self.env.stop()
         self.tmp.cleanup()
@@ -800,7 +804,7 @@ class CodexRound4Tests(ReviewFlowTests):
         self.ask(1)
         self.replies = [review_reply()]
         self.tick(5)
-        self.assertEqual(order, ["label", "review-clean (as Alex)", "review"])
+        self.assertEqual(order, ["review-clean (as Alex)", "label", "review"])
 
     def test_f4_a_finished_review_is_posted_during_a_pause(self):
         self.tick(0)
@@ -1190,6 +1194,65 @@ class CodexRound15Tests(ReviewFlowTests):
         jobs.rescan([reply])
         self.assertEqual(watcher.state["reviews"]["5"]["status"], "done")
         self.assertEqual(jobs.pending(), [])
+
+
+class CodexRound16Tests(ReviewFlowTests):
+    def test_r1_an_escaped_descendant_cannot_wedge_the_runner(self):
+        script = ("import os, sys, time\n"
+                  "if os.fork() == 0:\n"
+                  "    os.setsid(); time.sleep(30); sys.exit(0)\n"  # leaves the group, keeps stdout
+                  "print('parent done'); sys.stdout.flush()\n")
+        started = time.monotonic()
+        done = conductor.default_runner([sys.executable, "-c", script], self.tmp.name, dict(os.environ), 20)
+        self.assertLess(time.monotonic() - started, 10, "returned when the run ended, not when the pipe closed")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "parent done"))
+
+    def test_r1_a_timeout_returns_though_a_descendant_escaped(self):
+        script = ("import os, time\n"
+                  "if os.fork() == 0:\n"
+                  "    os.setsid(); time.sleep(30)\n"
+                  "time.sleep(30)\n")
+        started = time.monotonic()
+        done = conductor.default_runner([sys.executable, "-c", script], self.tmp.name, dict(os.environ), 1)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(done.returncode, 124)
+
+    def test_r1_holders_of_the_review_trees_are_killed(self):
+        self.holders.stop()
+        try:
+            tree = os.path.join(self.tmp.name, "tree")
+            os.makedirs(tree)
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=tree,
+                                     start_new_session=True)
+            time.sleep(0.5)
+            reviewer.kill_holders([tree])
+            self.assertEqual(child.wait(timeout=10), -9)
+        finally:
+            self.holders.start()
+
+    def test_r2_no_record_on_alexs_identity_below_the_hard_floor(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.user.fail_posts = 1
+        self.tick(5)  # the record fails; nothing else is posted
+        self.assertEqual((self.user.posts, self.app.markers("review")), ([], []))
+        with mock.patch.object(conductor.Watcher, "budget_left", return_value=1):
+            lines = self.tick(10)
+        self.assertEqual(self.user.posts, [], "Alex's identity waits for his budget")
+        self.assertTrue(any("budget is low" in line for line in lines))
+        self.tick(15)
+        self.assertEqual(len(self.user.markers("review-clean")), 1)
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.reviews()), 1)
+
+    def test_r3_an_unsent_reply_outlives_the_retention(self):
+        watcher = mock.Mock(state={"reviews": {"1": {"id": 1, "pr": 7, "status": "failed", "unsent": "gave up",
+                                                     "at": snapshot.iso(at(-60 * 24 * 30))}}},
+                            config=self.config, now=at(0))
+        jobs = reviewer.Reviews(watcher, self.app)
+        jobs.prune()
+        self.assertIn("1", watcher.state["reviews"])
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):
