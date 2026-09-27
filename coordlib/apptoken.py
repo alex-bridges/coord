@@ -247,6 +247,11 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
     """
     env = os.environ if env is None else env
     path = config_path(env)
+    if str(env.get("COORD_AGENT") or "").startswith("reviewer@"):
+        # A review run, and anything it starts (a PR's test, a wrapper), is read-only: it
+        # mints no token and falls back to no identity (Codex on #1049). Every call refuses.
+        return Mode(True, "a review run holds no GitHub credential", path,
+                    error="a review run (COORD_AGENT=reviewer@…) holds no GitHub credential")
     if env.get(SWITCH_ENV) == "off":
         return Mode(False, "COORD_APP=off: the deliberate override, Alex's gh/keyring identity", path)
     if env.get("GITHUB_ACTIONS") == "true":

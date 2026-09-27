@@ -86,6 +86,8 @@ def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelt
             "seenThrough": payload.get("seenThrough") if _time(payload.get("seenThrough")) else None,
             "lastWake": _wake(payload.get("lastWake")), "pending": _number(payload.get("pending")),
             "disk": _number(payload.get("disk")), "wasLeader": payload.get("leader") is True,
+            # Review runs of the last 24 h, so the daily cap follows the lead (reviewer.py).
+            "reviewRuns": [r for r in (payload.get("reviewRuns") or []) if isinstance(r, str) and _time(r)][:100],
         })
     return out
 

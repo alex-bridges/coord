@@ -168,6 +168,10 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         if pr.get("alexApprovedHead") != pr.get("head"):
             return HOLD, HOLD_NEEDS_ALEX, (f"alex-approved does not name the current head {str(pr.get('head'))[:9]}; "
                                            "Alex's approval covers only the head he approved")
+    if pr.get("head") and pr.get("head") in (pr.get("sidechainBlockedHeads") or []):
+        # Checked before Codex: its 👍 does not answer another reviewer's P0-P2 (Codex on #1049).
+        return HOLD, HOLD_UNANSWERED_FINDINGS, ("an inisa-sidechain review requested changes at this head "
+                                                f"{str(pr.get('head'))[:9]}; only a new push answers it")
     codex = pr.get("codex") or {}
     if codex.get("reviewing"):
         return HOLD, HOLD_NO_REVIEW, "Codex is re-reviewing it"

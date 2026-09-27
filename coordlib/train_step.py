@@ -274,11 +274,15 @@ class Step:
         number = pr["number"]
         latest: Dict[str, Any] = {}
         held = set()
+        blocked = set()
         pr["overtakenBy"] = None
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             payload = marker.decode(comment.get("body"))
             if not payload or payload.get("pr") != number:
                 continue
+            blocks = snapshot.sidechain_blocks(comment, payload)
+            if blocks:
+                blocked.add(blocks)  # from the PR's whole history, not a comment window (Codex on #1049)
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
@@ -293,6 +297,7 @@ class Step:
         pr["trainAddedBy"] = latest.get("agent")
         pr["trainAddedAt"] = latest.get("at")
         pr["heldNotices"] = held
+        pr["sidechainBlockedHeads"] = sorted(blocked)
         return latest
 
     def own_record(self, comment: Dict[str, Any], payload: Dict[str, Any]) -> bool:

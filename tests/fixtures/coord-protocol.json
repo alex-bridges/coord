@@ -9,6 +9,7 @@
     {"v": 1, "kind": "review-clean", "agent": "codex@host:task-a", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "by": "claude@host:reviewer"},
     {"v": 1, "kind": "review-substitute", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
     {"v": 1, "kind": "alex-approve", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
+    {"v": 1, "kind": "review", "agent": "reviewer@host:review", "pr": 1049, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "model": "opus", "verdict": "pass", "counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 1}, "request": 1000001, "countsForTrain": true, "to": ["codex@host:task-a"]},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "held", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hold": "no-review", "reason": "awaiting review", "to": ["codex@host:task-a"], "mode": "live"},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "testing", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "members": [1059, 1060], "mode": "dry-run"},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "merged", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "run": null},

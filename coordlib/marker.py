@@ -28,7 +28,7 @@ PREFIX = "<!-- coord:v1 "
 SUFFIX = " -->"
 
 KINDS = ("claim", "release", "msg", "train-add", "train-remove", "train", "review-clean", "review-substitute",
-         "alex-approve", "outage", "conductor")
+         "alex-approve", "outage", "conductor", "review")
 
 
 def _text(value: Any) -> bool:
@@ -75,12 +75,18 @@ _FIELDS: Dict[str, Callable[[Any], bool]] = {
     "run": lambda value: value is None or _positive_int(value),
     "seenThrough": lambda value: value is None or _text(value),
     "pending": _number, "disk": _number, "lastWake": _wake,
+    # reviewer.py: its `review` records, and the model its review-clean records name. (Its
+    # `request`, a comment id, stays untyped: train records use that name for an object.)
+    "verdict": _nonempty_text, "model": _text, "revokes": _text,
+    "countsForTrain": lambda value: type(value) is bool,
+    "reviewRuns": _texts,
 }
 _REQUIRED = {
     "claim": ("issue",), "release": ("issue",), "msg": ("to",),
     "train-add": ("pr", "head"), "train-remove": ("pr",), "train": ("pr", "event"),
     "review-clean": ("pr", "head"), "review-substitute": ("pr", "head"),
     "alex-approve": ("pr", "head"), "outage": ("event", "harness"), "conductor": ("event",),
+    "review": ("pr", "verdict"),
 }
 MAX_NESTING = 32
 

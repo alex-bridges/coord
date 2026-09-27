@@ -41,6 +41,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -135,6 +136,8 @@ class Config:
     disk_path: str = "/"
     disk_low_gb: float = DISK_LOW_GB
     update_checkout: bool = True
+    max_reviews_per_day: int = 8        # reviewer.MAX_REVIEWS_PER_DAY
+    review_timeout: int = 45 * 60       # reviewer.REVIEW_TIMEOUT_SECONDS
 
     @classmethod
     def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Config":
@@ -166,6 +169,8 @@ class Config:
             disk_path=env.get("CONDUCTOR_DISK_PATH") or (data_volume if os.path.isdir(data_volume) else "/"),
             disk_low_gb=number("CONDUCTOR_DISK_LOW_GB", DISK_LOW_GB),
             update_checkout=env.get("CONDUCTOR_UPDATE_CHECKOUT", "1") != "0",
+            max_reviews_per_day=int(number("CONDUCTOR_MAX_REVIEWS_PER_DAY", 8)),
+            review_timeout=int(number("CONDUCTOR_REVIEW_TIMEOUT", 45 * 60)),
         )
 
 
@@ -196,9 +201,16 @@ def append_wake(config: Config, record: Dict[str, Any]) -> None:
         handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
-def read_wakes(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
+def append_review(config: Config, record: Dict[str, Any]) -> None:
+    """One line per review run (reviewer.py), like wakes.jsonl for conductor wakes."""
+    os.makedirs(config.state_dir, exist_ok=True)
+    with open(os.path.join(config.state_dir, "reviews.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+
+def read_wakes(config: Config, limit: int = 200, name: str = "wakes.jsonl") -> List[Dict[str, Any]]:
     try:
-        with open(os.path.join(config.state_dir, "wakes.jsonl"), encoding="utf-8") as handle:
+        with open(os.path.join(config.state_dir, name), encoding="utf-8") as handle:
             lines = handle.readlines()[-limit:]
     except OSError:
         return []
@@ -404,22 +416,34 @@ Runner = Callable[[Sequence[str], str, Dict[str, str], int], "subprocess.Complet
 
 def default_runner(cmd: Sequence[str], cwd: str, env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess[str]":
     """The run in its own process group, so a timeout also stops the builds and tests it
-    started. stdin is closed: `claude -p` otherwise waits 3 s for piped input."""
-    try:
-        process = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
-    except OSError as error:
-        return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
-    try:
-        out, err = process.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(list(cmd), process.returncode, out, err)
-    except subprocess.TimeoutExpired:
+    started. stdin is closed: `claude -p` otherwise waits 3 s for piped input.
+
+    Output goes to files, not pipes, and only the run itself is waited for: a descendant
+    that left the group (setsid) and kept stdout open would otherwise hold a pipe forever
+    and wedge the watcher (Codex on #1049)."""
+    with tempfile.TemporaryFile("w+") as out_file, tempfile.TemporaryFile("w+") as err_file:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            process = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out_file,
+                                       stderr=err_file, text=True, start_new_session=True)
+        except OSError as error:
+            return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
+        try:
+            code = process.wait(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # what the run left behind in its group, either way
         except OSError:
             pass
-        out, _ = process.communicate()
-        return subprocess.CompletedProcess(list(cmd), 124, out or "", f"timed out after {timeout}s")
+        if timed_out:
+            process.wait()
+        out_file.seek(0)
+        err_file.seek(0)
+        out, err = out_file.read(), err_file.read()
+    if timed_out:
+        return subprocess.CompletedProcess(list(cmd), 124, out, f"timed out after {timeout}s")
+    return subprocess.CompletedProcess(list(cmd), code, out, err)
 
 
 def model_command(config: Config, prompt: str, model: str) -> List[str]:
@@ -500,6 +524,9 @@ class Watcher:
         self.lock = threading.Lock()
         self.state: Dict[str, Any] = {}
         self.dry_run = False
+        self.issue_comments: Optional[List[Dict[str, Any]]] = None
+        self.app_gh_factory: Callable[[], Optional[GitHub]] = self.default_app_gh
+        self.user_gh_factory: Callable[[], GitHub] = self.default_user_gh
 
     def say(self, text: str) -> None:
         self.lines.append(text)
@@ -580,6 +607,14 @@ class Watcher:
             posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
             self.state["beatComment"] = posted.get("id")
 
+    def adopt_review_runs(self, hosts: List[Dict[str, Any]]) -> None:
+        """Every host's review runs of the last 24 h (from its heartbeat) count toward this
+        host's daily cap: failed runs included, so a takeover cannot start a fresh eight
+        (Codex on #1049)."""
+        runs = self.state.setdefault("reviewRuns", [])
+        for host in hosts:  # this host's own beat too: a run it sent mid-review before dying
+            runs.extend(r for r in host.get("reviewRuns") or [] if r not in runs)
+
     def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> None:
         """A new leader starts reading where the last leader had read to. Only beats posted
         as leader count: a standby's cursor says nothing about the conductor's inbox. On a
@@ -610,6 +645,17 @@ class Watcher:
         items = cli.inbox_items(issue_comments, review_comments, snap, me, since, "",
                                 cache.load_seen_ids(self.gh.repo, me))
         payloads = {c.get("id"): marker.decode(c.get("body")) for c in issue_comments}
+        self.issue_comments = issue_comments  # reviewer.py finds `@inisa-sidechain review` here
+        from . import reviewer
+        reviewer.Reviews(self, None).remember(issue_comments)  # kept in state: the cursor moves on
+        if not self.state.get("wasLeader"):
+            self.state["reviewRescan"] = True  # kept until it succeeds
+        if self.state.get("reviewRescan"):
+            # A new leader: requests the last leader held only in its own state (reviewer.rescan).
+            older = self.gh.rest_paginated(
+                f"repos/{{repo}}/issues/comments?since={iso(self.now - reviewer.FRESH)}&per_page=100")
+            reviewer.Reviews(self, None).rescan(older)
+            self.state.pop("reviewRescan", None)
         reasons += message_reasons(items, payloads)
         if slow:
             reasons += stuck_reasons(snap, self.now)
@@ -668,6 +714,7 @@ class Watcher:
             self.say("no inbox cursor: starting from now")
         if leader and can_read:
             self.adopt_cursor(hosts)
+            self.adopt_review_runs(hosts)
             try:
                 reasons += self.github_reasons(slow)
                 if slow:
@@ -688,6 +735,11 @@ class Watcher:
         for item in todo:
             self.say(f"  {'*' if item['wake'] else ' '} [{item['kind']}] {_clip(item['summary'], 140)}")
         if dry_run:
+            from . import reviewer
+            asked = [r for r in reviewer.requests(self.issue_comments or [])
+                     if (self.state.get("reviews") or {}).get(str(r["id"]), {}).get("status") not in ("done", "skipped", "failed")]
+            for request in asked:
+                self.say(f"  review requested on #{request['pr']} ({request['model'] or request['error']}) {request['url']}")
             return
 
         extra: Dict[str, Any] = {"pending": len(todo), "disk": None if free is None else round(free),
@@ -707,6 +759,7 @@ class Watcher:
                    else f"{wakes_today} wakes in 24 h, the cap is {self.config.max_wakes_per_day}"
                    if wakes_today >= self.config.max_wakes_per_day
                    else "API budget too low for a run" if not can_read else "")
+        woke = False
         if wakeable and blocked:
             self.say(f"not waking: {blocked}")
             if tampered and github_ok and self.state.get("tamperEscalated") != tampered:
@@ -721,6 +774,7 @@ class Watcher:
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
         elif wakeable:
+            woke = True
             self.state.pop("capEscalated", None)
             self.state.pop("tamperEscalated", None)
             ended = self.previous_outage(windows)
@@ -730,11 +784,60 @@ class Watcher:
                 self.post_outage(result["limit"])
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
+        if leader and github_ok:
+            # A finished review or a reply posts on any tick: below the read floor, after a
+            # failed read, or after a wake (Codex on #1049). Only a new run waits for a tick
+            # with none of those (a wake and a review never share one).
+            reading = can_read and self.issue_comments is not None
+            self.review_step(windows, down, pause, wake, extra,
+                             "a conductor wake ran this tick" if woke else
+                             "" if reading else "Alex's API budget is under the read floor, or this tick's read failed")
+        elif not github_ok and self.state.get("wasLeader"):
+            # Below the hard floor nothing is read with Alex's budget, so leadership cannot be
+            # checked; the host that led last goes on posting finished reviews with the app's
+            # own token (Codex on #1049). No new run starts until leadership is known again.
+            self.review_step(windows, down, pause, wake, extra,
+                             "Alex's API budget is under the hard floor (leadership unknown)", user_ok=False)
         if github_ok and can_write:
             try:
+                runs = self.state.get("reviewRuns") or []
+                extra["reviewRuns"] = [r for r in runs if (_time(r) or self.now) > self.now - dt.timedelta(days=1)] or None
                 self.beat(leader, extra)
             except GitHubError as error:
                 self.say(f"heartbeat failed: {_clip(str(error), 120)}")
+
+    def default_app_gh(self) -> Optional[GitHub]:
+        """A GitHub on the inisa-sidechain app for posting reviews, or None when app mode is
+        off on this machine (reviews are then held; they are never posted as Alex)."""
+        from . import cli
+        app_gh = GitHub(self.gh.repo)
+        cli.attach_app(app_gh)
+        return app_gh if app_gh.app is not None else None
+
+    def default_user_gh(self) -> GitHub:
+        """A GitHub on Alex's identity, for the one record a review makes as him: a pass's
+        `review-clean`, which the train counts only from a trusted user (#1054), as the
+        attestation commands post it (cli.ATTESTATIONS)."""
+        return GitHub(self.gh.repo)
+
+    def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
+                    pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None,
+                    unread: str = "", user_ok: bool = True) -> None:
+        """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
+        from . import reviewer
+        blocked = (unread if unread else "waking is off (--no-wake)" if not wake
+                   else f"Claude is down until {iso(down['end'])}" if down
+                   else f"paused until {pause['until']}" if pause else "")
+        jobs = reviewer.Reviews(self, None)
+        jobs.user_ok = user_ok  # may a record be posted on Alex's identity this tick
+        jobs.prune()  # every tick, not only when a request waits
+        if not jobs.pending():
+            return
+        if not blocked:
+            tampered = self.tampered()
+            blocked = f"the conductor's own controls are modified in its checkout: {tampered}" if tampered else ""
+        jobs.app = self.app_gh_factory()  # posting a finished review needs no run: Reviews.step decides
+        jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The most recent claude outage when it has run out and nobody has posted its

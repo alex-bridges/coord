@@ -738,6 +738,20 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
 # #1054). The attestation commands always post as Alex (cli.ATTESTATIONS never run on
 # the app), so every real record passes.
 HEAD_RECORDS = {"review-clean": "reviewedHead", "review-substitute": "reviewedHead", "alex-approve": "alexApprovedHead"}
+SIDECHAIN_LOGIN = "inisa-sidechain[bot]"  # the app that posts `@inisa-sidechain review` results (reviewer.py)
+
+
+def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
+    """The head a comment blocks: a `review` marker with verdict `changes`, posted by the
+    app itself (anyone can write a marker; Codex on #1049). Such a head is held whatever
+    else is said of it (Codex's 👍 included); only a new head answers it."""
+    author = comment.get("author")
+    login = author.get("login") if isinstance(author, dict) else ((comment.get("user") or {}).get("login"))
+    if login != SIDECHAIN_LOGIN:
+        return None
+    if payload.get("kind") == "review" and payload.get("verdict") == "changes" and isinstance(payload.get("head"), str):
+        return payload["head"]
+    return None
 
 
 def trusted_attesters(repo: str) -> FrozenSet[str]:
@@ -774,9 +788,17 @@ def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]
         on_its_pr = isinstance(payload.get("pr"), int) and comment.get("on") == payload["pr"]
         if field and on_its_pr and trusted_attestation(comment.get("author"), repo):
             latest[(payload["pr"], field)] = payload.get("head")
+    # For the board; the train re-reads each queued PR's whole history (train_step.train_added),
+    # so a block older than this snapshot's comment window still holds there.
+    blocked: Dict[int, set] = {}
+    for comment in comments:
+        head = sidechain_blocks(comment, comment["payload"])
+        if head and isinstance(comment["payload"].get("pr"), int):
+            blocked.setdefault(comment["payload"]["pr"], set()).add(head)
     for pr in prs:
         for field in set(HEAD_RECORDS.values()):
             pr[field] = latest.get((pr["number"], field))
+        pr["sidechainBlockedHeads"] = sorted(blocked.get(pr["number"], ()))
 
 
 def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -311,7 +311,10 @@ class FakeGitHub:
         if "issues/900/comments" in path:
             return list(self.issue_comments)
         if path.startswith("repos/{repo}/issues/comments"):
-            return list(self.repo_comments)
+            # Like GitHub, only comments at or after `since` (review of #1049: a fake that
+            # returned everything hid a request the cursor had moved past).
+            since = path.split("since=", 1)[1].split("&", 1)[0] if "since=" in path else ""
+            return [c for c in self.repo_comments if not since or (c.get("updated_at") or c["created_at"]) >= since]
         if path.startswith("repos/{repo}/pulls/comments"):
             return []
         raise AssertionError(f"unexpected paginated call {path}")
