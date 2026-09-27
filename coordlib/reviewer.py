@@ -40,9 +40,10 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
   If a clean review of that head was recorded, a newer record naming no head withdraws it,
   posted after the blocking review so the head is never left merely unreviewed.
 - **One host per review.** Before a run the app posts a `review-claim` naming the PR, head
-  and model, with an expiry, and reads the PR again: the earliest live claim owns the
-  review, and any other host waits. Two leaders during a lease overlap would otherwise
-  both run and bill it (#1056).
+  and model, with an expiry covering the whole run, and reads the PR again. The first claim
+  posted while no other host's claim was live owns the review; its host's later claims
+  renew it, and a claim another host posted meanwhile never counts. Any other host waits.
+  Two leaders during a lease overlap would otherwise both run and bill it (#1056).
 - **Bounds.** One review per (PR, head, model); at most CONDUCTOR_MAX_REVIEWS_PER_DAY (8)
   runs a day; a run is stopped after CONDUCTOR_REVIEW_TIMEOUT (45 min); a job that fails
   three times gets a reply saying so; none run while Claude is out of usage or the
@@ -80,9 +81,10 @@ MAX_BODY = 60000  # characters; GitHub refuses a comment over 65536
 SEVERITIES = ("P0", "P1", "P2", "P3")
 MAX_REVIEWS_PER_DAY = 8
 REVIEW_TIMEOUT_SECONDS = 45 * 60
-# How long a review-claim holds (pr, head, model) for its host: a run's timeout and the tick
-# around it. A host that dies mid-run frees the review when its claim runs out (#1056).
-CLAIM_FOR = dt.timedelta(seconds=REVIEW_TIMEOUT_SECONDS + 15 * 60)
+# A review-claim holds (pr, head, model) for its host for the run's timeout (the configured
+# one) and this margin for the tick around it. A host that dies mid-run frees the review when
+# its claim runs out (#1056).
+CLAIM_MARGIN = dt.timedelta(minutes=15)
 MAX_ATTEMPTS = 3
 KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
@@ -267,17 +269,26 @@ def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: 
 
 def claim_owner(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: str,
                 now: dt.datetime) -> Optional[Dict[str, Any]]:
-    """The live review-claim that owns (pr, head, model): the earliest the app posted whose
-    `until` has not passed, as {"agent", "url"}; None when no claim holds it (#1056)."""
+    """The claim that holds (pr, head, model) at `now`, as {"agent", "url", "until"}; None
+    when none does (#1056). Read in posting order: a claim posted while no other host's claim
+    was live takes the review; one by the holder's host renews it (a later `until`); one by
+    another host meanwhile lost, and never counts, even once the holder's expires. A claim
+    without a posting time is taken to have been posted while the holder was live."""
+    owner: Optional[Dict[str, Any]] = None
     for comment in sorted(pr_comments, key=lambda c: c.get("id") or 0):
         if (comment.get("user") or {}).get("login") != APP_LOGIN:
             continue
         payload = marker.decode(comment.get("body")) or {}
         until = _time(payload.get("until"))
-        if payload.get("kind") == "review-claim" and payload.get("pr") == pr and payload.get("head") == head \
-                and payload.get("model") == model and until is not None and until > now:
-            return {"agent": payload.get("agent") or "", "url": comment.get("html_url") or ""}
-    return None
+        if not (payload.get("kind") == "review-claim" and payload.get("pr") == pr and payload.get("head") == head
+                and payload.get("model") == model and until is not None):
+            continue
+        agent, posted = payload.get("agent") or "", _time(comment.get("created_at"))
+        if owner is None or (posted is not None and owner["until"] <= posted):
+            owner = {"agent": agent, "url": comment.get("html_url") or "", "until": until}
+        elif agent == owner["agent"] and until > owner["until"]:
+            owner.update(url=comment.get("html_url") or "", until=until)
+    return owner if owner is not None and owner["until"] > now else None
 
 
 def ours(comment: Dict[str, Any], payload: Dict[str, Any], repo: str) -> bool:
@@ -658,13 +669,15 @@ class Reviews:
         self.publish(request, record, posting, key)
 
     def claim(self, request: Dict[str, Any], head: str) -> bool:
-        """Whether this host may run the review of (pr, head, model) now. Unless a live claim
-        already holds it, post one and read the PR again: two hosts that claimed at once both
-        see the earlier claim, and only its host runs (#1056)."""
+        """Whether this host may run the review of (pr, head, model) now. Unless another host's
+        claim holds it, post one (a retry renews its own claim, so it covers the whole run) and
+        read the PR again: two hosts that claimed at once both see the earlier claim, and only
+        its host runs (#1056)."""
         path = f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100"
         owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
-        if owner is None:
-            until = snapshot.iso(self.w.now + CLAIM_FOR)
+        lease = self.w.now + dt.timedelta(seconds=self.config.review_timeout) + CLAIM_MARGIN
+        if owner is None or (owner["agent"] == self.agent() and owner["until"] < lease):
+            until = snapshot.iso(lease)
             self.reply(request, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
                                 f"(asked in {request.get('url') or 'a comment'}).",
                        {"kind": "review-claim", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,

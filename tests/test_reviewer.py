@@ -1032,11 +1032,43 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.assertEqual((len(self.reviews()), len(self.app.posts)), (1, posts), "no second run, no second reply")
 
 
-    def other_claim(self, until_minutes, comment_id=1):
-        payload = {"kind": "review-claim", "v": 1, "agent": "reviewer@Eidolon:review", "pr": 7, "head": HEAD,
+    def other_claim(self, until_minutes, comment_id=1, host="Eidolon", posted_minutes=0):
+        payload = {"kind": "review-claim", "v": 1, "agent": f"reviewer@{host}:review", "pr": 7, "head": HEAD,
                    "model": "opus", "request": 1, "until": snapshot.iso(at(until_minutes))}
         return {"id": comment_id, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"}, "body": marker.compose("claim", payload),
-                "html_url": f"https://github.com/o/r/pull/7#issuecomment-{comment_id}"}
+                "html_url": f"https://github.com/o/r/pull/7#issuecomment-{comment_id}",
+                "created_at": snapshot.iso(at(posted_minutes))}
+
+    def claims(self):
+        return [marker.decode(b) for b in self.app.claims]
+
+    def test_the_lease_follows_the_configured_timeout(self):
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        host = self.host("Tycho", request, 5)
+        host.config.review_timeout = 2 * 60 * 60
+        self.replies = [review_reply()]
+        host.review_step([], None, None, True, {})
+        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(5 + 120 + 15))])
+
+    def test_a_retry_renews_a_claim_that_would_run_out_during_it(self):
+        self.app.echo_posts = True
+        self.app.pr_comments.append(self.other_claim(10, host="Tycho", posted_minutes=-50))  # its first attempt's
+        request = reviewer.requests([self.ask(1)])[0]
+        self.replies = [review_reply()]
+        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(5 + 45 + 15))], "renewed for the whole run")
+        comments = self.app.rest_paginated("repos/{repo}/issues/7/comments")
+        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(30))["agent"], "reviewer@Tycho:review",
+                         "past its first claim's expiry, the renewal still holds it")
+
+    def test_a_claim_that_lost_never_takes_over(self):
+        comments = [self.other_claim(50, 1, "Tycho", -10), self.other_claim(55, 2, "Eidolon", -10),  # posted at once
+                    self.other_claim(100, 3, "Tycho", 40)]  # Tycho's renewal
+        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(52))["agent"], "reviewer@Tycho:review")
+        self.assertEqual(reviewer.claim_owner(comments[:2], 7, HEAD, "opus", at(52)), None,
+                         "the loser's claim frees nothing and holds nothing")
+        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(101)), None, "expired")
 
     def test_of_two_claims_posted_at_once_the_earlier_runs(self):
         self.app.echo_posts = True
