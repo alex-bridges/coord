@@ -674,6 +674,55 @@ class CodexRoundThreeTests(unittest.TestCase):
         [comment] = snapshot.fetch_coord_comments(Fake(), NOW)
         self.assertEqual(comment["author"], {"login": "inisa-sidechain[bot]", "type": "Bot"})
 
+    def test_head_records_older_than_the_window_are_read_from_the_labelled_pr(self):
+        # #1055: a record past CLAIM_WINDOW_DAYS is not in the repo-wide window; a PR
+        # labelled for it gets its own comments read, and only such a PR does.
+        head = "a" * 40
+        old = (snapshot.CLAIM_WINDOW_DAYS + 3) * 24 * 60
+
+        def raw(cid, number, minutes_ago, payload):
+            return {"id": cid, "issue_url": f"https://api.github.com/repos/{REPO}/issues/{number}",
+                    "created_at": t(minutes_ago), "html_url": f"h/{cid}", "user": dict(ALEX),
+                    "body": marker.compose("x", dict(payload, v=1, agent="a", pr=number, head=head))}
+
+        history = {
+            7: [raw(1, 7, old, {"kind": "review-clean"}), raw(2, 7, old, {"kind": "alex-approve"}),
+                raw(3, 7, old, {"kind": "train-add"})],
+            8: [raw(4, 8, old, {"kind": "review-clean"})],  # no label: never read
+            9: [raw(5, 9, 60, {"kind": "review-clean"})],   # in the window: never read again
+        }
+        labelled = [{"name": n} for n in ("reviewed", "alex-approved", "train")]
+        nodes = [pr_node(number=7, labels={"nodes": labelled}), pr_node(number=8),
+                 pr_node(number=9, labels={"nodes": [{"name": "reviewed"}]})]
+        paths = []
+
+        class Fake:
+            owner, name, repo, calls = "alex-bridges", "INISA", REPO, 0
+
+            def graphql(self, query, variables=None):
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m"}},
+                                       "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                        "nodes": nodes}}}
+
+            def rest_paginated(self, path):
+                paths.append(path)
+                if path.startswith("repos/{repo}/issues/comments"):  # the window: what `since` keeps
+                    return list(history[9])
+                for number, comments in history.items():
+                    if path.startswith(f"repos/{{repo}}/issues/{number}/comments"):
+                        return list(comments)
+                return []
+
+        snap = snapshot.build(Fake(), NOW)
+        by_number = {p["number"]: p for p in snap["prs"]}
+        self.assertEqual(by_number[7]["reviewedHead"], head)
+        self.assertEqual(by_number[7]["alexApprovedHead"], head)
+        self.assertEqual([q["headAtAdd"] for q in snap["train"]], [head])
+        self.assertIsNone(by_number[8]["reviewedHead"])
+        self.assertEqual(by_number[9]["reviewedHead"], head)
+        self.assertEqual([p for p in paths if "/issues/" in p and "/issues/comments" not in p],
+                         ["repos/{repo}/issues/7/comments?per_page=100"])
+
     HEAD = "abc" + "0" * 37  # the fake PR's current head
 
     def run_attestation(self, argv):

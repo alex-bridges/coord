@@ -22,7 +22,7 @@ import re
 import urllib.parse
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from . import lease, marker, outage, review
+from . import lease, marker, outage, review, train
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 CLAIM_WINDOW_DAYS = 14
@@ -361,23 +361,26 @@ def fetch_coord_comments(gh: GitHub, since: dt.datetime) -> List[Dict[str, Any]]
     the issue in advance.
     """
     raw = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={iso(since)}&per_page=100")
-    out = []
-    for comment in raw:
-        payload = marker.decode(comment.get("body"))
-        if payload is None:
-            continue
-        match = _ISSUE_URL.search(comment.get("issue_url") or "")
-        out.append({
-            "id": comment.get("id"),
-            "on": int(match.group(1)) if match else None,
-            "createdAt": comment.get("created_at"),
-            "url": comment.get("html_url"),
-            "text": marker.strip(comment.get("body") or ""),
-            "payload": payload,
-            "author": comment_author(comment),  # attestations count only from a trusted user
-        })
+    out = [c for c in map(coord_comment, raw) if c is not None]
     out.sort(key=lambda c: c["id"] or 0)
     return out
+
+
+def coord_comment(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A REST comment in the snapshot's shape, or None if it carries no marker."""
+    payload = marker.decode(comment.get("body"))
+    if payload is None:
+        return None
+    match = _ISSUE_URL.search(comment.get("issue_url") or "")
+    return {
+        "id": comment.get("id"),
+        "on": int(match.group(1)) if match else None,
+        "createdAt": comment.get("created_at"),
+        "url": comment.get("html_url"),
+        "text": marker.strip(comment.get("body") or ""),
+        "payload": payload,
+        "author": comment_author(comment),  # attestations count only from a trusted user
+    }
 
 
 def fetch_targets(gh: GitHub, numbers: Iterable[int], branches: Iterable[str]) -> Dict[str, Any]:
@@ -824,6 +827,43 @@ def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> Li
     return queue
 
 
+# The label that says a PR has a record, and the record's kind (any of them).
+LABELLED_RECORDS = {
+    train.REVIEWED_LABEL: ("review-clean", "review-substitute"),
+    train.ALEX_APPROVED_LABEL: ("alex-approve",),
+    TRAIN_LABEL: ("train-add",),
+}
+
+
+def with_aged_head_records(gh: GitHub, prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """`comments` plus the whole history of each PR whose label promises a record the
+    window does not hold (#1055): `reviewed`, `alex-approved` or `train` on a PR whose
+    review, approval or train-add was last touched more than CLAIM_WINDOW_DAYS ago.
+
+    API cost: one paginated call per such PR per snapshot, and none for a PR whose
+    records are all in the window, so it fires only when a head has sat that long.
+    For head records and the train queue only: old claims, messages and leases stay
+    out of the rest of the snapshot."""
+    seen = {(c["payload"].get("pr"), c["payload"].get("kind")) for c in comments
+            if c.get("on") == c["payload"].get("pr")
+            and (c["payload"].get("kind") not in HEAD_RECORDS or trusted_attestation(c.get("author"), gh.repo))}
+    extra: List[Dict[str, Any]] = []
+    for pr in prs:
+        number = pr["number"]
+        if not any(label in pr["labels"] and not any((number, kind) in seen for kind in kinds)
+                   for label, kinds in LABELLED_RECORDS.items()):
+            continue
+        for raw in gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
+            comment = coord_comment(raw)
+            if comment is not None and comment["on"] == number and comment["payload"].get("pr") == number:
+                extra.append(comment)
+    if not extra:
+        return comments
+    merged = {c["id"]: c for c in comments}
+    merged.update({c["id"]: c for c in extra})
+    return sorted(merged.values(), key=lambda c: c["id"] or 0)
+
+
 def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
     now = now or now_utc()
     main, pr_nodes = fetch_prs(gh)
@@ -836,7 +876,8 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p["issue"] for p in claim_payloads if isinstance(p.get("issue"), int)],
         [p.get("branch") or "" for p in claim_payloads],
     )
-    attach_head_records(prs, comments, gh.repo)
+    records = with_aged_head_records(gh, prs, comments)
+    attach_head_records(prs, records, gh.repo)
     outage_windows = outage.windows(comments)
     claims = resolve_claims(comments, targets, prs, now, outage_windows)
     # A `send` message, or any other record addressed to someone (the train's held notice).
@@ -849,7 +890,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         "prs": prs,
         "claims": claims,
         "overlaps": overlaps(prs, claims),
-        "train": train_queue(prs, comments),
+        "train": train_queue(prs, records),
         "runs": runs,
         "messages": messages,
         # Outage windows of the last CLAIM_WINDOW_DAYS; `active` ones are what the board shows.
