@@ -311,7 +311,8 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
            counts_for_train: bool, run: Dict[str, Any], blocked_by: str = "") -> Tuple[str, Dict[str, Any]]:
     findings = result["findings"]
     passed = outcome == "pass"
-    lines = [f"## Review by inisa-sidechain: {'PASS' if passed else 'changes requested'} at `{head[:9]}` ({model})", ""]
+    title = "PASS" if passed else "stale (not counted)" if outcome == "stale" else "changes requested"
+    lines = [f"## Review by inisa-sidechain: {title} at `{head[:9]}` ({model})", ""]
     if request.get("url"):
         lines.append(f"Requested in {request['url']}. Pass means no P0, P1 or P2 finding; P3 notes do not block.")
     if passed:
@@ -321,6 +322,8 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
                      f"({blocked_by}). Push a fix; a pass by another model does not answer those findings."
                      if blocked_by and blocked_by.startswith("http") else
                      f"This does not count for the train: {blocked_by}.")
+    if outcome == "stale":
+        lines.append(f"These findings do not hold the head: {blocked_by}.")
     lines.append("")
     if result.get("summary"):
         lines += [result["summary"], ""]
@@ -535,10 +538,25 @@ class Reviews:
         except GitHubError as error:
             self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
 
+    def checkout_off_main(self) -> str:
+        """Why the conductor's checkout may not govern a review, or "": the reviewer's orders,
+        guard and settings come from it, so it must be detached at origin/main, not on a
+        branch, however clean (Codex on #1049)."""
+        if self.w.git(["symbolic-ref", "-q", "HEAD"])[0] == 0:
+            return "the conductor's checkout is on a branch, not detached at origin/main"
+        head = self.w.git(["rev-parse", "HEAD"])
+        main = self.w.git(["rev-parse", "refs/remotes/origin/main"])
+        if head[0] != 0 or main[0] != 0 or not head[1].strip() or head[1].strip() != main[1].strip():
+            return "the conductor's checkout is not at origin/main"
+        return ""
+
     def may_run(self) -> str:
         """Why a new model run may not start now, or ""."""
         if getattr(self, "blocked", ""):
             return self.blocked
+        off = self.checkout_off_main()
+        if off:
+            return off
         cap = self.config.max_reviews_per_day
         if self.runs_today(self.w.now) >= cap:
             return f"{cap} reviews in 24 h, the cap"
@@ -638,7 +656,8 @@ class Reviews:
                 self.runs.pop()  # the pre-run beat failed: no model ran, so no run is counted
             raise
         finally:
-            kill_holders([worktree, scratch])  # anything the run left running in its trees
+            kill_run(getattr(self, "run_tag", ""))  # anything the run left running, anywhere
+            kill_holders([worktree, scratch])  # and anything still in its trees
             self.w.git(["worktree", "remove", "--force", worktree])
             shutil.rmtree(scratch, ignore_errors=True)
             self.restore_checkout(clean)
@@ -676,14 +695,19 @@ class Reviews:
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
         # The diff reviewed was head against this base. If the PR's base moved or it was
-        # retargeted since, the pass covers another diff: advice only (Codex on #1049).
+        # retargeted since, either verdict is about another diff: a pass is advice, and a
+        # `changes` is posted as `stale`, which holds nothing (Codex on #1049).
         current = self.app.rest(f"repos/{{repo}}/pulls/{request['pr']}") or {}
-        if outcome == "pass" and finished.get("base") and base_of(current) != finished["base"]:
-            blocked_by = blocked_by or f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
+        if finished.get("base") and base_of(current) != finished["base"]:
+            moved = f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
+            if outcome == "pass":
+                blocked_by = blocked_by or moved
+            else:
+                outcome, blocked_by = "stale", moved
         counts = outcome == "pass" and not blocked_by
         # A blocking review of a head whose clean review is recorded withdraws that record;
         # the blocking marker holds the head in the train either way (Codex on #1049).
-        revoke = outcome != "pass" and reviewed_head(comments, request["pr"], self.app.repo) == head
+        revoke = outcome == "changes" and reviewed_head(comments, request["pr"], self.app.repo) == head
         body, payload = render(request["pr"], head, request["model"], found, outcome, request, counts, run,
                                blocked_by or "")
         return {"head": head, "body": body, "payload": payload, "counts": counts, "verdict": outcome,
@@ -810,6 +834,9 @@ class Reviews:
         env = isolated_env(dict(os.environ), empty)
         # CONDUCTOR_WAKE turns on the conductor guard hook for this run.
         env.update({"COORD_AGENT": self.agent(), "CONDUCTOR_WAKE": "1", "CONDUCTOR_STATE_DIR": self.config.state_dir})
+        # Every process of this run inherits it, wherever it goes: kill_run finds them by it.
+        self.run_tag = secrets.token_hex(8)
+        env["COORD_REVIEW_RUN"] = self.run_tag
         self.w.say(f"reviewing #{request['pr']} at {head[:9]} with {request['model']}")
         stop = threading.Event()
         beating = threading.Thread(target=self.w._beat_while_running, args=(stop, getattr(self, "extra", {}), True),
@@ -825,6 +852,28 @@ class Reviews:
         finally:
             stop.set()
         return completed, int((snapshot.now_utc() - started).total_seconds())
+
+
+def kill_run(tag: str) -> None:
+    """SIGKILL every process whose environment carries this run's COORD_REVIEW_RUN tag: a
+    PR's test that left the process group (setsid) and the review trees is still found
+    (Codex on #1049). `ps -E` shows the environment of this user's processes. A process that
+    rewrote its own environment escapes this; only a separate OS identity closes that."""
+    if not re.fullmatch(r"[0-9a-f]{16}", tag or ""):
+        return
+    try:
+        listed = subprocess.run(["ps", "-axwwE", "-o", "pid=,command="], capture_output=True, text=True,
+                                timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    needle = re.compile(r"(^|\s)COORD_REVIEW_RUN=" + tag + r"(\s|$)")
+    for line in listed.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() and needle.search(rest):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
 
 
 def kill_holders(paths: List[str]) -> None:

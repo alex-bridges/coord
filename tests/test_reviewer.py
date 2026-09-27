@@ -187,6 +187,10 @@ class ReviewFlowTests(unittest.TestCase):
 
     def git(self, args):
         self.git_calls.append(args)
+        if args[:2] == ["symbolic-ref", "-q"]:
+            return 1, ""  # detached
+        if args[:1] == ["rev-parse"]:
+            return 0, "m" * 40 + "\n"  # HEAD and origin/main agree
         return 0, ""
 
     def tick(self, minutes, app="default", config=None, **kwargs):
@@ -554,9 +558,11 @@ class CodexRoundTests(ReviewFlowTests):
         states = iter([(0, ""), (0, " M README.md\n")])
         calls = []
 
+        base = self.git
+
         def git(args):
             calls.append(args)
-            return next(states) if args == ["status", "--porcelain"] else (0, "")
+            return next(states) if args == ["status", "--porcelain"] else base(args)
         self.git = git
         self.tick(0)
         self.ask(1)
@@ -568,9 +574,11 @@ class CodexRoundTests(ReviewFlowTests):
     def test_c7_a_checkout_dirty_before_the_run_is_left_alone(self):
         calls = []
 
+        base = self.git
+
         def git(args):
             calls.append(args)
-            return (0, " M notes\n") if args == ["status", "--porcelain"] else (0, "")
+            return (0, " M notes\n") if args == ["status", "--porcelain"] else base(args)
         self.git = git
         self.tick(0)
         self.ask(1)
@@ -1253,6 +1261,66 @@ class CodexRound16Tests(ReviewFlowTests):
         jobs = reviewer.Reviews(watcher, self.app)
         jobs.prune()
         self.assertIn("1", watcher.state["reviews"])
+
+
+class CodexRound17Tests(ReviewFlowTests):
+    def test_s1_a_run_tagged_process_is_killed_wherever_it_went(self):
+        tag = "ab" * 8
+        env = dict(os.environ, COORD_REVIEW_RUN=tag)
+        child = subprocess.Popen([sys.executable, "-c", "import os, time; os.chdir('/'); time.sleep(60)"],
+                                 env=env, start_new_session=True)
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 env=dict(os.environ, COORD_REVIEW_RUN="cd" * 8), start_new_session=True)
+        try:
+            time.sleep(0.5)
+            reviewer.kill_run(tag)
+            self.assertEqual(child.wait(timeout=10), -9)
+            self.assertIsNone(other.poll(), "another run's processes are left alone")
+        finally:
+            other.kill()
+            other.wait()
+
+    def test_s1_every_run_gets_its_own_tag(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.tick(5)
+        self.assertRegex(self.reviews()[0]["env"]["COORD_REVIEW_RUN"], r"^[0-9a-f]{16}$")
+
+    def test_s2_a_blocking_review_over_a_moved_base_holds_nothing(self):
+        self.app.pr["base"] = {"ref": "claude/parent", "sha": "b" * 40}
+        runner = self.runner
+
+        def moving(cmd, cwd, env, timeout):
+            self.app.pr["base"] = {"ref": "main", "sha": "c" * 40}  # retargeted mid-run
+            return runner(cmd, cwd, env, timeout)
+        self.runner = moving
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply([{"severity": "P1", "summary": "bug"}])]
+        self.tick(5)
+        review = self.app.markers("review")[0]
+        self.assertEqual(review["verdict"], "stale")
+        comment = {"user": {"login": reviewer.APP_LOGIN}}
+        self.assertIsNone(snapshot.sidechain_blocks(comment, review), "a stale verdict holds nothing")
+        self.assertIn("base moved", self.app.posts[-1])
+
+    def test_s3_no_run_unless_the_checkout_is_detached_at_origin_main(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        real = self.git
+        self.git = lambda args: (0, "refs/heads/feature\n") if args[:2] == ["symbolic-ref", "-q"] else real(args)
+        lines = self.tick(5)
+        self.assertEqual(self.reviews(), [])
+        self.assertTrue(any("on a branch" in line for line in lines))
+        self.git = lambda args: (0, ("d" if args[-1] == "HEAD" else "m") * 40) if args[:1] == ["rev-parse"] else real(args)
+        lines = self.tick(10)
+        self.assertEqual(self.reviews(), [])
+        self.assertTrue(any("not at origin/main" in line for line in lines))
+        self.git = real
+        self.tick(15)
+        self.assertEqual(len(self.reviews()), 1)
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):
