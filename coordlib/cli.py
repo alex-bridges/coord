@@ -408,6 +408,10 @@ def cmd_release(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
+    if args.on is not None and not args.to and args.on in known_mailboxes(gh.repo):
+        # --on N alone reaches whoever works on N; nobody works on the mailbox (#1070).
+        raise UsageError(f"#{args.on} is the mailbox issue: nobody works on it, so --on alone reaches no one. "
+                         "Name the recipient with --to <agent> (the sender of the message you answer).")
     recipients = args.to or (["all"] if args.on is None else [f"#{args.on}"])
     target = args.on if args.on is not None else find_or_create_mailbox(gh)
     payload = {"kind": "msg", "v": 1, "agent": me, "to": recipients}
@@ -420,6 +424,14 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
     for line in down_warnings(gh.repo, recipients):
         print(line)
     return EXIT_OK
+
+
+def known_mailboxes(repo: str) -> set:
+    """Mailbox issue numbers seen on this machine's cached board: a message sent without --on
+    lands there. No call (`send` must stay cheap and always run), so a cold cache knows none."""
+    cached = cache.load_snapshot(repo, float("inf"))
+    return {m.get("on") for m in (cached or {}).get("messages") or []
+            if m.get("payload", {}).get("kind") == "msg" and "on" not in m.get("payload", {})}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:
