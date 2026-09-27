@@ -538,6 +538,7 @@ class Reviews:
     def step(self, issue_comments: List[Dict[str, Any]], windows: List[Dict[str, Any]], blocked: str,
              extra: Optional[Dict[str, Any]] = None) -> None:
         self.extra = extra or {}
+        self.began = snapshot.now_utc()  # for clock(): the tick's time, advanced by what this step took
         self.prune()
         jobs = sorted(self.pending(issue_comments), key=lambda r: not r.get("unsent"))
         if not jobs:
@@ -566,7 +567,14 @@ class Reviews:
             if record.get("unsent"):
                 self.send_unsent(request, record)
                 return
-            self.handle(request, record, windows)
+            try:
+                self.handle(request, record, windows)
+            finally:
+                # However handle ended (a wait, a failed read, compose or post), a finished review
+                # not yet posted keeps its claim (Codex on #1088).
+                pending = record.get("posting") or record.get("finished")
+                if record.get("status") == "pending" and pending:
+                    self.keep_claim(request, record, pending["head"])
         except AppAuthError as error:
             self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
         except GitHubError as error:
@@ -667,11 +675,12 @@ class Reviews:
             # counts is decided on the PR's state as it is then (Codex on #1049).
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
-        try:
-            self.publish(request, record, posting, key)
-        finally:
-            if record.get("posting"):  # not posted yet (a wait, or a failed post)
-                self.keep_claim(request, record, posting["head"])
+        self.publish(request, record, posting, key)
+
+    def clock(self) -> dt.datetime:
+        """The tick's time advanced by the wall time this step has taken so far: after a
+        model run, self.w.now is up to a whole run behind (Codex on #1088)."""
+        return self.w.now + (snapshot.now_utc() - getattr(self, "began", snapshot.now_utc()))
 
     def lease(self) -> dt.datetime:
         """When a claim posted now runs out: the run's configured timeout and the margin."""
@@ -697,11 +706,19 @@ class Reviews:
         read the PR again: two hosts that claimed at once both see the earlier claim, and only
         its host runs (#1056)."""
         path = f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100"
-        owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
+        comments = self.app.rest_paginated(path)
+        owner = claim_owner(comments, request["pr"], head, request["model"], self.w.now)
         if owner is None or (owner["agent"] == self.agent() and owner["until"] < self.lease()):
             self.post_claim(request, record, head, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
                                                    f"(asked in {request.get('url') or 'a comment'}).")
-            owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
+            comments = self.app.rest_paginated(path)
+            owner = claim_owner(comments, request["pr"], head, request["model"], self.w.now)
+        if request["id"] in answered(comments, self.app.repo) \
+                or posted_review(comments, request["pr"], head, request["model"], self.app.repo) is not None:
+            # A holder whose claim lapsed while its finished review waited posted it since
+            # handle's read: the next tick settles the request from the PR (Codex on #1088).
+            self.w.say(f"review of #{request['pr']} waits: it was answered meanwhile")
+            return False
         if owner is not None and owner["agent"] != self.agent():
             self.w.say(f"review of #{request['pr']} waits: {owner['agent']} holds its claim {owner['url']}")
             return False
@@ -710,7 +727,7 @@ class Reviews:
         return True
 
     def keep_claim(self, request: Dict[str, Any], record: Dict[str, Any], head: str) -> None:
-        """While a finished review waits to be posted (Alex's budget low, a failed post), keep
+        """While a finished review waits to be posted (Alex's budget low, a failed read or post), keep
         its claim live: whenever less than one gap() of it is left, it is renewed for two, so
         it cannot lapse before this host next handles it (one comment per gap, about an hour,
         while it waits). Otherwise another host, seeing no live claim and no answer, would run
@@ -718,14 +735,15 @@ class Reviews:
         read from the PR, so a waiting review costs no read a tick. A renewal after the claim
         lapsed (this host was down past it) may lose to another host's claim under
         claim_owner's rule; the finished review is posted all the same, since it is paid for.
-        Best-effort: a failed renewal is tried again on the next tick."""
-        until = _time(record.get("claimUntil"))
-        if until is not None and until >= self.w.now + self.gap():
+        Best-effort: a failed renewal is tried again on the next tick. Timed by clock(), not
+        the tick's start: the run that just finished may have taken most of the claim."""
+        until, now = _time(record.get("claimUntil")), self.clock()
+        if until is not None and until >= now + self.gap():
             return
         try:
             self.post_claim(request, record, head, f"@inisa-sidechain has reviewed `{head[:9]}` with {request['model']} "
                                                    f"and is still posting it (asked in {request.get('url') or 'a comment'}).",
-                            self.w.now + 2 * self.gap())
+                            now + 2 * self.gap())
         except AppAuthError:
             raise
         except GitHubError as error:

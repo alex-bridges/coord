@@ -1119,6 +1119,64 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.assertEqual(len(self.app.markers("review")), 1)
         self.assertEqual(len(self.claims()), 2, "posted: nothing more to hold")
 
+    def test_a_review_that_cannot_be_composed_keeps_its_claim(self):
+        """Codex on 369c620: a read failing in compose() skipped the renewal."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        first = self.host("Tycho", request, 5)
+        self.replies = [review_reply()]
+        first.review_step([], None, None, True, {}, user_ok=False)  # finished; waits on the budget
+        real = self.app.rest_paginated
+
+        def failing(path):
+            if path.startswith("repos/{repo}/issues/7/comments"):
+                raise reviewer.GitHubError("HTTP 502")
+            return real(path)
+        self.app.rest_paginated = failing
+        first.now = at(90)  # the first renewal (to 155) has under one gap left
+        first.review_step([], None, None, True, {})
+        self.assertEqual([c["until"] for c in self.claims()],
+                         [snapshot.iso(at(65)), snapshot.iso(at(5 + 150)), snapshot.iso(at(90 + 150))])
+
+    def test_a_review_answered_after_the_claim_is_not_run(self):
+        """Codex on 369c620: a lapsed holder posting its finished review between handle's
+        read and the claim's re-read must stop this run."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        real = self.app.rest
+
+        def racing(path, method="GET", body=None):
+            if method == "POST" and "review-claim" in ((body or {}).get("body") or ""):
+                payload = {"kind": "review", "v": 1, "agent": "reviewer@Eidolon:review", "pr": 7, "head": HEAD,
+                           "model": "opus", "request": request["id"], "verdict": "pass"}
+                self.app.pr_comments.append({"id": 2, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"},
+                                             "body": marker.compose("review", payload),
+                                             "html_url": "https://github.com/o/r/pull/7#issuecomment-2"})
+            return real(path, method, body)
+        self.app.rest = racing
+        self.replies = [review_reply()]
+        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.assertEqual(self.reviews(), [], "answered meanwhile: no second run")
+
+    def test_the_renewal_after_a_long_run_counts_the_run(self):
+        """Codex on 369c620: after a run of most of its lease, the tick's start time said the
+        claim had a whole gap left when only the margin did."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        host = self.host("Tycho", request, 5)
+        host.config.review_timeout = 2 * 60 * 60  # at least the run timeout: gap = 2 h 15
+        wall, runner = [at(5)], self.runner
+
+        def long_run(cmd, cwd, env, timeout):
+            wall[0] += dt.timedelta(minutes=120)
+            return runner(cmd, cwd, env, timeout)
+        self.runner = host.runner = long_run
+        self.replies = [review_reply()]
+        with mock.patch.object(snapshot, "now_utc", side_effect=lambda: wall[0]):
+            host.review_step([], None, None, True, {}, user_ok=False)
+        self.assertEqual([c["until"] for c in self.claims()],
+                         [snapshot.iso(at(5 + 135)), snapshot.iso(at(125 + 270))])
+
     def test_an_expired_claim_frees_the_review(self):
         self.app.echo_posts = True
         self.app.pr_comments.append(self.other_claim(4))  # its host died mid-run
