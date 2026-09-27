@@ -108,8 +108,36 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
             raise
         mark_app_unavailable(gh, error)
         return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused, gh.app_stale)
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        return snapshot_despite_budget(gh, gh.budget_low)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
+
+
+def mark_exhausted(gh: GitHub, error: GitHubError) -> bool:
+    """The read that discovers an exhausted quota (#1052): in a cache read, a 403 or 429
+    whose recorded headers (`_http` records them before raising) put the budget below the
+    read floor marks the command budget-low, as the next call's gate would, and the caller
+    serves its cache. False for any other error, or outside a cache read."""
+    low = exhausted_words(gh, error) if getattr(gh, "cache_read", False) else None
+    if low is None:
+        return False
+    gh.budget_low = low  # type: ignore[attr-defined]
+    return True
+
+
+def exhausted_words(gh: GitHub, error: GitHubError) -> Optional[str]:
+    """The budget-low line when `error` is a 403 or 429 and the recorded reading of the
+    budget it spent, this command's principal's, is now below the read floor; else None."""
+    principal = gh.principal()
+    if getattr(error, "status", None) not in (403, 429) or not getattr(error, "resource", None) or not principal:
+        return None
+    reading = budget.current(gh.repo, error.resource, principal=principal)
+    if reading is None or budget.left(reading) >= budget.read_floor():
+        return None
+    return budget.low_words(reading)
 
 
 def mark_app_unavailable(gh: GitHub, error: Exception) -> None:
@@ -541,6 +569,9 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         since = snapshot.now_utc() - dt.timedelta(days=INBOX_DEFAULT_DAYS)
     started = snapshot.now_utc()
     snap = get_snapshot(gh, args.max_age)
+    if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
+        # The snapshot build was the refused read (#1052): reading comments would cost more.
+        return inbox_from_snapshot(args, gh, me, snap)
     try:
         issue_comments = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={snapshot.iso(since)}&per_page=100")
         review_comments = gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={snapshot.iso(since)}&per_page=100")
@@ -548,6 +579,11 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         if not getattr(gh, "app_unavailable", None):  # get_snapshot served a fresh cache and said nothing
             mark_app_unavailable(gh, error)
             print(f"coord: {gh.app_unavailable}; counting from the cached snapshot", file=sys.stderr)
+        return inbox_from_snapshot(args, gh, me, snap)
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        print(f"coord: {gh.budget_low}; counting from the cached snapshot", file=sys.stderr)
         return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
     if args.json:
@@ -731,6 +767,12 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
         low = gh.app_unavailable
         print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
         refs = []
+    except GitHubError as error:
+        if not mark_exhausted(gh, error):
+            raise
+        low = gh.budget_low
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        refs = []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
     try:
@@ -747,6 +789,12 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     except AppAuthError as error:  # the read token failed after the refs (on any page of the runs)
         mark_app_unavailable(gh, error)
         low = gh.app_unavailable
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        batches = []
+    except GitHubError as error:  # the budget ran out on a page of the runs
+        if not mark_exhausted(gh, error):
+            raise
+        low = gh.budget_low
         print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
         batches = []
     queue = []
