@@ -108,6 +108,8 @@ _MODEL = re.compile(r"^\s*(?:model\s*[=:]\s*(?P<explicit>[\w.-]+)|(?P<bare>[\w.-
 _FENCE = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,}).*?(^[ \t]{0,3}(?P=mark)|\Z)", re.S | re.M)
 _INLINE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)", re.S)
 _INDENTED = re.compile(r"^(?: {4}|\t)")
+# Raw HTML that GitHub renders as code or a quote (Codex on #1049); an unclosed one runs to the end.
+_HTML = re.compile(r"<(code|pre|kbd|samp|tt|blockquote|q)\b[^>]*>.*?(</\1\s*>|\Z)", re.S | re.I)
 # Markdown container prefixes: list markers and quote markers, nested in any order (Codex on #1049).
 _CONTAINER = re.compile(r"^(?:[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+|[ \t]*>[ \t]?)*[ \t]*")
 _PR_URL = re.compile(r"/pull/(\d+)")
@@ -137,7 +139,7 @@ def find_tag(body: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
     call it one: missing a request costs a re-ask, a false one a 45-minute run.
     """
     kept = []
-    for line in (body or "").splitlines():
+    for line in _HTML.sub("", body or "").splitlines():
         prefix = _CONTAINER.match(line).group(0)
         if ">" in prefix or _INDENTED.match(line):
             kept.append("")  # quoted, at any depth or inside a list item, or indented code
@@ -514,7 +516,8 @@ class Reviews:
         self.blocked = blocked
         # Work that needs no model run (a reply or a finished review to post) goes ahead
         # through a pause, an outage or the cap; only starting a run waits (Codex on #1049).
-        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished")]
+        # A request with a known error needs only its reply (Codex on #1049).
+        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished") or r.get("error")]
         if blocked and not continuing:
             self.w.say(f"{len(jobs)} review request(s) waiting: {blocked}")
             return

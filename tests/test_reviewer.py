@@ -1210,6 +1210,23 @@ class CodexRound13Tests(ReviewFlowTests):
         self.assertEqual([r["status"] for r in state["reviews"].values()], ["pending"])
 
 
+class CodexRound14Tests(ReviewFlowTests):
+    def test_p1_html_code_and_quotes_hide_the_tag(self):
+        for body in ("<code>@inisa-sidechain review</code>", "<blockquote>\n@inisa-sidechain review\n</blockquote>",
+                     "<PRE class='x'>@inisa-sidechain review</PRE>", "<kbd>@inisa-sidechain review", "<q>@inisa-sidechain review</q>"):
+            self.assertIsNone(reviewer.find_tag(body), body)
+        self.assertEqual(reviewer.find_tag("<b>note</b> @inisa-sidechain review haiku")["model"], "haiku")
+
+    def test_p2_a_bad_model_is_answered_during_a_pause(self):
+        watcher = mock.Mock(state={"reviews": {"1": {"id": 1, "pr": 7, "model": None, "error": "unknown model `x`",
+                                                     "url": "u", "status": "pending"}}},
+                            config=self.config, now=at(10), say=lambda *_: None)
+        jobs = reviewer.Reviews(watcher, self.app)
+        jobs.step([], [], "paused until later")
+        self.assertTrue(any("unknown model" in p for p in self.app.posts))
+        self.assertEqual(self.reviews(), [])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
