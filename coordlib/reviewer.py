@@ -75,6 +75,9 @@ MAX_ATTEMPTS = 3
 CODEX_OUT = "reached your Codex usage limits"
 CODEX_LOGINS = ("chatgpt-codex-connector[bot]", "chatgpt-codex-connector")
 CODEX_HARNESS = "codex-review"
+# Who may declare a codex-review outage that authorizes a substitute: Alex's login (every
+# agent posts as it) and this app (coord in app mode). Not any commenter (Codex on #1049).
+OUTAGE_AUTHORS = ("alex-bridges", snapshot.SIDECHAIN_LOGIN)
 KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
 # Directories never copied into the reviewer's view of the PR: Claude Code loads agents,
@@ -625,7 +628,13 @@ class Reviews:
         head_time = pushed_at(suites.get("check_suites") or [], (pr.get("head") or {}).get("ref") or "")
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
-        counts = outcome == "pass" and not blocked_by and codex_out(comments, head_time, windows, now)
+        # The time and outages as they are now, after a run that may have taken 45 minutes, not
+        # at the tick's start; and only outages declared by a trusted author (Codex on #1049).
+        records = getattr(self.w, "records", None)
+        trusted = [c for c in (records if isinstance(records, list) else [])
+                   if ((c.get("author") or {}).get("login")) in OUTAGE_AUTHORS]
+        counts = outcome == "pass" and not blocked_by and codex_out(comments, head_time, outage.windows(trusted),
+                                                                    snapshot.now_utc())
         # A blocking review of a head that a substitute review passed withdraws that pass;
         # otherwise the train would still take the head (Codex on #1049).
         revoke = outcome != "pass" and substitute_head(comments, request["pr"]) == head

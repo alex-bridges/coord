@@ -457,7 +457,8 @@ def coord_comments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         payload = marker.decode(comment.get("body"))
         if payload is not None:
             out.append({"id": comment.get("id"), "createdAt": comment.get("created_at"), "url": comment.get("html_url"),
-                        "text": marker.strip(comment.get("body") or ""), "payload": payload})
+                        "text": marker.strip(comment.get("body") or ""), "payload": payload,
+                        "author": {"login": (comment.get("user") or {}).get("login")}})
     return sorted(out, key=lambda c: c["id"] or 0)
 
 
@@ -770,8 +771,12 @@ class Watcher:
                 self.post_outage(result["limit"])
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
-        if leader and github_ok and can_read and self.issue_comments is not None and not woke:
-            self.review_step(windows, down, pause, wake, extra)
+        if leader and github_ok and not woke:
+            # Below the read floor, or when this tick's read failed, a finished review or a
+            # reply still posts: that uses the app's own budget (Codex on #1049). New runs wait.
+            reading = can_read and self.issue_comments is not None
+            self.review_step(windows, down, pause, wake, extra,
+                             "" if reading else "Alex's API budget is under the read floor, or this tick's read failed")
         if github_ok and can_write:
             try:
                 self.beat(leader, extra)
@@ -787,10 +792,11 @@ class Watcher:
         return app_gh if app_gh.app is not None else None
 
     def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
-                    pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None) -> None:
+                    pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None,
+                    unread: str = "") -> None:
         """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
         from . import reviewer
-        blocked = ("waking is off (--no-wake)" if not wake
+        blocked = (unread if unread else "waking is off (--no-wake)" if not wake
                    else f"Claude is down until {iso(down['end'])}" if down
                    else f"paused until {pause['until']}" if pause else "")
         jobs = reviewer.Reviews(self, None)

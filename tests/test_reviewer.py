@@ -892,6 +892,45 @@ class CodexRound4Tests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 1)
 
 
+class CodexRound5Tests(ReviewFlowTests):
+    """Codex's review of e701749e (#1049)."""
+
+    def compose(self, author, now):
+        start = {"kind": "outage", "v": 1, "event": "start", "harness": "codex-review", "until": snapshot.iso(at(30))}
+        records = [{"id": 1, "createdAt": snapshot.iso(at(-10)), "payload": start, "author": {"login": author}}]
+        watcher = mock.Mock(state={}, config=self.config, now=at(0), records=records)
+        jobs = reviewer.Reviews(watcher, self.app)
+        finished = {"head": HEAD, "found": reviewer.normalize({"findings": []}), "verdict": "pass", "run": {}}
+        with mock.patch.object(reviewer.snapshot, "now_utc", return_value=now):
+            return jobs.compose({"pr": 7, "id": 1, "url": "", "model": "opus"}, self.app.pr, finished, [])
+
+    def test_g1_an_outage_that_ended_during_the_run_does_not_count(self):
+        self.assertTrue(self.compose("alex-bridges", at(10))["counts"], "in force when posted")
+        self.assertFalse(self.compose("alex-bridges", at(45))["counts"], "ran out during the run")
+
+    def test_g3_only_a_trusted_author_declares_a_codex_outage(self):
+        self.assertTrue(self.compose(reviewer.APP_LOGIN, at(10))["counts"])
+        self.assertFalse(self.compose("mallory", at(10))["counts"])
+        self.assertFalse(self.compose(None, at(10))["counts"])
+
+    def test_g4_a_finished_review_posts_below_the_read_floor(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        watcher = conductor.Watcher(self.config, self.gh, now=at(10), runner=self.runner,
+                                    disk=lambda path: 100.0, git=self.git)
+        watcher.app_gh_factory = lambda: self.app
+        watcher.issue_comments = None  # nothing read this tick
+        with open(os.path.join(self.config.state_dir, "state.json")) as handle:
+            watcher.state = json.load(handle)
+        watcher.review_step([], None, None, True, {}, "Alex's API budget is under the read floor")
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.reviews()), 1)
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
