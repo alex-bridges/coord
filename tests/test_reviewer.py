@@ -1145,6 +1145,41 @@ class CodexRound11Tests(ReviewFlowTests):
         self.assertTrue(posting["counts"])
 
 
+class CodexRound12Tests(ReviewFlowTests):
+    def test_n1_a_beat_goes_out_before_the_model_starts(self):
+        order = []
+        real_beat = conductor.Watcher.beat
+        runner = self.runner
+
+        def beat(watcher, leader, extra):
+            order.append(("beat", len(extra.get("reviewRuns") or [])))
+            return real_beat(watcher, leader, extra)
+
+        def run(cmd, cwd, env, timeout):
+            order.append(("run", 0))
+            return runner(cmd, cwd, env, timeout)
+        self.runner = run
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        with mock.patch.object(conductor.Watcher, "beat", beat):
+            self.tick(5)
+        first_run = order.index(("run", 0))
+        self.assertIn(("beat", 1), order[:first_run], "a beat listing the run precedes the model")
+
+    def test_n2_a_nested_agent_config_that_survives_fails_the_checkout(self):
+        root = os.path.join(self.tmp.name, "reviews")
+        tree = os.path.join(root, "pr-7")
+        os.makedirs(os.path.join(tree, "node_modules", ".claude", "agents"))
+        os.makedirs(os.path.join(tree, "Packages", "X", ".Claude"))
+        reviewer.strip_agent_config(tree, root)
+        self.assertEqual([d for _, dirs, _ in os.walk(tree) for d in dirs if d.lower() == ".claude"], [])
+        os.makedirs(os.path.join(tree, "Packages", "Y", ".claude"))
+        with mock.patch.object(reviewer.shutil, "rmtree", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                reviewer.strip_agent_config(tree, root)
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

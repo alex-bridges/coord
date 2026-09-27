@@ -809,6 +809,10 @@ class Reviews:
         beating = threading.Thread(target=self.w._beat_while_running, args=(stop, getattr(self, "extra", {}), True),
                                    daemon=True)
         if self.w.issue is not None:
+            try:  # one beat now, so the run is on record before the first five-minute beat (Codex)
+                self.w.beat(True, dict(getattr(self, "extra", {}), live=True))
+            except GitHubError:
+                pass
             beating.start()
         started = snapshot.now_utc()
         try:
@@ -837,10 +841,12 @@ def strip_agent_config(tree: str, reviews_root: str) -> None:
                 if os.path.islink(path) or os.path.isfile(path):
                     os.unlink(path)
                 else:
-                    shutil.rmtree(path, ignore_errors=True)
+                    shutil.rmtree(path)  # an error propagates: the checkout then fails (Codex on #1049)
                 if name in dirs:
                     dirs.remove(name)
-            elif name in (".git", ".build", "node_modules", "DerivedData"):
+            elif name == ".git":  # every other directory is walked: the check below looks everywhere
                 dirs.remove(name)
-    if any(os.path.lexists(os.path.join(tree, name)) for name in STRIP):
-        raise OSError(f"strip_agent_config: could not remove the PR's agent config from {tree}")
+    for root, dirs, files in os.walk(tree):  # verified at every depth, not only the root
+        if any(name.lower() in STRIP for name in dirs + files):
+            raise OSError(f"strip_agent_config: a `.claude` entry remains under {root}")
+        dirs[:] = [d for d in dirs if d != ".git"]
