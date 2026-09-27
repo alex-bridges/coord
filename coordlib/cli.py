@@ -108,8 +108,29 @@ def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
             raise
         mark_app_unavailable(gh, error)
         return snapshot_despite_budget(gh, gh.app_unavailable, AppRefused, gh.app_stale)
+    except GitHubError as error:
+        # The read that discovers an exhausted quota (#1052): `_http` recorded the 403's
+        # headers before raising, so the reading now says what the next call's gate would.
+        low = exhausted_words(gh, error) if getattr(gh, "cache_read", False) else None
+        if low is None:
+            raise
+        gh.budget_low = low  # type: ignore[attr-defined]
+        return snapshot_despite_budget(gh, low)
     cache.store_snapshot(gh.repo, fresh)
     return fresh
+
+
+def exhausted_words(gh: GitHub, error: GitHubError) -> Optional[str]:
+    """The budget-low line when `error` is a 403 or 429 and the recorded reading of this
+    command's principal (core or GraphQL) is now below the read floor; else None."""
+    principal = gh.principal()
+    if error.status not in (403, 429) or not principal:
+        return None
+    for resource in ("core", "graphql"):
+        reading = budget.current(gh.repo, resource, principal=principal)
+        if reading is not None and budget.left(reading) < budget.read_floor():
+            return budget.low_words(reading)
+    return None
 
 
 def mark_app_unavailable(gh: GitHub, error: Exception) -> None:

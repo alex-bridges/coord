@@ -46,7 +46,10 @@ CALL_TIMEOUT_SECONDS = 30
 
 
 class GitHubError(RuntimeError):
-    """gh failed: not installed, not authenticated, network, or an API error."""
+    """gh failed: not installed, not authenticated, network, or an API error. `status` is
+    the HTTP status of an HTTPS call GitHub answered with an error, else None."""
+
+    status: Optional[int] = None
 
 
 class NotFound(GitHubError):
@@ -337,7 +340,9 @@ class GitHub:
             accepted = error_headers.get("x-accepted-github-permissions")
             if accepted:
                 detail += f" (accepted permissions: {accepted})"
-            raise GitHubError(f"HTTP {error.code} {method} {url}: {detail}") from error
+            failure = GitHubError(f"HTTP {error.code} {method} {url}: {detail}")
+            failure.status = error.code
+            raise failure from error
         except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as error:
             raise GitHubError(f"{method} {url}: {type(error).__name__}: {error}") from error
         return (json.loads(raw) if raw.strip() else None), headers
