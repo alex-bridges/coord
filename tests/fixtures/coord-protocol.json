@@ -10,6 +10,7 @@
     {"v": 1, "kind": "review-substitute", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
     {"v": 1, "kind": "alex-approve", "agent": "codex@host:task-a", "pr": 1059, "head": ""},
     {"v": 1, "kind": "review", "agent": "reviewer@host:review", "pr": 1049, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "model": "opus", "verdict": "pass", "counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 1}, "request": 1000001, "countsForTrain": true, "to": ["codex@host:task-a"]},
+    {"v": 1, "kind": "review-claim", "agent": "reviewer@host:review", "pr": 1049, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "model": "opus", "request": 1000001, "until": "2026-09-27T12:00:00Z"},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "held", "pr": 1059, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "hold": "no-review", "reason": "awaiting review", "to": ["codex@host:task-a"], "mode": "live"},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "testing", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "members": [1059, 1060], "mode": "dry-run"},
     {"v": 1, "kind": "train", "agent": "train@actions", "event": "merged", "pr": 1059, "batch": "train/20260927", "tip": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "run": null},
@@ -25,6 +26,7 @@
   "invalid": [
     {"name": "unsupported version", "payload": {"v": 2, "kind": "msg", "agent": "a", "to": ["all"]}},
     {"name": "missing version", "payload": {"kind": "msg", "agent": "a", "to": ["all"]}},
+    {"name": "review claim without expiry", "payload": {"v": 1, "kind": "review-claim", "agent": "a", "pr": 1, "head": "h", "model": "opus"}},
     {"name": "unknown reviewer kind", "payload": {"v": 1, "kind": "reviewer", "agent": "a"}},
     {"name": "array agent", "payload": {"v": 1, "kind": "claim", "agent": ["a"], "issue": 1}},
     {"name": "nested takeover", "payload": {"v": 1, "kind": "claim", "agent": "a", "issue": 1, "takesOverFrom": [["b"]]}},

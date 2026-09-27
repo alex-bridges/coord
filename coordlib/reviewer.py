@@ -39,6 +39,10 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
   head in the train, Codex's 👍 notwithstanding (train.assess, train_step.train_added).
   If a clean review of that head was recorded, a newer record naming no head withdraws it,
   posted after the blocking review so the head is never left merely unreviewed.
+- **One host per review.** Before a run the app posts a `review-claim` naming the PR, head
+  and model, with an expiry, and reads the PR again: the earliest live claim owns the
+  review, and any other host waits. Two leaders during a lease overlap would otherwise
+  both run and bill it (#1056).
 - **Bounds.** One review per (PR, head, model); at most CONDUCTOR_MAX_REVIEWS_PER_DAY (8)
   runs a day; a run is stopped after CONDUCTOR_REVIEW_TIMEOUT (45 min); a job that fails
   three times gets a reply saying so; none run while Claude is out of usage or the
@@ -76,6 +80,9 @@ MAX_BODY = 60000  # characters; GitHub refuses a comment over 65536
 SEVERITIES = ("P0", "P1", "P2", "P3")
 MAX_REVIEWS_PER_DAY = 8
 REVIEW_TIMEOUT_SECONDS = 45 * 60
+# How long a review-claim holds (pr, head, model) for its host: a run's timeout and the tick
+# around it. A host that dies mid-run frees the review when its claim runs out (#1056).
+CLAIM_FOR = dt.timedelta(seconds=REVIEW_TIMEOUT_SECONDS + 15 * 60)
 MAX_ATTEMPTS = 3
 KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
@@ -255,6 +262,21 @@ def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: 
         if ours(comment, payload, repo) and payload.get("pr") == pr and payload.get("head") == head \
                 and payload.get("model") == model:
             return comment.get("html_url") or ""
+    return None
+
+
+def claim_owner(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: str,
+                now: dt.datetime) -> Optional[Dict[str, Any]]:
+    """The live review-claim that owns (pr, head, model): the earliest the app posted whose
+    `until` has not passed, as {"agent", "url"}; None when no claim holds it (#1056)."""
+    for comment in sorted(pr_comments, key=lambda c: c.get("id") or 0):
+        if (comment.get("user") or {}).get("login") != APP_LOGIN:
+            continue
+        payload = marker.decode(comment.get("body")) or {}
+        until = _time(payload.get("until"))
+        if payload.get("kind") == "review-claim" and payload.get("pr") == pr and payload.get("head") == head \
+                and payload.get("model") == model and until is not None and until > now:
+            return {"agent": payload.get("agent") or "", "url": comment.get("html_url") or ""}
     return None
 
 
@@ -598,6 +620,10 @@ class Reviews:
             return
         if not record.get("posting"):
             comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
+            if request["id"] in answered(comments, self.app.repo):
+                # Another host answered this very request (it held the claim): nothing to add.
+                record.update(status="done", at=snapshot.iso(now))
+                return
             earlier = posted_review(comments, request["pr"], head, request["model"], self.app.repo)
             if earlier is not None:
                 self.reply(request, f"`{head[:9]}` was already reviewed with {request['model']}: {earlier}. "
@@ -617,6 +643,8 @@ class Reviews:
                 if self.may_run():
                     self.w.say(f"review of #{request['pr']} waits: {self.may_run()}")
                     return
+                if not self.claim(request, head):
+                    return
                 finished = self.review(request, record, pr, head, windows)
                 if finished is None:
                     return
@@ -628,6 +656,24 @@ class Reviews:
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
         self.publish(request, record, posting, key)
+
+    def claim(self, request: Dict[str, Any], head: str) -> bool:
+        """Whether this host may run the review of (pr, head, model) now. Unless a live claim
+        already holds it, post one and read the PR again: two hosts that claimed at once both
+        see the earlier claim, and only its host runs (#1056)."""
+        path = f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100"
+        owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
+        if owner is None:
+            until = snapshot.iso(self.w.now + CLAIM_FOR)
+            self.reply(request, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
+                                f"(asked in {request.get('url') or 'a comment'}).",
+                       {"kind": "review-claim", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
+                        "model": request["model"], "request": request["id"], "until": until})
+            owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
+        if owner is not None and owner["agent"] != self.agent():
+            self.w.say(f"review of #{request['pr']} waits: {owner['agent']} holds its claim {owner['url']}")
+            return False
+        return True
 
     def review(self, request: Dict[str, Any], record: Dict[str, Any], pr: Dict[str, Any], head: str,
                windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
