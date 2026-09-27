@@ -406,8 +406,14 @@ def run_settings(home: str, deny: List[str], reviews_root: str = "") -> Dict[str
     without the sandbox, and nothing may run outside it (Codex on #1049). The added
     directories (the PR's tree and scratch) stay writable."""
     from . import apptoken
+    guard = os.path.join(os.path.realpath(home), ".claude", "hooks", "conductor-guard.py")
     return {
         "permissions": {"deny": deny},
+        # The sandbox covers Bash only: the guard (the checkout's, main's) also vets the run's own
+        # Read, Grep, Glob and LS, allowing nothing under the home folder but the review tree and
+        # the checkout (Codex on #1049). Registered here, so ordinary sessions pay nothing.
+        "hooks": {"PreToolUse": [{"matcher": "Read|Grep|Glob|LS|NotebookRead",
+                                  "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]},
         "sandbox": {
             "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
             "filesystem": {
@@ -534,6 +540,10 @@ class Reviews:
         issue to read."""
         from . import conductor
         issue = getattr(self.w, "issue", None)
+        if not isinstance(issue, int):
+            # Below the hard floor the watcher reads nothing, but it remembers the issue.
+            state = getattr(self.w, "state", None)
+            issue = state.get("issue") if isinstance(state, dict) else None
         if isinstance(issue, int):
             return conductor.coord_comments(self.app.rest_paginated(f"repos/{{repo}}/issues/{issue}/comments?per_page=100"))
         records = getattr(self.w, "records", None)

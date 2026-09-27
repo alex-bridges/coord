@@ -1092,6 +1092,59 @@ class CodexRound10Tests(ReviewFlowTests):
         self.assertEqual(reviewer.find_tag("@inisa-sidechain review")["model"], "opus")
 
 
+class CodexRound11Tests(ReviewFlowTests):
+    def read_guard(self, tool, data, state="/tmp/state"):
+        env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
+        home = os.path.realpath(os.path.expanduser("~"))
+        env.update({"COORD_AGENT": "reviewer@Tycho:review", "CONDUCTOR_WAKE": "1",
+                    "CLAUDE_PROJECT_DIR": os.path.join(home, "conductor", "INISA"), "CONDUCTOR_STATE_DIR": state})
+        payload = json.dumps({"tool_name": tool, "tool_input": data, "cwd": os.path.join(home, "conductor", "INISA")})
+        return subprocess.run([sys.executable, REVIEWER_GUARD], input=payload, capture_output=True, text=True,
+                              env=env).returncode
+
+    def test_m1_the_runs_own_reads_stay_in_the_review(self):
+        home = os.path.realpath(os.path.expanduser("~"))
+        state = os.path.join(home, ".local", "state", "inisa-conductor")
+        for tool, data in (("Read", {"file_path": "~/.aws/credentials"}), ("Read", {"file_path": "../../.npmrc"}),
+                           ("Grep", {"pattern": "token", "path": home}), ("Glob", {"pattern": home + "/.*rc"}),
+                           ("LS", {"path": os.path.join(home, ".local")}), ("Grep", {"pattern": "x", "path": "~/.ssh"})):
+            self.assertEqual(self.read_guard(tool, data, state), 2, (tool, data))
+        for tool, data in (("Read", {"file_path": "Tools/coord/coord"}), ("Grep", {"pattern": "x"}),
+                           ("Read", {"file_path": os.path.join(state, "reviews", "pr-7-x", "a.py")}),
+                           ("Read", {"file_path": "/opt/homebrew/lib/python3.14/os.py"}),
+                           ("Glob", {"pattern": "**/*.py"})):
+            self.assertEqual(self.read_guard(tool, data, state), 0, (tool, data))
+
+    def test_m1_the_read_guard_is_registered_for_the_run(self):
+        settings = reviewer.run_settings("/Users/x/conductor/INISA", [], "/r")
+        hook = settings["hooks"]["PreToolUse"][0]
+        self.assertEqual(hook["matcher"], "Read|Grep|Glob|LS|NotebookRead")
+        self.assertTrue(hook["hooks"][0]["command"].endswith("/conductor/INISA/.claude/hooks/conductor-guard.py"))
+
+    def test_m2_a_restarted_host_counts_its_own_mid_run_beat(self):
+        from coordlib import lease
+        beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
+                "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,
+                            "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": [snapshot.iso(at(-5))]}}
+        watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
+                                    disk=lambda path: 100.0, git=self.git)
+        watcher.state = {}
+        watcher.adopt_review_runs(lease.hosts([beat], at(0)))
+        self.assertEqual(watcher.state["reviewRuns"], [snapshot.iso(at(-5))])
+
+    def test_m3_below_the_hard_floor_outages_come_from_the_remembered_issue(self):
+        self.app.conductor_comments = [{"id": 1, "user": {"login": "alex-bridges"}, "created_at": snapshot.iso(at(-10)),
+                                        "body": marker.compose("o", {"kind": "outage", "v": 1, "event": "start",
+                                                                     "harness": "codex-review",
+                                                                     "until": snapshot.iso(at(300))})}]
+        watcher = mock.Mock(state={"issue": 900}, config=self.config, now=at(0), issue=None, records=[])
+        jobs = reviewer.Reviews(watcher, self.app)
+        finished = {"head": HEAD, "found": reviewer.normalize({"findings": []}), "verdict": "pass", "run": {}}
+        with mock.patch.object(reviewer.snapshot, "now_utc", return_value=at(5)):
+            posting = jobs.compose({"pr": 7, "id": 1, "url": "", "model": "opus"}, self.app.pr, finished, [])
+        self.assertTrue(posting["counts"])
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

@@ -608,9 +608,8 @@ class Watcher:
         host's daily cap: failed runs included, so a takeover cannot start a fresh eight
         (Codex on #1049)."""
         runs = self.state.setdefault("reviewRuns", [])
-        for host in hosts:
-            if host["agent"] != self.config.agent:
-                runs.extend(r for r in host.get("reviewRuns") or [] if r not in runs)
+        for host in hosts:  # this host's own beat too: a run it sent mid-review before dying
+            runs.extend(r for r in host.get("reviewRuns") or [] if r not in runs)
 
     def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> None:
         """A new leader starts reading where the last leader had read to. Only beats posted
