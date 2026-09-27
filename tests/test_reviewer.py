@@ -1070,6 +1070,28 @@ class CodexRound9Tests(unittest.TestCase):
             self.assertEqual(reviewer.requests([self.comment("stranger", association)]), [], association)
 
 
+class CodexRound10Tests(ReviewFlowTests):
+    def test_l1_the_last_leader_posts_finished_reviews_below_the_hard_floor(self):
+        self.tick(0)
+        self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(self.app.markers("review"), [])
+        with mock.patch.object(conductor.Watcher, "budget_left", return_value=1):  # under every floor
+            self.tick(10)
+        self.assertEqual(len(self.app.markers("review")), 1, "posted with the app's token")
+        self.assertEqual(len(self.reviews()), 1)
+
+    def test_l2_quotes_and_fences_inside_list_items_are_not_requests(self):
+        for body in ("- > @inisa-sidechain review", "1. > > @inisa-sidechain review", "> - @inisa-sidechain review",
+                     "- ```\n  @inisa-sidechain review\n  ```", "* text\n  > @inisa-sidechain review"):
+            self.assertIsNone(reviewer.find_tag(body), body)
+        self.assertEqual(reviewer.find_tag("- @inisa-sidechain review sonnet")["model"], "sonnet",
+                         "a plain list item is a request")
+        self.assertEqual(reviewer.find_tag("@inisa-sidechain review")["model"], "opus")
+
+
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

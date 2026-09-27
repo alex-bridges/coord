@@ -103,6 +103,8 @@ _MODEL = re.compile(r"^\s*(?:model\s*[=:]\s*(?P<explicit>[\w.-]+)|(?P<bare>[\w.-
 _FENCE = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,}).*?(^[ \t]{0,3}(?P=mark)|\Z)", re.S | re.M)
 _INLINE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)", re.S)
 _INDENTED = re.compile(r"^(?: {4}|\t)")
+# Markdown container prefixes: list markers and quote markers, nested in any order (Codex on #1049).
+_CONTAINER = re.compile(r"^(?:[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]+|[ \t]*>[ \t]?)*[ \t]*")
 _PR_URL = re.compile(r"/pull/(\d+)")
 
 
@@ -129,9 +131,14 @@ def find_tag(body: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
     docs show the syntax. An indented line counts as code even where Markdown would not
     call it one: missing a request costs a re-ask, a false one a 45-minute run.
     """
-    text = _INLINE.sub("", _FENCE.sub("", body or ""))
-    text = "\n".join(line for line in text.splitlines()
-                     if not line.lstrip().startswith(">") and not _INDENTED.match(line))
+    kept = []
+    for line in (body or "").splitlines():
+        prefix = _CONTAINER.match(line).group(0)
+        if ">" in prefix or _INDENTED.match(line):
+            kept.append("")  # quoted, at any depth or inside a list item, or indented code
+        else:
+            kept.append(line[len(prefix):])  # a list item's text; a fence opened in one is found
+    text = _INLINE.sub("", _FENCE.sub("", "\n".join(kept)))
     match = _TAG.search(text)
     if not match:
         return None

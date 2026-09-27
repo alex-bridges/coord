@@ -789,6 +789,12 @@ class Watcher:
             self.review_step(windows, down, pause, wake, extra,
                              "a conductor wake ran this tick" if woke else
                              "" if reading else "Alex's API budget is under the read floor, or this tick's read failed")
+        elif not github_ok and self.state.get("wasLeader"):
+            # Below the hard floor nothing is read with Alex's budget, so leadership cannot be
+            # checked; the host that led last goes on posting finished reviews with the app's
+            # own token (Codex on #1049). No new run starts until leadership is known again.
+            self.review_step(windows, down, pause, wake, extra,
+                             "Alex's API budget is under the hard floor (leadership unknown)")
         if github_ok and can_write:
             try:
                 runs = self.state.get("reviewRuns") or []
