@@ -42,7 +42,8 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
 - **One host per review.** Before a run the app posts a `review-claim` naming the PR, head
   and model, with an expiry covering the whole run, and reads the PR again. The first claim
   posted while no other host's claim was live owns the review; its host's later claims
-  renew it, and a claim another host posted meanwhile never counts. Any other host waits.
+  renew it, including while a finished review waits to be posted, and a claim another
+  host posted meanwhile never counts. Any other host waits.
   Two leaders during a lease overlap would otherwise both run and bill it (#1056).
 - **Bounds.** One review per (PR, head, model); at most CONDUCTOR_MAX_REVIEWS_PER_DAY (8)
   runs a day; a run is stopped after CONDUCTOR_REVIEW_TIMEOUT (45 min); a job that fails
@@ -654,7 +655,7 @@ class Reviews:
                 if self.may_run():
                     self.w.say(f"review of #{request['pr']} waits: {self.may_run()}")
                     return
-                if not self.claim(request, head):
+                if not self.claim(request, record, head):
                     return
                 finished = self.review(request, record, pr, head, windows)
                 if finished is None:
@@ -666,27 +667,69 @@ class Reviews:
             # counts is decided on the PR's state as it is then (Codex on #1049).
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
-        self.publish(request, record, posting, key)
+        try:
+            self.publish(request, record, posting, key)
+        finally:
+            if record.get("posting"):  # not posted yet (a wait, or a failed post)
+                self.keep_claim(request, record, posting["head"])
 
-    def claim(self, request: Dict[str, Any], head: str) -> bool:
+    def lease(self) -> dt.datetime:
+        """When a claim posted now runs out: the run's configured timeout and the margin."""
+        return self.w.now + dt.timedelta(seconds=self.config.review_timeout) + CLAIM_MARGIN
+
+    def gap(self) -> dt.timedelta:
+        """The longest this host can go between two handlings of a finished review waiting to
+        post, and a margin: it goes first in review_step, but a conductor wake (up to its run
+        timeout) may come before review_step in a tick. The review timeout bounds it too, so
+        the gap is never shorter than a run's own lease."""
+        return dt.timedelta(seconds=max(self.config.review_timeout, getattr(self.config, "run_timeout", 0))) + CLAIM_MARGIN
+
+    def post_claim(self, request: Dict[str, Any], record: Dict[str, Any], head: str, text: str,
+                   until_time: Optional[dt.datetime] = None) -> None:
+        until = snapshot.iso(until_time or self.lease())
+        self.reply(request, text, {"kind": "review-claim", "v": 1, "agent": self.agent(), "pr": request["pr"],
+                                   "head": head, "model": request["model"], "request": request["id"], "until": until})
+        record["claimUntil"] = until
+
+    def claim(self, request: Dict[str, Any], record: Dict[str, Any], head: str) -> bool:
         """Whether this host may run the review of (pr, head, model) now. Unless another host's
         claim holds it, post one (a retry renews its own claim, so it covers the whole run) and
         read the PR again: two hosts that claimed at once both see the earlier claim, and only
         its host runs (#1056)."""
         path = f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100"
         owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
-        lease = self.w.now + dt.timedelta(seconds=self.config.review_timeout) + CLAIM_MARGIN
-        if owner is None or (owner["agent"] == self.agent() and owner["until"] < lease):
-            until = snapshot.iso(lease)
-            self.reply(request, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
-                                f"(asked in {request.get('url') or 'a comment'}).",
-                       {"kind": "review-claim", "v": 1, "agent": self.agent(), "pr": request["pr"], "head": head,
-                        "model": request["model"], "request": request["id"], "until": until})
+        if owner is None or (owner["agent"] == self.agent() and owner["until"] < self.lease()):
+            self.post_claim(request, record, head, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
+                                                   f"(asked in {request.get('url') or 'a comment'}).")
             owner = claim_owner(self.app.rest_paginated(path), request["pr"], head, request["model"], self.w.now)
         if owner is not None and owner["agent"] != self.agent():
             self.w.say(f"review of #{request['pr']} waits: {owner['agent']} holds its claim {owner['url']}")
             return False
+        if owner is not None:
+            record["claimUntil"] = snapshot.iso(owner["until"])
         return True
+
+    def keep_claim(self, request: Dict[str, Any], record: Dict[str, Any], head: str) -> None:
+        """While a finished review waits to be posted (Alex's budget low, a failed post), keep
+        its claim live: whenever less than one gap() of it is left, it is renewed for two, so
+        it cannot lapse before this host next handles it (one comment per gap, about an hour,
+        while it waits). Otherwise another host, seeing no live claim and no answer, would run
+        and bill the same review again (Codex on #1088). Its expiry is kept in the record, not
+        read from the PR, so a waiting review costs no read a tick. A renewal after the claim
+        lapsed (this host was down past it) may lose to another host's claim under
+        claim_owner's rule; the finished review is posted all the same, since it is paid for.
+        Best-effort: a failed renewal is tried again on the next tick."""
+        until = _time(record.get("claimUntil"))
+        if until is not None and until >= self.w.now + self.gap():
+            return
+        try:
+            self.post_claim(request, record, head, f"@inisa-sidechain has reviewed `{head[:9]}` with {request['model']} "
+                                                   f"and is still posting it (asked in {request.get('url') or 'a comment'}).",
+                            self.w.now + 2 * self.gap())
+        except AppAuthError:
+            raise
+        except GitHubError as error:
+            self.w.say(f"could not renew the claim on the review of #{request['pr']} ({_clip(str(error), 100)})")
 
     def review(self, request: Dict[str, Any], record: Dict[str, Any], pr: Dict[str, Any], head: str,
                windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:

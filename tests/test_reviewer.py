@@ -1084,6 +1084,27 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.host("Tycho", request, 5).review_step([], None, None, True, {})
         self.assertEqual(self.reviews(), [], "the re-read found the earlier claim")
 
+    def test_a_finished_review_waiting_to_post_keeps_its_claim(self):
+        """Codex on #1088: a pass that waits on Alex's budget past its lease left the review
+        unclaimed and unanswered, so another host ran it again."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        first = self.host("Tycho", request, 5)
+        self.replies = [review_reply(), review_reply()]
+        first.review_step([], None, None, True, {}, user_ok=False)  # run, then wait to record the pass
+        self.assertEqual(len(self.reviews()), 1)
+        first.now = at(60)  # an hour-long wake may come before the next handling: still covered
+        first.review_step([], None, None, True, {}, user_ok=False)
+        self.host("Eidolon", request, 100).review_step([], None, None, True, {})  # past the run's lease (65)
+        self.assertEqual(len(self.reviews()), 1, "the other host saw the renewed claim and did not run")
+        # The run's lease, then one renewal for two gaps (a 60-min wake + 15) when it waited.
+        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(65)), snapshot.iso(at(5 + 150))])
+        self.assertEqual(self.app.markers("review"), [], "still waiting to post")
+        first.now = at(110)
+        first.review_step([], None, None, True, {})  # the budget is back
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(len(self.claims()), 2, "posted: nothing more to hold")
+
     def test_an_expired_claim_frees_the_review(self):
         self.app.echo_posts = True
         self.app.pr_comments.append(self.other_claim(4))  # its host died mid-run
