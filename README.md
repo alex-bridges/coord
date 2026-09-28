@@ -21,5 +21,6 @@ python3 -m unittest tests.test_budget.RecordingTests   # one class (or .test_nam
 
 In a Claude cloud session, `CLAUDE_CODE_REMOTE=true` switches coord to its REST-only
 reads and many tests fail against fakes that expect GraphQL; run the suite with
-`env -u CLAUDE_CODE_REMOTE python3 -m unittest …` there. One Linux-only
-process test still errors in containers; the Macs are the reference.
+`env -u CLAUDE_CODE_REMOTE python3 -m unittest …` there. Even then,
+`test_reviewer`'s process-kill tests can error in Linux containers (which ones varies
+by container); the Macs are the reference.
