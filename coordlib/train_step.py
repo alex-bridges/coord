@@ -28,13 +28,14 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import subprocess
 import time
 import urllib.parse
 import uuid
 from typing import Any, Callable, Dict, List, Optional
 
-from . import marker, snapshot, train, train_metrics
+from . import marker, review, snapshot, train, train_metrics
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
@@ -51,6 +52,9 @@ SETTLE_POLL_SECONDS = 10
 VERDICT_JOB = "CI verdict"
 WAKE_JOB = "Wake the merge train"
 FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
+# A comment that asks Codex for a review: the mention at the start of a line, as people
+# and the train write it (a sentence quoting it mid-line is not a request).
+_CODEX_REQUEST = re.compile(r"(?m)^\s*@codex\s+review\b", re.IGNORECASE)
 
 
 class GitError(RuntimeError):
@@ -78,7 +82,7 @@ class Git:
 class Step:
     def __init__(self, gh: GitHub, git: Git, mode: str, now: Optional[dt.datetime] = None,
                  agent: str = TRAIN_AGENT, log: Callable[[str], None] = print,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep, requester: Optional[GitHub] = None):
         if mode not in ("dry-run", "live"):
             raise ValueError(f"mode must be dry-run or live, not {mode!r}")
         self.gh = gh
@@ -88,6 +92,8 @@ class Step:
         self.agent = agent
         self.log = log
         self.sleep = sleep
+        # Who posts `@codex review` (#1101): the step's own identity unless told otherwise.
+        self.requester = requester or gh
         self.closed_batch = False
         self.lines: List[str] = []
         self._labels_ready = False
@@ -99,14 +105,14 @@ class Step:
 
     # MARK: - GitHub helpers
 
-    def comment(self, number: int, text: str, event: str, **fields: Any) -> None:
+    def comment(self, number: int, text: str, event: str, via: Optional[GitHub] = None, **fields: Any) -> None:
         payload = {"kind": "train", "v": 1, "agent": self.agent, "event": event, "pr": number, "mode": self.mode,
                    "at": snapshot.iso(self.now)}
         payload.update(fields)
         if self._receipt and fields.get("batch") == self._receipt["batch"]:
             payload["receipt"] = dict(self._receipt, outcome=event)
-        self.gh.rest(f"repos/{{repo}}/issues/{number}/comments", method="POST",
-                     body={"body": marker.compose(text, payload)})
+        (via or self.gh).rest(f"repos/{{repo}}/issues/{number}/comments", method="POST",
+                              body={"body": marker.compose(text, payload)})
 
     def remove_label(self, number: int, label: str) -> None:
         try:
@@ -261,7 +267,12 @@ class Step:
 
     def open_prs(self) -> Dict[int, Dict[str, Any]]:
         _, nodes = snapshot.fetch_prs(self.gh)
-        return {node["number"]: snapshot.summarize_pr(node) for node in nodes}
+        prs = {}
+        for node in nodes:
+            pr = snapshot.summarize_pr(node)
+            pr["headPushedAt"] = review.head_pushed_at(node)  # when a review of this head became due
+            prs[node["number"]] = pr
+        return prs
 
     def train_added(self, pr: Dict[str, Any]) -> Dict[str, Any]:
         """The newest train-add marker on the PR (when it joined, at which head, by whom).
@@ -270,13 +281,23 @@ class Step:
         user posted (snapshot.trusted_attestation, the snapshot's own rule), who added it
         (`trainAddedBy`), the (head, hold class) of every `held` notice the train has
         posted on it (`heldNotices`), and `overtakenBy`: the light batch that went ahead
-        of it since it joined, if any."""
+        of it since it joined, if any. For #1101 it also sets `reviewRequests`, when anyone
+        (the train included) commented `@codex review`, and `readdedAtNewHead`: the newest
+        add names a different head than the add before it, so the train dropped it and it
+        was added back."""
         number = pr["number"]
         latest: Dict[str, Any] = {}
         held = set()
         blocked = set()
+        requests = []
+        add_heads = []
         pr["overtakenBy"] = None
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
+            login = snapshot.comment_author(comment).get("login") or ""
+            if _CODEX_REQUEST.search(comment.get("body") or "") and not login.startswith(review.CODEX_LOGIN_PREFIX):
+                at = review.parse_time(comment.get("created_at"))
+                if at is not None:
+                    requests.append(at)
             payload = marker.decode(comment.get("body"))
             if not payload or payload.get("pr") != number:
                 continue
@@ -285,6 +306,7 @@ class Step:
                 blocked.add(blocks)  # from the PR's whole history, not a comment window (Codex on #1049)
             if payload.get("kind") == "train-add":
                 latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
+                add_heads.append(payload.get("head"))
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
                 if snapshot.trusted_attestation(snapshot.comment_author(comment), self.gh.repo):
@@ -298,6 +320,8 @@ class Step:
         pr["trainAddedAt"] = latest.get("at")
         pr["heldNotices"] = held
         pr["sidechainBlockedHeads"] = sorted(blocked)
+        pr["reviewRequests"] = requests
+        pr["readdedAtNewHead"] = len(add_heads) >= 2 and add_heads[-1] != add_heads[-2]
         return latest
 
     def own_record(self, comment: Dict[str, Any], payload: Dict[str, Any]) -> bool:
@@ -366,6 +390,30 @@ class Step:
             self.note(f"#{number}: could not post the held notice ({error}); the next step tries again")
             return
         pr["heldNotices"].add((head, hold))
+
+    def request_review(self, pr: Dict[str, Any]) -> None:
+        """Ask Codex to review the queued PR's head when nobody has (#1101; the rule is
+        train.review_request_due). The comment is the request and the train's record of
+        it, so it is made once per head. Dry runs ask too: a request moves nothing.
+
+        Posted through `requester`. A hand-run step is Alex, whose `@codex review` Codex
+        answers (on #1088 within four minutes). The Actions train posts as
+        github-actions[bot]; the docs name Alex as the identity for review requests, and
+        whether Codex answers a bot is not established. Best effort: an error is noted and
+        the next step tries again."""
+        reason = train.review_request_due(pr, self.now)
+        if not reason:
+            return
+        number, head = pr["number"], pr["head"]
+        text = (f"{train.CODEX_REQUEST}\n\n_Merge train: {reason} (head `{head[:9]}`), so the train asks "
+                "once for this head._")
+        try:
+            self.comment(number, text, train.REVIEW_REQUEST_EVENT, via=self.requester, head=head, reason=reason)
+        except GitHubError as error:
+            self.note(f"#{number}: could not ask Codex to review ({error}); the next step tries again")
+            return
+        pr.setdefault("reviewRequests", []).append(self.now)
+        self.note(f"#{number}: asked Codex to review {head[:9]}: {reason}")
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
         if not pr.get("filesTruncated"):
@@ -722,6 +770,9 @@ class Step:
         for number, reason in chosen["holds"]:
             self.note(f"#{number} held: {reason}")
             self.notify_held(prs[number], prs[number]["head"], holds[number], reason)
+        for pr in queued:
+            if verdicts[pr["number"]][0] != train.DROP:
+                self.request_review(pr)
         if not chosen["batch"]:
             self.note("nothing ready")
             return

@@ -197,6 +197,46 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     return READY, "", "ready"
 
 
+CODEX_REQUEST = "@codex review"
+REVIEW_REQUEST_EVENT = "review-requested"
+REVIEW_REQUEST_AFTER = dt.timedelta(minutes=30)
+
+
+def review_request_due(pr: Dict[str, Any], now: dt.datetime) -> Optional[str]:
+    """Why the train should ask Codex to review the queued PR's head now, or None (#1101).
+
+    Codex reviews some new heads on its own and not others, and a queued PR then sits
+    held on "no Codex 👍" until someone notices. Due when nobody has reviewed the head
+    (no Codex 👍 or summary naming it, no review under way, no recorded clean review, no
+    inisa-sidechain verdict on it), nobody has asked since it was pushed (`reviewRequests`:
+    when anyone commented `@codex review` after the push, the train's own record included),
+    and either the head is REVIEW_REQUEST_AFTER old or the PR was added again at a new
+    head (`readdedAtNewHead`: the train dropped it and its author did what the drop said,
+    so there is nothing to wait for).
+
+    Once per head: the guard is the record of asking, never the answer, so the train
+    never loops and a person can always ask again by hand.
+    """
+    head = pr.get("head")
+    pushed = pr.get("headPushedAt")
+    codex = pr.get("codex") or {}
+    reviewed = codex.get("reviewedCommit")
+    if not head or pr.get("isDraft") or pushed is None:
+        return None
+    if codex.get("approved") or codex.get("reviewing") or (reviewed and head.startswith(reviewed)):
+        return None
+    if pr.get("reviewedHead") == head or head in (pr.get("sidechainBlockedHeads") or []):
+        return None
+    if any(at >= pushed for at in pr.get("reviewRequests") or []):
+        return None
+    if pr.get("readdedAtNewHead"):
+        return "it was added again to the train at a new head"
+    waited = now - pushed
+    if waited < REVIEW_REQUEST_AFTER:
+        return None
+    return f"its head has had no Codex review for {int(waited.total_seconds() // 60)} minutes"
+
+
 LIGHT, HEAVY = "light", "heavy"
 # The train comment (event) recording that a light batch went ahead of a heavy PR.
 OVERTAKEN_EVENT = "overtaken"
