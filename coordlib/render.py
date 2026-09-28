@@ -207,8 +207,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
     if snapshot["overlaps"]:
         lines.append("OVERLAPS (same files in two pieces of work; coordinate, nothing is locked)")
         for overlap in snapshot["overlaps"]:
-            files = overlap["files"]
-            shown = ", ".join(files[:3]) + (f" (+{len(files) - 3} more)" if len(files) > 3 else "")
+            files = overlap.get("described") or overlap["files"]
+            shown = ("; " if "described" in overlap else ", ").join(files[:3]) + (f" (+{len(files) - 3} more)" if len(files) > 3 else "")
             lines.append(f"  {overlap['a']} and {overlap['b']}: {shown}")
         lines.append("")
 

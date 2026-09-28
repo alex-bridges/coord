@@ -719,6 +719,37 @@ def overlapping(files: List[str], other: List[str]) -> List[str]:
     return sorted({f for f in files for g in other if _paths_overlap(f, g)})
 
 
+def describe_overlap(files: List[str], other: List[str], files_label: str = "", other_label: str = "") -> List[str]:
+    """The overlap of two pieces of work in words that name what each declared (#1069).
+
+    A path both name is shown once. A directory one side declared is shown as that
+    directory with the other side's paths inside it, e.g. `Tests/X/ (directory, claim #7),
+    which contains: A.swift`, so a new file is not read as one the other work touches.
+    Without `files_label` (`coord claim`, where `files` are the claimant's own), a
+    directory of the claimant's is shown as the other side's paths `(inside Tests/X/)`.
+    """
+    same, dirs = set(), {}  # dirs: (declaring side, directory) -> paths inside it
+    for f in files:
+        f = f.rstrip("/")
+        for g in other:
+            g = g.rstrip("/")
+            if f == g:
+                same.add(f)
+            elif f.startswith(g + "/"):
+                dirs.setdefault(("other", g), set()).add(f)
+            elif g.startswith(f + "/"):
+                dirs.setdefault(("files", f), set()).add(g)
+    out = sorted(same)
+    for (side, directory), inside in sorted(dirs.items(), key=lambda item: item[0][1]):
+        label = (other_label if side == "other" else files_label).split(" (")[0]  # "claim #7 (agent)" -> "claim #7"
+        if side == "files" and not files_label:
+            out.append(f"{', '.join(sorted(inside))} (inside {directory}/)")
+            continue
+        names = ", ".join(sorted(p[len(directory) + 1:] for p in inside))
+        out.append(f"{directory}/ (directory{', ' + label if label else ''}), which contains: {names}")
+    return out
+
+
 def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Pairs of in-flight work touching the same files. A warning, never a lock."""
     items = [(label, files) for label, files, _ in work_items(prs, claims)]
@@ -727,7 +758,11 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
         for j in range(i + 1, len(items)):
             shared = overlapping(items[i][1], items[j][1])
             if shared:
-                out.append({"a": items[i][0], "b": items[j][0], "files": shared})
+                entry = {"a": items[i][0], "b": items[j][0], "files": shared}
+                described = describe_overlap(items[i][1], items[j][1], items[i][0], items[j][0])
+                if described != shared:  # a directory on one side: say whose (#1069)
+                    entry["described"] = described
+                out.append(entry)
     return out
 
 
