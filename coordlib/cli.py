@@ -366,11 +366,18 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
         return EXIT_CONFLICT
 
     files = []
-    for raw in args.files or []:
+    for raw in (part.strip() for arg in args.files or [] for part in arg.split(",")):
+        if not raw:
+            continue  # `--files a,b` and `--files a, b` both name two paths (#1083)
         normal = snapshot.normalize_path(raw)
         if not normal:
             raise UsageError(f"{raw!r}: name files by their path from the repository root (no leading /, no ..)")
         files.append(normal)
+    if args.branch is None and _commits_ahead_of_main() == 0 and not any(
+            pr.get("branch") == branch and not pr.get("fromFork") for pr in snap["prs"]):
+        # A cloud session starts on a harness branch it never works on (#1084).
+        print(f"coord: claiming on {branch}, which has no work yet; pass --branch <name> if you'll work elsewhere",
+              file=sys.stderr)
     payload = {"kind": "claim", "v": 1, "agent": me, "issue": args.issue, "branch": branch, "files": files}
     if args.note:
         payload["note"] = args.note
@@ -404,13 +411,23 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     for label, other, owner in snapshot.work_items(snap["prs"], snap["claims"]):
         if (owner.get("branch") == branch and not owner.get("fork")) or owner.get("issue") == args.issue:
             continue  # this work itself (a fork's PR with the same branch name is not)
-        shared = snapshot.overlapping(files, other)
+        shared = snapshot.describe_overlap(files, other)
         if shared:
-            warnings.append(f"  {label} ({owner.get('branch')}) touches or expects: {', '.join(shared[:5])}")
+            warnings.append(f"  {label} ({owner.get('branch')}) touches or expects: {'; '.join(shared[:5])}")
     if warnings:
         print("overlaps (a warning, nothing is locked):")
         print("\n".join(warnings))
     return EXIT_OK
+
+
+def _commits_ahead_of_main() -> Optional[int]:
+    """Commits HEAD has that origin/main lacks; None when git cannot say."""
+    try:
+        done = subprocess.run(["git", "rev-list", "--count", "origin/main..HEAD"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return int(done.stdout.strip()) if done.returncode == 0 and done.stdout.strip().isdigit() else None
 
 
 def cmd_release(args: argparse.Namespace, gh: GitHub) -> int:
@@ -1152,7 +1169,8 @@ def parser() -> argparse.ArgumentParser:
     claim.add_argument("issue", type=int)
     claim.add_argument("--branch", help="default: the current branch")
     claim.add_argument("--files", nargs="+", metavar="PATH",
-                       help="files or directories you expect to touch, as paths from the repository root")
+                       help="files or directories you expect to touch, as paths from the repository root "
+                            "(space- or comma-separated)")
     claim.add_argument("--note", help="one line of context")
     claim.add_argument("--force", action="store_true", help="claim even though another agent holds it (say why in --note)")
     claim.add_argument("--dry-run", action="store_true", help="print the comment instead of posting it")
