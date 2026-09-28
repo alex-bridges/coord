@@ -1111,8 +1111,8 @@ class CrossHostClaimTests(ReviewFlowTests):
         first.review_step([], None, None, True, {}, user_ok=False)
         self.host("Eidolon", request, 100).review_step([], None, None, True, {})  # past the run's lease (65)
         self.assertEqual(len(self.reviews()), 1, "the other host saw the renewed claim and did not run")
-        # The run's lease, then one renewal for two gaps (a 60-min wake + 15) when it waited.
-        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(65)), snapshot.iso(at(5 + 150))])
+        # The run's lease, then one renewal for two gaps (two 60-min wake runs + 15) when it waited.
+        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(65)), snapshot.iso(at(5 + 270))])
         self.assertEqual(self.app.markers("review"), [], "still waiting to post")
         first.now = at(110)
         first.review_step([], None, None, True, {})  # the budget is back
@@ -1133,10 +1133,10 @@ class CrossHostClaimTests(ReviewFlowTests):
                 raise reviewer.GitHubError("HTTP 502")
             return real(path)
         self.app.rest_paginated = failing
-        first.now = at(90)  # the first renewal (to 155) has under one gap left
+        first.now = at(150)  # the first renewal (to 275) has under one gap (135) left
         first.review_step([], None, None, True, {})
         self.assertEqual([c["until"] for c in self.claims()],
-                         [snapshot.iso(at(65)), snapshot.iso(at(5 + 150)), snapshot.iso(at(90 + 150))])
+                         [snapshot.iso(at(65)), snapshot.iso(at(5 + 270)), snapshot.iso(at(150 + 270))])
 
     def test_a_review_answered_after_the_claim_is_not_run(self):
         """Codex on 369c620: a lapsed holder posting its finished review between handle's
@@ -1164,7 +1164,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
         host = self.host("Tycho", request, 5)
-        host.config.review_timeout = 2 * 60 * 60  # at least the run timeout: gap = 2 h 15
+        host.config.review_timeout = 2 * 60 * 60  # twice the run timeout: gap = 2 h 15
         wall, runner = [at(5)], self.runner
 
         def long_run(cmd, cwd, env, timeout):
@@ -1176,6 +1176,57 @@ class CrossHostClaimTests(ReviewFlowTests):
             host.review_step([], None, None, True, {}, user_ok=False)
         self.assertEqual([c["until"] for c in self.claims()],
                          [snapshot.iso(at(5 + 135)), snapshot.iso(at(125 + 270))])
+
+    def owner_at(self, minutes):
+        owner = reviewer.claim_owner(self.app.rest_paginated("repos/{repo}/issues/7/comments"), 7, HEAD, "opus",
+                                     at(minutes))
+        return owner and owner["agent"]
+
+    def test_a_held_claim_outlasts_a_triage_and_an_escalated_repair(self):
+        """Codex on 85c4876: a wake can run triage and then an escalated repair, each up to
+        run_timeout, before review_step renews anything."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        first = self.host("Tycho", request, 5)
+        self.replies = [review_reply()]
+        first.review_step([], None, None, True, {}, user_ok=False)  # finished; waits on the budget
+        first.now = at(65)
+        first.review_step([], None, None, True, {}, user_ok=False)  # the last renewal before the wake
+        self.assertEqual(self.owner_at(65 + 120 + 5), "reviewer@Tycho:review", "two 60-min runs later, still held")
+
+    def test_a_failed_attempt_keeps_its_claim_for_the_retry(self):
+        """Codex on 85c4876: after a failed run the request is retryable, and its claim must
+        outlast a wake before the retry, or another host starts over at attempt 0."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        self.replies = [claude_result("SUMMARY: I forgot the block")]
+        first = self.host("Tycho", request, 5)
+        first.review_step([], None, None, True, {})
+        self.assertEqual(first.state["reviews"][str(request["id"])]["attempts"], 1)
+        self.assertEqual(self.owner_at(5 + 15 + 120), "reviewer@Tycho:review")
+
+    def test_a_request_given_up_keeps_its_claim_until_the_reply_posts(self):
+        """Codex on 85c4876: a give-up reply that failed to post left the request unanswered
+        and, once the claim lapsed, open to three more runs on another host."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        self.replies = [claude_result("SUMMARY: I forgot the block")] * 3
+        first = self.host("Tycho", request, 5)
+        for minutes in (5, 10, 15):
+            first.now = at(minutes)
+            if minutes == 15:
+                self.app.fail_posts = 1  # the give-up reply
+            first.review_step([], None, None, True, {})
+        record = first.state["reviews"][str(request["id"])]
+        self.assertEqual((record["status"], bool(record.get("unsent"))), ("failed", True))
+        self.assertEqual(self.owner_at(15 + 140), "reviewer@Tycho:review")
+        first.now = at(20)
+        first.review_step([], None, None, True, {})
+        self.assertIn("gave up", self.app.posts[-1])
+        claims = len(self.claims())
+        first.now = at(300)
+        first.review_step([], None, None, True, {})
+        self.assertEqual(len(self.claims()), claims, "answered: the claim is let go")
 
     def test_an_expired_claim_frees_the_review(self):
         self.app.echo_posts = True
