@@ -398,8 +398,11 @@ def outcome(returncode: int, stdout: str, stderr: str, now: dt.datetime) -> Dict
     data = parse_result(stdout)
     result = str(data.get("result") or "")
     ok = returncode == 0 and bool(data) and not data.get("is_error")
-    finals = _FINAL.findall(result)
-    last = finals[-1] if finals else None
+    # The marker counts only as the last nonblank line: a run that wrote one and went on
+    # working, or quoted one, has not finished (Codex on #1145).
+    tail = [line for line in result.splitlines() if line.strip()][-1:]
+    match = _FINAL.match(tail[0]) if tail else None
+    last = match.groups() if match else None
     usage = data.get("usage") or {}
     return {
         "ok": ok,

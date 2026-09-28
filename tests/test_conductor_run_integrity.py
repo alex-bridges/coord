@@ -26,6 +26,14 @@ class FinalLineTests(unittest.TestCase):
         out = conductor.outcome(0, base.claude_result("Checked the train; now looking at #12.").stdout, "", base.NOW)
         self.assertEqual((out["ok"], out["final"]), (True, False), "the run itself did not fail")
 
+    def test_a_marker_the_run_went_on_past_is_not_final(self):
+        text = "SUMMARY: answered #12\nNow looking at #13; running the tests."
+        out = conductor.outcome(0, base.claude_result(text).stdout, "", base.NOW)
+        self.assertFalse(out["final"], "only the last nonblank line ends the run")
+        out = conductor.outcome(0, base.claude_result("ESCALATE: red main\nTrying one more thing.").stdout, "", base.NOW)
+        self.assertEqual((out["final"], out["escalate"]), (False, False), "not an escalation either")
+        self.assertTrue(conductor.outcome(0, base.claude_result("x\nSUMMARY: done\n\n").stdout, "", base.NOW)["final"])
+
 
 class EarlyStopTests(base.WatcherTests):
     """A run that exits 0 without `SUMMARY:`/`ESCALATE:` stopped mid-task."""
@@ -59,6 +67,14 @@ class EarlyStopTests(base.WatcherTests):
         self.tick(10)
         self.assertEqual(len(self.runs), 2, "the reason is handed to a model again")
         self.assertIn("the train looks stuck", self.runs[1]["prompt"])
+
+    def test_a_summary_followed_by_more_work_is_not_done(self):
+        self.tick(0)
+        self.message(1)
+        self.replies = [base.claude_result("SUMMARY: answered the message\nNow checking the train.")]
+        self.tick(5)
+        self.assertEqual([r.get("attempts") for r in self.handled().values()], [1])
+        self.assertTrue(self.wakes()[-1].get("incomplete"))
 
     def test_three_early_stops_escalate_to_alex(self):
         self.tick(0)
