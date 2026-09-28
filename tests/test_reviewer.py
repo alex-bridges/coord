@@ -262,6 +262,20 @@ class ReviewFlowTests(unittest.TestCase):
         self.tick(10)
         self.assertEqual(len(self.reviews()), 1, "it runs once the app is back")
 
+    def test_the_backlog_with_the_app_off_rides_the_beat_for_the_board(self):
+        """A stalled reviewer only said so in the watcher log (#1092): no agent could see
+        it. Its beat now carries the count and the app's availability too."""
+        self.tick(0)
+        self.ask(1)
+        self.tick(5, app=None)
+        beat = self.gh.records("conductor", "beat")[-1]
+        self.assertEqual(beat["reviewer"], {"waiting": 1, "appAvailable": False})
+        self.replies = [review_reply()]
+        self.tick(10)  # the app is back: this tick both shows it and resolves the request
+        self.assertEqual(self.gh.records("conductor", "beat")[-1]["reviewer"], {"waiting": 1, "appAvailable": True})
+        self.tick(15)
+        self.assertNotIn("reviewer", self.gh.records("conductor", "beat")[-1], "answered: no backlog left to show")
+
     def test_a_usage_limit_posts_the_outage_and_keeps_the_request(self):
         self.tick(0)
         self.ask(1)

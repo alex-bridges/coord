@@ -24,6 +24,29 @@ from coordlib.gh import GitHub, repo_from_remote_url  # noqa: E402
 NOW = dt.datetime(2026, 9, 24, 17, 0, tzinfo=dt.timezone.utc)
 BOT = "chatgpt-codex-connector[bot]"
 
+# snapshot.rest_only() reads these, so a run inside a Claude cloud container (where
+# CLAUDE_CODE_REMOTE=true) would route the GraphQL fakes' reads to REST (#1085). The REST
+# path is covered where it is meant: RestFallbackTests sets CLAUDE_CODE_REMOTE itself, and
+# NotRunRestTests calls snapshot.fetch_prs_rest directly.
+REST_ENV = ("CLAUDE_CODE_REMOTE", "COORD_REST_ONLY")
+
+
+def isolate_from_rest_env() -> None:
+    """For a module's setUpModule: clear REST_ENV for its tests, restored afterwards."""
+    saved = {name: os.environ.pop(name, None) for name in REST_ENV}
+
+    def restore():
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    unittest.addModuleCleanup(restore)
+
+
+def setUpModule():
+    isolate_from_rest_env()
+
 
 def t(minutes_ago: float) -> str:
     return snapshot.iso(NOW - dt.timedelta(minutes=minutes_ago))
@@ -674,6 +697,55 @@ class CodexRoundThreeTests(unittest.TestCase):
         [comment] = snapshot.fetch_coord_comments(Fake(), NOW)
         self.assertEqual(comment["author"], {"login": "inisa-sidechain[bot]", "type": "Bot"})
 
+    def test_head_records_older_than_the_window_are_read_from_the_labelled_pr(self):
+        # #1055: a record past CLAIM_WINDOW_DAYS is not in the repo-wide window; a PR
+        # labelled for it gets its own comments read, and only such a PR does.
+        head = "a" * 40
+        old = (snapshot.CLAIM_WINDOW_DAYS + 3) * 24 * 60
+
+        def raw(cid, number, minutes_ago, payload):
+            return {"id": cid, "issue_url": f"https://api.github.com/repos/{REPO}/issues/{number}",
+                    "created_at": t(minutes_ago), "html_url": f"h/{cid}", "user": dict(ALEX),
+                    "body": marker.compose("x", dict(payload, v=1, agent="a", pr=number, head=head))}
+
+        history = {
+            7: [raw(1, 7, old, {"kind": "review-clean"}), raw(2, 7, old, {"kind": "alex-approve"}),
+                raw(3, 7, old, {"kind": "train-add"})],
+            8: [raw(4, 8, old, {"kind": "review-clean"})],  # no label: never read
+            9: [raw(5, 9, 60, {"kind": "review-clean"})],   # in the window: never read again
+        }
+        labelled = [{"name": n} for n in ("reviewed", "alex-approved", "train")]
+        nodes = [pr_node(number=7, labels={"nodes": labelled}), pr_node(number=8),
+                 pr_node(number=9, labels={"nodes": [{"name": "reviewed"}]})]
+        paths = []
+
+        class Fake:
+            owner, name, repo, calls = "alex-bridges", "INISA", REPO, 0
+
+            def graphql(self, query, variables=None):
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m"}},
+                                       "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                        "nodes": nodes}}}
+
+            def rest_paginated(self, path):
+                paths.append(path)
+                if path.startswith("repos/{repo}/issues/comments"):  # the window: what `since` keeps
+                    return list(history[9])
+                for number, comments in history.items():
+                    if path.startswith(f"repos/{{repo}}/issues/{number}/comments"):
+                        return list(comments)
+                return []
+
+        snap = snapshot.build(Fake(), NOW)
+        by_number = {p["number"]: p for p in snap["prs"]}
+        self.assertEqual(by_number[7]["reviewedHead"], head)
+        self.assertEqual(by_number[7]["alexApprovedHead"], head)
+        self.assertEqual([q["headAtAdd"] for q in snap["train"]], [head])
+        self.assertIsNone(by_number[8]["reviewedHead"])
+        self.assertEqual(by_number[9]["reviewedHead"], head)
+        self.assertEqual([p for p in paths if "/issues/" in p and "/issues/comments" not in p],
+                         ["repos/{repo}/issues/7/comments?per_page=100"])
+
     HEAD = "abc" + "0" * 37  # the fake PR's current head
 
     def run_attestation(self, argv):
@@ -886,13 +958,8 @@ class RestFallbackTests(unittest.TestCase):
     def test_a_graphql_403_falls_back_to_rest_and_stays_there(self):
         from coordlib.gh import GitHubError
         fake = self.Fake(GitHubError("HTTP 403 POST https://api.github.com/graphql: GitHub GraphQL is not available"))
-        saved = os.environ.pop("CLAUDE_CODE_REMOTE", None)
-        try:
-            main, nodes = snapshot.fetch_prs(fake)
-            snapshot.fetch_prs(fake)
-        finally:
-            if saved is not None:
-                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        main, nodes = snapshot.fetch_prs(fake)
+        snapshot.fetch_prs(fake)
         self.assertEqual(fake.graphql_calls, 1, "after one 403 the session stays on REST")
         pr = snapshot.summarize_pr(nodes[0])
         self.assertEqual(main["sha"], "m" * 40)
@@ -906,13 +973,8 @@ class RestFallbackTests(unittest.TestCase):
     def test_other_graphql_errors_are_not_swallowed(self):
         from coordlib.gh import GitHubError
         fake = self.Fake(GitHubError("HTTP 502 POST https://api.github.com/graphql: bad gateway"))
-        saved = os.environ.pop("CLAUDE_CODE_REMOTE", None)
-        try:
-            with self.assertRaises(GitHubError):
-                snapshot.fetch_prs(fake)
-        finally:
-            if saved is not None:
-                os.environ["CLAUDE_CODE_REMOTE"] = saved
+        with self.assertRaises(GitHubError):
+            snapshot.fetch_prs(fake)
 
     def test_cloud_sessions_skip_graphql_entirely(self):
         fake = self.Fake(AssertionError("GraphQL must not be tried"))

@@ -56,6 +56,17 @@ def _number(value: Any) -> Optional[int]:
     return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def _reviewer(value: Any) -> Optional[Dict[str, Any]]:
+    """A beat's `reviewer` backlog (conductor.py `review_step`, #1092), or None: a
+    malformed or absent value shows nothing rather than crashing the board."""
+    if not isinstance(value, dict):
+        return None
+    waiting = _number(value.get("waiting"))
+    if not waiting:
+        return None
+    return {"waiting": waiting, "appAvailable": value.get("appAvailable") is True}
+
+
 def _records(comments: Iterable[Dict[str, Any]], event: str) -> List[Dict[str, Any]]:
     return sorted((c for c in comments if (c.get("payload") or {}).get("kind") == "conductor"
                    and c["payload"].get("event") == event), key=lambda c: c.get("id") or 0)
@@ -88,6 +99,7 @@ def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelt
             "disk": _number(payload.get("disk")), "wasLeader": payload.get("leader") is True,
             # Review runs of the last 24 h, so the daily cap follows the lead (reviewer.py).
             "reviewRuns": [r for r in (payload.get("reviewRuns") or []) if isinstance(r, str) and _time(r)][:100],
+            "reviewer": _reviewer(payload.get("reviewer")),
         })
     return out
 

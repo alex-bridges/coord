@@ -22,7 +22,7 @@ import re
 import urllib.parse
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
-from . import lease, marker, outage, review
+from . import lease, marker, outage, review, train
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 CLAIM_WINDOW_DAYS = 14
@@ -361,23 +361,26 @@ def fetch_coord_comments(gh: GitHub, since: dt.datetime) -> List[Dict[str, Any]]
     the issue in advance.
     """
     raw = gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={iso(since)}&per_page=100")
-    out = []
-    for comment in raw:
-        payload = marker.decode(comment.get("body"))
-        if payload is None:
-            continue
-        match = _ISSUE_URL.search(comment.get("issue_url") or "")
-        out.append({
-            "id": comment.get("id"),
-            "on": int(match.group(1)) if match else None,
-            "createdAt": comment.get("created_at"),
-            "url": comment.get("html_url"),
-            "text": marker.strip(comment.get("body") or ""),
-            "payload": payload,
-            "author": comment_author(comment),  # attestations count only from a trusted user
-        })
+    out = [c for c in map(coord_comment, raw) if c is not None]
     out.sort(key=lambda c: c["id"] or 0)
     return out
+
+
+def coord_comment(comment: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """A REST comment in the snapshot's shape, or None if it carries no marker."""
+    payload = marker.decode(comment.get("body"))
+    if payload is None:
+        return None
+    match = _ISSUE_URL.search(comment.get("issue_url") or "")
+    return {
+        "id": comment.get("id"),
+        "on": int(match.group(1)) if match else None,
+        "createdAt": comment.get("created_at"),
+        "url": comment.get("html_url"),
+        "text": marker.strip(comment.get("body") or ""),
+        "payload": payload,
+        "author": comment_author(comment),  # attestations count only from a trusted user
+    }
 
 
 def fetch_targets(gh: GitHub, numbers: Iterable[int], branches: Iterable[str]) -> Dict[str, Any]:
@@ -716,6 +719,37 @@ def overlapping(files: List[str], other: List[str]) -> List[str]:
     return sorted({f for f in files for g in other if _paths_overlap(f, g)})
 
 
+def describe_overlap(files: List[str], other: List[str], files_label: str = "", other_label: str = "") -> List[str]:
+    """The overlap of two pieces of work in words that name what each declared (#1069).
+
+    A path both name is shown once. A directory one side declared is shown as that
+    directory with the other side's paths inside it, e.g. `Tests/X/ (directory, claim #7),
+    which contains: A.swift`, so a new file is not read as one the other work touches.
+    Without `files_label` (`coord claim`, where `files` are the claimant's own), a
+    directory of the claimant's is shown as the other side's paths `(inside Tests/X/)`.
+    """
+    same, dirs = set(), {}  # dirs: (declaring side, directory) -> paths inside it
+    for f in files:
+        f = f.rstrip("/")
+        for g in other:
+            g = g.rstrip("/")
+            if f == g:
+                same.add(f)
+            elif f.startswith(g + "/"):
+                dirs.setdefault(("other", g), set()).add(f)
+            elif g.startswith(f + "/"):
+                dirs.setdefault(("files", f), set()).add(g)
+    out = sorted(same)
+    for (side, directory), inside in sorted(dirs.items(), key=lambda item: item[0][1]):
+        label = (other_label if side == "other" else files_label).split(" (")[0]  # "claim #7 (agent)" -> "claim #7"
+        if side == "files" and not files_label:
+            out.append(f"{', '.join(sorted(inside))} (inside {directory}/)")
+            continue
+        names = ", ".join(sorted(p[len(directory) + 1:] for p in inside))
+        out.append(f"{directory}/ (directory{', ' + label if label else ''}), which contains: {names}")
+    return out
+
+
 def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Pairs of in-flight work touching the same files. A warning, never a lock."""
     items = [(label, files) for label, files, _ in work_items(prs, claims)]
@@ -724,7 +758,11 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
         for j in range(i + 1, len(items)):
             shared = overlapping(items[i][1], items[j][1])
             if shared:
-                out.append({"a": items[i][0], "b": items[j][0], "files": shared})
+                entry = {"a": items[i][0], "b": items[j][0], "files": shared}
+                described = describe_overlap(items[i][1], items[j][1], items[i][0], items[j][0])
+                if described != shared:  # a directory on one side: say whose (#1069)
+                    entry["described"] = described
+                out.append(entry)
     return out
 
 
@@ -824,6 +862,43 @@ def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> Li
     return queue
 
 
+# The label that says a PR has a record, and the record's kind (any of them).
+LABELLED_RECORDS = {
+    train.REVIEWED_LABEL: ("review-clean", "review-substitute"),
+    train.ALEX_APPROVED_LABEL: ("alex-approve",),
+    TRAIN_LABEL: ("train-add",),
+}
+
+
+def with_aged_head_records(gh: GitHub, prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """`comments` plus the whole history of each PR whose label promises a record the
+    window does not hold (#1055): `reviewed`, `alex-approved` or `train` on a PR whose
+    review, approval or train-add was last touched more than CLAIM_WINDOW_DAYS ago.
+
+    API cost: one paginated call per such PR per snapshot, and none for a PR whose
+    records are all in the window, so it fires only when a head has sat that long.
+    For head records and the train queue only: old claims, messages and leases stay
+    out of the rest of the snapshot."""
+    seen = {(c["payload"].get("pr"), c["payload"].get("kind")) for c in comments
+            if c.get("on") == c["payload"].get("pr")
+            and (c["payload"].get("kind") not in HEAD_RECORDS or trusted_attestation(c.get("author"), gh.repo))}
+    extra: List[Dict[str, Any]] = []
+    for pr in prs:
+        number = pr["number"]
+        if not any(label in pr["labels"] and not any((number, kind) in seen for kind in kinds)
+                   for label, kinds in LABELLED_RECORDS.items()):
+            continue
+        for raw in gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
+            comment = coord_comment(raw)
+            if comment is not None and comment["on"] == number and comment["payload"].get("pr") == number:
+                extra.append(comment)
+    if not extra:
+        return comments
+    merged = {c["id"]: c for c in comments}
+    merged.update({c["id"]: c for c in extra})
+    return sorted(merged.values(), key=lambda c: c["id"] or 0)
+
+
 def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
     now = now or now_utc()
     main, pr_nodes = fetch_prs(gh)
@@ -836,7 +911,8 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         [p["issue"] for p in claim_payloads if isinstance(p.get("issue"), int)],
         [p.get("branch") or "" for p in claim_payloads],
     )
-    attach_head_records(prs, comments, gh.repo)
+    records = with_aged_head_records(gh, prs, comments)
+    attach_head_records(prs, records, gh.repo)
     outage_windows = outage.windows(comments)
     claims = resolve_claims(comments, targets, prs, now, outage_windows)
     # A `send` message, or any other record addressed to someone (the train's held notice).
@@ -849,7 +925,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         "prs": prs,
         "claims": claims,
         "overlaps": overlaps(prs, claims),
-        "train": train_queue(prs, comments),
+        "train": train_queue(prs, records),
         "runs": runs,
         "messages": messages,
         # Outage windows of the last CLAIM_WINDOW_DAYS; `active` ones are what the board shows.

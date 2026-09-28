@@ -27,7 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
 from test_coord import (ALEX, BOT, NOW, REAL_FAILURE, REPO, check, codex_summary, coord_comment, pr_node,  # noqa: E402
-                        reaction, refused_check)
+                        isolate_from_rest_env, reaction, refused_check)
+
+
+def setUpModule():
+    isolate_from_rest_env()  # the fakes answer GraphQL; see test_coord.REST_ENV (#1085)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.

@@ -147,6 +147,10 @@ def conductor_lines(snapshot: Dict[str, Any], now: dt.datetime) -> List[str]:
             words += f" · disk {host['disk']} GB free"
         if host.get("pending"):
             words += f" · {host['pending']} pending"
+        reviewer = host.get("reviewer")
+        if reviewer:
+            state = "on" if reviewer.get("appAvailable") else f"off (app not available on {host.get('host') or host['agent']})"
+            words += f" · reviewer {state}, {reviewer['waiting']} waiting"
         if wake.get("at"):
             words += f" · last wake {ago(wake['at'], now)} ago" + (f": {_clip(wake.get('summary') or '', 60)}" if wake.get("summary") else "")
         lines.append(words)
@@ -203,8 +207,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
     if snapshot["overlaps"]:
         lines.append("OVERLAPS (same files in two pieces of work; coordinate, nothing is locked)")
         for overlap in snapshot["overlaps"]:
-            files = overlap["files"]
-            shown = ", ".join(files[:3]) + (f" (+{len(files) - 3} more)" if len(files) > 3 else "")
+            files = overlap.get("described") or overlap["files"]
+            shown = ("; " if "described" in overlap else ", ").join(files[:3]) + (f" (+{len(files) - 3} more)" if len(files) > 3 else "")
             lines.append(f"  {overlap['a']} and {overlap['b']}: {shown}")
         lines.append("")
 
