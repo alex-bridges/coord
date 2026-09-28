@@ -88,13 +88,18 @@ class ArgumentParser(argparse.ArgumentParser):
 # MARK: - Shared helpers
 
 
-def get_snapshot(gh: GitHub, max_age: float) -> Dict[str, Any]:
+def get_snapshot(gh: GitHub, max_age: float, claim_issue: Optional[int] = None) -> Dict[str, Any]:
+    """The board, from the cache when younger than `max_age`. With `claim_issue`, a fresh
+    snapshot.claim_view for `coord claim` instead (#1109): open PRs' files and the claims,
+    not the whole board, and not cached, since it is not one."""
     low = getattr(gh, "budget_low", None)
     if low:
         return snapshot_despite_budget(gh, low)
     unavailable = getattr(gh, "app_unavailable", None)
     if unavailable:
         return snapshot_despite_budget(gh, unavailable, AppRefused, getattr(gh, "app_stale", None))
+    if claim_issue is not None:
+        return snapshot.claim_view(gh, claim_issue)
     if max_age > 0:
         cached = cache.load_snapshot(gh.repo, max_age)
         if cached is not None and cached.get("schema") == 1:
@@ -351,10 +356,12 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     if target.get("state") != "OPEN":
         print(f"coord: #{args.issue} is {target.get('state', '').lower()}; nothing to claim", file=sys.stderr)
         return EXIT_USAGE
-    snap = get_snapshot(gh, 0)
-    others = [c for c in snap["claims"] if c["issue"] == args.issue and c["agent"] != me]
-    if others and not args.force:
-        for claim in others:
+    snap = get_snapshot(gh, 0, claim_issue=args.issue)
+    others = [c for c in snap["claims"] + (snap.get("staleClaims") or [])
+              if c["issue"] == args.issue and c["agent"] != me]
+    live = [c for c in others if not c.get("mergedPr")]
+    if live and not args.force:
+        for claim in live:
             print(
                 f"coord: #{args.issue} is claimed by {claim['agent']} on {claim['branch']} "
                 f"(claimed {claim['claimedAt']}, last active {claim['lastActivity']}"
@@ -382,7 +389,12 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     if args.note:
         payload["note"] = args.note
     if others:
+        # A claim whose PR merged (#1110) is retired without --force: its work is done.
         payload["takesOverFrom"] = sorted({c["agent"] for c in others})
+        for claim in others:
+            if claim.get("mergedPr"):
+                print(f"coord: {claim['agent']}'s claim on #{args.issue} is stale (PR #{claim['mergedPr']} merged); "
+                      "this claim retires it", file=sys.stderr)
     lines = [f"**Claimed** by `{me}` on branch `{branch}`."]
     if files:
         lines.append("Expected files: " + ", ".join(f"`{f}`" for f in files))
