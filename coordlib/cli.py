@@ -707,7 +707,8 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     )
     # The head marker first, the label second: the label is what queues the PR, so it
     # must never exist without the record of the head it was added at (Codex on #989).
-    post_comment(gh, args.pr, text, {"kind": "train-add", "v": 1, "agent": me, "pr": args.pr, "head": pr["head"]})
+    post_comment(gh, args.pr, text, {"kind": "train-add", "v": 1, "agent": me, "pr": args.pr, "head": pr["head"],
+                                      **({"fallback": args.owner_fallback} if args.owner_fallback else {})})
     train_step.ensure_labels(gh)
     gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
     cache.invalidate_snapshot(gh.repo)
@@ -1221,6 +1222,8 @@ def parser() -> argparse.ArgumentParser:
     add = train_sub.add_parser("add", help="queue a PR; asserts it is not a carve-out")
     add.add_argument("pr", type=int)
     add.add_argument("--note")
+    add.add_argument("--owner-fallback", help="the agent that hears the train's held/removed notices when you "
+                     "have stopped (your dispatching lead)")
     add.set_defaults(func=cmd_train_add)
     remove = train_sub.add_parser("remove", help="take a PR out of the train")
     remove.add_argument("pr", type=int)

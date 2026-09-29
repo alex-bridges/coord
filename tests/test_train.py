@@ -101,7 +101,7 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
-        self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings")
+        self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings on head " + str(pr["head"])[:9])
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": ["Android"], "pending": [], "verdict": "failure"}))[0],
                          train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": [], "pending": ["x"], "verdict": "pending"}))[0],
