@@ -20,7 +20,7 @@ import os
 import posixpath
 import re
 import urllib.parse
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from . import lease, marker, outage, review, train
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
@@ -61,6 +61,18 @@ query($owner: String!, $name: String!, $cursor: String) {
   }
 }
 """ % PR_FIELDS
+
+
+CLAIM_PRS_QUERY = """
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 50, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title url isCrossRepository headRefName updatedAt files(first: 100) { totalCount nodes { path changeType } } }
+    }
+  }
+}
+"""
 
 
 def now_utc() -> dt.datetime:
@@ -609,6 +621,60 @@ def resolve_claims(
     so two simultaneous claims can both post — the board makes that visible
     instead of pretending it cannot happen.
     """
+    pr_by_branch = local_prs_by_branch(prs)
+    merged_by_branch = targets.get("merged") or {}
+    claims: List[Dict[str, Any]] = []
+    for comment in latest_claims(comments):
+        payload = comment["payload"]
+        issue, agent = payload["issue"], payload["agent"]
+        target = (targets.get("issues") or {}).get(issue) or {}
+        if target.get("state") in ("CLOSED", "MERGED"):
+            continue
+        branch = payload.get("branch") or ""
+        pr = pr_by_branch.get(branch)
+        branch_state = (targets.get("branches") or {}).get(branch)
+        claimed_at = review.parse_time(comment["createdAt"]) or now
+        activity = [claimed_at]
+        if branch_state and branch_state.get("committedAt"):
+            activity.append(review.parse_time(branch_state["committedAt"]) or claimed_at)
+        if pr and pr.get("updatedAt"):
+            activity.append(review.parse_time(pr["updatedAt"]) or claimed_at)
+        last_activity = max(activity)
+        merged = merged_by_branch.get(branch) if pr is None else None
+        merged_pr = merged["number"] if merged and (review.parse_time(merged["mergedAt"]) or now) >= claimed_at else None
+        claims.append({
+            "issue": issue,
+            "title": target.get("title", ""),
+            "agent": agent,
+            "branch": branch,
+            "files": [n for n in (normalize_path(str(f)) for f in payload.get("files") or []) if n],
+            "note": payload.get("note", ""),
+            "claimedAt": comment["createdAt"],
+            "commentId": comment["id"],
+            "url": comment["url"],
+            "pr": pr["number"] if pr else None,
+            "branchPushed": branch_state is not None,
+            "lastActivity": iso(last_activity),
+            # The claim's PR merged (`Refs #N`, so the issue stayed open): its work is done (#1110).
+            "mergedPr": merged_pr,
+            "stale": merged_pr is not None or pr is None and (
+                now - last_activity - outage.paused_time(outage_windows or [], agent, last_activity, now)
+                > dt.timedelta(hours=STALE_HOURS)),
+            "contested": False,
+        })
+    claims.sort(key=lambda c: c["commentId"] or 0)
+    holders: Dict[int, str] = {}
+    for claim in claims:
+        if claim["issue"] in holders and holders[claim["issue"]] != claim["agent"]:
+            claim["contested"] = True
+        holders.setdefault(claim["issue"], claim["agent"])
+    return claims
+
+
+def latest_claims(comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The claim comments still standing: per (issue, agent) the newest claim/release wins,
+    `release --everyone` clears an issue, and a claim's `takesOverFrom` retires the
+    holders it names. Issue state, PRs and staleness are resolve_claims'."""
     latest: Dict[Tuple[int, str], Dict[str, Any]] = {}
     for comment in comments:
         payload = comment["payload"]
@@ -628,50 +694,114 @@ def resolve_claims(
             for previous in payload.get("takesOverFrom") or []:
                 latest.pop((issue, previous), None)
         latest[(issue, agent)] = comment
+    return [c for c in latest.values() if c["payload"].get("kind") == "claim"]
 
-    pr_by_branch = local_prs_by_branch(prs)
-    claims: List[Dict[str, Any]] = []
-    for (issue, agent), comment in latest.items():
-        payload = comment["payload"]
-        if payload.get("kind") != "claim":
-            continue
-        target = (targets.get("issues") or {}).get(issue) or {}
-        if target.get("state") in ("CLOSED", "MERGED"):
-            continue
-        branch = payload.get("branch") or ""
-        pr = pr_by_branch.get(branch)
-        branch_state = (targets.get("branches") or {}).get(branch)
-        claimed_at = review.parse_time(comment["createdAt"]) or now
-        activity = [claimed_at]
-        if branch_state and branch_state.get("committedAt"):
-            activity.append(review.parse_time(branch_state["committedAt"]) or claimed_at)
-        if pr and pr.get("updatedAt"):
-            activity.append(review.parse_time(pr["updatedAt"]) or claimed_at)
-        last_activity = max(activity)
-        claims.append({
-            "issue": issue,
-            "title": target.get("title", ""),
-            "agent": agent,
-            "branch": branch,
-            "files": [n for n in (normalize_path(str(f)) for f in payload.get("files") or []) if n],
-            "note": payload.get("note", ""),
-            "claimedAt": comment["createdAt"],
-            "commentId": comment["id"],
-            "url": comment["url"],
-            "pr": pr["number"] if pr else None,
-            "branchPushed": branch_state is not None,
-            "lastActivity": iso(last_activity),
-            "stale": pr is None and (now - last_activity - outage.paused_time(outage_windows or [], agent, last_activity, now))
-            > dt.timedelta(hours=STALE_HOURS),
-            "contested": False,
-        })
-    claims.sort(key=lambda c: c["commentId"] or 0)
-    holders: Dict[int, str] = {}
-    for claim in claims:
-        if claim["issue"] in holders and holders[claim["issue"]] != claim["agent"]:
-            claim["contested"] = True
-        holders.setdefault(claim["issue"], claim["agent"])
-    return claims
+
+MAX_CLOSED_PR_PAGES = 10
+
+
+def fetch_merged_branches(gh: GitHub, branches: Iterable[str], since: dt.datetime) -> Dict[str, Dict[str, Any]]:
+    """The newest PR from this repository merged since `since` for each of `branches`:
+    branch -> {number, mergedAt} (#1110). A claim whose `Refs #N` PR merged is matched by
+    branch, as the board matches an open PR.
+
+    Closed PRs newest-updated first, a page at a time, stopping at the first PR last
+    updated before `since`: a PR merged after a claim was updated after it too. Usually
+    one call. Explicit pages, not rest_paginated, which would read every closed PR."""
+    wanted = {b for b in branches if b}
+    found: Dict[str, Dict[str, Any]] = {}
+    if not wanted:
+        return found
+    for page in range(1, MAX_CLOSED_PR_PAGES + 1):
+        pulls = gh.rest(f"repos/{{repo}}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}") or []
+        for pull in pulls:
+            head = pull.get("head") or {}
+            branch, merged_at = head.get("ref"), pull.get("merged_at")
+            if (branch in wanted and merged_at and (head.get("repo") or {}).get("full_name") == gh.repo
+                    and merged_at > (found.get(branch) or {}).get("mergedAt", "")):
+                found[branch] = {"number": pull["number"], "mergedAt": merged_at}
+        oldest = review.parse_time((pulls[-1] if pulls else {}).get("updated_at"))
+        if len(pulls) < 100 or oldest is None or oldest < since:
+            break
+    return found
+
+
+def merged_candidates(comments: List[Dict[str, Any]], prs: List[Dict[str, Any]],
+                      closed: Iterable[int] = ()) -> Tuple[List[str], Optional[dt.datetime]]:
+    """The branches of standing claims on issues not in `closed` that have no open PR, and
+    the earliest of those claims: what fetch_merged_branches must look for."""
+    open_branches = set(local_prs_by_branch(prs))
+    closed = set(closed)
+    pending = [c for c in latest_claims(comments)
+               if c["payload"]["issue"] not in closed and (c["payload"].get("branch") or "") not in open_branches
+               and c["payload"].get("branch")]
+    times = [t for t in (review.parse_time(c["createdAt"]) for c in pending) if t is not None]
+    return sorted({c["payload"]["branch"] for c in pending}), (min(times) if times else None)
+
+
+def claim_prs_rest(gh: GitHub) -> List[Dict[str, Any]]:
+    """Open PRs with their files, for claim_view: the list, then one call per PR."""
+    return [{
+        "number": p["number"],
+        "title": p.get("title", ""),
+        "url": p.get("html_url"),
+        "branch": (p.get("head") or {}).get("ref"),
+        "fromFork": ((p.get("head") or {}).get("repo") or {}).get("full_name") != gh.repo,
+        "updatedAt": p.get("updated_at"),
+        "files": rest_files(gh, p["number"]),
+    } for p in gh.rest_paginated("repos/{repo}/pulls?state=open&per_page=100")]
+
+
+def claim_prs_graphql(gh: GitHub) -> List[Dict[str, Any]]:
+    """claim_prs_rest's result in one query per 50 PRs; a PR with more than 100 files or
+    a rename is completed over REST, as complete_pr_node does."""
+    out: List[Dict[str, Any]] = []
+    cursor = None
+    while True:
+        page = gh.graphql(CLAIM_PRS_QUERY, {"owner": gh.owner, "name": gh.name, "cursor": cursor})
+        page = page["repository"]["pullRequests"]
+        for node in page["nodes"]:
+            files = node.get("files") or {}
+            paths = ([f["path"] for f in files.get("nodes") or []]
+                     if not truncated(files) and not any(f.get("changeType") == "RENAMED" for f in files.get("nodes") or [])
+                     else rest_files(gh, node["number"]))
+            out.append({"number": node["number"], "title": node.get("title", ""), "url": node.get("url"),
+                        "branch": node.get("headRefName"), "fromFork": bool(node.get("isCrossRepository")),
+                        "updatedAt": node.get("updatedAt"), "files": paths})
+        if not page["pageInfo"]["hasNextPage"]:
+            return out
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def claim_view(gh: GitHub, issue: int, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    """What `coord claim` reads (#1109): open PRs with their files and the standing claims,
+    without the board's reviews, CI, runs, train and conductor state.
+
+    In REST-only mode the board cost about 250 calls and 100 s (2026-09-28), mostly an
+    issue and a branch read for every claim record in the window. This is one call for the
+    open PRs and one per open PR for its files, the record window, one listing of the
+    issues closed since the oldest standing claim, the merged-PR pages, and a branch read
+    only for the claims on `issue` (their staleness is shown when they block). Where
+    GraphQL works, the open PRs and their files are one query."""
+    now = now or now_utc()
+    prs = with_rest_fallback(gh, lambda: claim_prs_graphql(gh), lambda: claim_prs_rest(gh))
+    comments = fetch_coord_comments(gh, now - dt.timedelta(days=CLAIM_WINDOW_DAYS))
+    standing = latest_claims(comments)
+    closed: Set[int] = set()
+    times = [t for t in (review.parse_time(c["createdAt"]) for c in standing) if t is not None]
+    if times:
+        # A claim comment bumps its issue's updated_at, so this lists every closed issue a
+        # standing claim is on (PRs too: the issues endpoint lists both).
+        closed = {i["number"] for i in gh.rest_paginated(
+            f"repos/{{repo}}/issues?state=closed&since={iso(min(times))}&per_page=100")}
+    branches, since = merged_candidates(comments, prs, closed)
+    mine = [c["payload"].get("branch") or "" for c in standing if c["payload"]["issue"] == issue]
+    targets = fetch_targets(gh, [], mine)
+    targets["issues"] = {n: {"state": "CLOSED"} for n in closed}
+    targets["merged"] = fetch_merged_branches(gh, branches, since) if since else {}
+    resolved = resolve_claims(comments, targets, prs, now, outage.windows(comments))
+    return {"prs": prs, "claims": [c for c in resolved if c["mergedPr"] is None],
+            "staleClaims": [c for c in resolved if c["mergedPr"] is not None]}
 
 
 def normalize_path(path: str) -> str:
@@ -913,8 +1043,13 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
     )
     records = with_aged_head_records(gh, prs, comments)
     attach_head_records(prs, records, gh.repo)
+    closed = [n for n, t in targets["issues"].items() if (t or {}).get("state") in ("CLOSED", "MERGED")]
+    branches, since = merged_candidates(comments, prs, closed)
+    targets["merged"] = fetch_merged_branches(gh, branches, since) if since else {}
     outage_windows = outage.windows(comments)
-    claims = resolve_claims(comments, targets, prs, now, outage_windows)
+    resolved = resolve_claims(comments, targets, prs, now, outage_windows)
+    # A claim whose PR merged is done: out of flight and overlaps, kept here (#1110).
+    claims = [c for c in resolved if c["mergedPr"] is None]
     # A `send` message, or any other record addressed to someone (the train's held notice).
     messages = [c for c in comments if c["payload"].get("kind") == "msg" or marker.recipients(c["payload"])]
     return {
@@ -932,6 +1067,7 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         "outages": [outage.serialize(w) for w in outage_windows],
         "conductor": {"hosts": lease.hosts(comments, now), "pause": lease.pause(comments, now),
                       "escalations": lease.escalations(comments, now)},
+        "staleClaims": [c for c in resolved if c["mergedPr"] is not None],
         "claimComments": [c for c in comments if c["payload"].get("kind") in ("claim", "release")],
         "apiCalls": gh.calls,
     }
