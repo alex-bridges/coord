@@ -305,7 +305,8 @@ class Step:
             if blocks:
                 blocked.add(blocks)  # from the PR's whole history, not a comment window (Codex on #1049)
             if payload.get("kind") == "train-add":
-                latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent")}
+                latest = {"at": comment.get("created_at"), "head": payload.get("head"), "agent": payload.get("agent"),
+                          "fallback": payload.get("fallback")}
                 add_heads.append(payload.get("head"))
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
@@ -318,6 +319,7 @@ class Step:
                 pr["overtakenBy"] = payload.get("batch") or "?"
         pr["trainAddedBy"] = latest.get("agent")
         pr["trainAddedAt"] = latest.get("at")
+        pr["ownerFallback"] = latest.get("fallback")
         pr["heldNotices"] = held
         pr["sidechainBlockedHeads"] = sorted(blocked)
         pr["reviewRequests"] = requests
@@ -347,9 +349,22 @@ class Step:
         return self.agent != TRAIN_AGENT and payload.get("agent") == self.agent
 
     def recipients(self, pr: Optional[Dict[str, Any]]) -> List[str]:
-        """Who hears when the train takes a PR out: the agent that added it (when this step
-        read it) and the conductor, which keeps the train moving (conductor.py)."""
-        return list(dict.fromkeys(a for a in ((pr or {}).get("trainAddedBy"), train.CONDUCTOR) if a))
+        """Who hears when the train holds or takes out a PR: the agent that added it (when
+        this step read it), the fallback it named at `train add --owner-fallback` (the
+        dispatching lead: a one-shot owner has stopped by then, #1148), and the conductor,
+        which keeps the train moving (conductor.py).
+
+        A PR dict straight from `open_prs()` (the ejection path) has not had its train-add
+        marker read yet: read it here, or the notice reaches the conductor alone (Codex on
+        #1157). Best effort: a read error leaves the conductor as the recipient."""
+        pr = pr or {}
+        if pr.get("number") is not None and "heldNotices" not in pr:
+            try:
+                self.train_added(pr)
+            except GitHubError as error:
+                self.note(f"#{pr['number']}: could not read who added it ({error}); telling the conductor only")
+        return list(dict.fromkeys(a for a in (pr.get("trainAddedBy"), pr.get("ownerFallback"), train.CONDUCTOR)
+                                  if isinstance(a, str) and a))
 
     def notify_held(self, pr: Dict[str, Any], head: str, hold: str, reason: str) -> None:
         """Tell whoever is still responsible that a queued PR is held (#1034), once per
@@ -378,7 +393,7 @@ class Step:
                 self.train_added(pr)
             if (head, hold) in pr["heldNotices"]:
                 return
-            to = list(dict.fromkeys(agent for agent in (pr.get("trainAddedBy"), train.CONDUCTOR) if agent))
+            to = self.recipients(pr)
             text = (f"**Held in the merge train** at head `{head[:9]}`: {reason}.\n\n"
                     + train.HOLD_ACTIONS[hold].format(pr=number) + "\n\n"
                     + "To " + ", ".join(f"`{agent}`" for agent in to)
@@ -672,7 +687,8 @@ class Step:
                     self.comment(number, (
                         f"**Removed from the merge train:** CI failed on this PR alone, twice "
                         f"({jobs}): {url}\n\nFix it and add it again with `Tools/coord/coord train add {number}`."
-                    ), "ejected", batch=name, run=run["id"], failed=failed[:10], to=self.recipients(prs.get(number)))
+                    ), "ejected", batch=name, run=run["id"], failed=failed[:10],
+                       to=self.recipients(prs.get(number) or {"number": number}))
                 else:
                     self.add_label(number, train.SOLO_LABEL)
                     self.comment(number, (

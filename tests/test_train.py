@@ -101,7 +101,7 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": True}))[1],
                          "Codex is re-reviewing it")
         self.assertEqual(train.eligibility(dict(pr, codex={"approved": False, "reviewing": False}))[0], train.HOLD)
-        self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings")
+        self.assertEqual(train.eligibility(dict(pr, unansweredFindings=2))[1], "2 unanswered Codex findings on head " + str(pr["head"])[:9])
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": ["Android"], "pending": [], "verdict": "failure"}))[0],
                          train.HOLD)
         self.assertEqual(train.eligibility(dict(pr, ci={"failing": [], "pending": ["x"], "verdict": "pending"}))[0],
@@ -867,6 +867,22 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertEqual(fake.posted("ejected"), [1])
         self.assertIn(("DELETE", "repos/{repo}/issues/1/labels/train", None), fake.writes)
+
+    def test_an_ejection_reaches_the_adder_and_its_fallback(self):
+        # Codex on #1157: advance() hands the PR dicts open_prs() returned straight to
+        # recipients(), which never read the train-add marker, so the notice went to the
+        # conductor alone. The ejected record must name the adder and its fallback.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=50)), "body": compose_record(
+            "added", {"kind": "train-add", "pr": 1, "head": h1, "agent": "worker@x", "fallback": "lead@y"})}]
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"}]
+        self.step(fake).run()
+        ejected = [marker.decode(body["body"]) for method, path, body in fake.writes
+                   if method == "POST" and path.endswith("/comments")
+                   and (marker.decode(body["body"]) or {}).get("event") == "ejected"]
+        self.assertEqual([payload["to"] for payload in ejected], [["worker@x", "lead@y", train.CONDUCTOR]])
 
     def test_clean_up_interrupted_after_main_moved_is_finished_by_the_next_step(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")

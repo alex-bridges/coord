@@ -175,6 +175,13 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     codex = pr.get("codex") or {}
     if codex.get("reviewing"):
         return HOLD, HOLD_NO_REVIEW, "Codex is re-reviewing it"
+    if pr.get("unansweredFindings"):
+        # Checked before the 👍: Codex answering a head with findings (a COMMENTED review,
+        # no 👍) is a different hold from waiting for a first review, so the train posts a
+        # new notice for it and the board says so (#1148).
+        count = pr["unansweredFindings"]
+        return HOLD, HOLD_UNANSWERED_FINDINGS, (f"{count} unanswered Codex finding" + ("s" if count != 1 else "")
+                                                + f" on head {str(pr.get('head'))[:9]}")
     if not codex.get("approved"):
         # A clean review by any agent counts too (Alex, 2026-09-26), for the one head its
         # record names. No label is needed: labels persist across pushes, the record does
@@ -188,9 +195,6 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         if reviewed != pr.get("head"):
             return HOLD, HOLD_NO_REVIEW, (f"no Codex 👍 on its current head {head}, and the recorded clean review "
                                           f"covers {str(reviewed)[:9]}, an older head; a new push needs a new review")
-    if pr.get("unansweredFindings"):
-        count = pr["unansweredFindings"]
-        return HOLD, HOLD_UNANSWERED_FINDINGS, f"{count} unanswered Codex finding" + ("s" if count != 1 else "")
     failing = (pr.get("ci") or {}).get("failing") or []
     if failing:
         return HOLD, HOLD_CI_RED, "CI is red at its head: " + ", ".join(failing[:3])
