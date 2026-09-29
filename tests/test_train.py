@@ -966,8 +966,12 @@ class StepTests(unittest.TestCase):
         self.assertIn(("POST", "repos/{repo}/actions/runs/603/cancel", None), fake.writes, "the rest still cancelled")
         self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes,
                          "a failed cancel keeps the batch for the next step")
-        self.assertTrue(any("601" in line for line in lines), lines)
-        self.assertFalse(any("602" in line for line in lines), "409: the run finished, nothing to retry")
+        # Match the message, never a bare run id: the output also carries the batch
+        # name (train/YYYYMMDD-HHMMSS) and a short SHA, either of which can contain
+        # "602" (a batch built at 19:36:02 is train/…-193602: CI red on #1094).
+        self.assertTrue(any("could not cancel run 601 " in line for line in lines), lines)
+        self.assertFalse(any("could not cancel run 602 " in line for line in lines),
+                         "409: the run finished, nothing to retry")
 
     def test_a_person_s_train_branch_is_never_touched(self):
         sh(self.work, "push", "-q", "origin", f"{self.main}:refs/heads/train/fix-cache")
