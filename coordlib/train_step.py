@@ -352,8 +352,17 @@ class Step:
         """Who hears when the train holds or takes out a PR: the agent that added it (when
         this step read it), the fallback it named at `train add --owner-fallback` (the
         dispatching lead: a one-shot owner has stopped by then, #1148), and the conductor,
-        which keeps the train moving (conductor.py)."""
+        which keeps the train moving (conductor.py).
+
+        A PR dict straight from `open_prs()` (the ejection path) has not had its train-add
+        marker read yet: read it here, or the notice reaches the conductor alone (Codex on
+        #1157). Best effort: a read error leaves the conductor as the recipient."""
         pr = pr or {}
+        if pr.get("number") is not None and "heldNotices" not in pr:
+            try:
+                self.train_added(pr)
+            except GitHubError as error:
+                self.note(f"#{pr['number']}: could not read who added it ({error}); telling the conductor only")
         return list(dict.fromkeys(a for a in (pr.get("trainAddedBy"), pr.get("ownerFallback"), train.CONDUCTOR)
                                   if isinstance(a, str) and a))
 
@@ -678,7 +687,8 @@ class Step:
                     self.comment(number, (
                         f"**Removed from the merge train:** CI failed on this PR alone, twice "
                         f"({jobs}): {url}\n\nFix it and add it again with `Tools/coord/coord train add {number}`."
-                    ), "ejected", batch=name, run=run["id"], failed=failed[:10], to=self.recipients(prs.get(number)))
+                    ), "ejected", batch=name, run=run["id"], failed=failed[:10],
+                       to=self.recipients(prs.get(number) or {"number": number}))
                 else:
                     self.add_label(number, train.SOLO_LABEL)
                     self.comment(number, (
