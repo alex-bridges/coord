@@ -539,7 +539,7 @@ class Reviews:
     def step(self, issue_comments: List[Dict[str, Any]], windows: List[Dict[str, Any]], blocked: str,
              extra: Optional[Dict[str, Any]] = None) -> None:
         self.extra = extra or {}
-        self.began = snapshot.now_utc()  # for clock(): the tick's time, advanced by what this step took
+        self.began = snapshot.now_utc()  # clock()'s fallback when the watcher records no start
         self.prune()
         if self.app is not None and getattr(self.app, "app", None) is not None:
             # Before anything can return early (a wake's tick, a pause, the cap): the claims
@@ -684,9 +684,14 @@ class Reviews:
         self.publish(request, record, posting, key)
 
     def clock(self) -> dt.datetime:
-        """The tick's time advanced by the wall time this step has taken so far: after a
-        model run, self.w.now is up to a whole run behind (Codex on #1088)."""
-        return self.w.now + (snapshot.now_utc() - getattr(self, "began", snapshot.now_utc()))
+        """The tick's time advanced by the wall time the tick has taken so far: after a model
+        run, or a conductor wake (triage and repair) that ran before this step, self.w.now is
+        that far behind (Codex on #1088). Counted from the watcher's own start, which goes
+        with self.w.now; from this step's start only when the watcher does not record one."""
+        began = getattr(self.w, "began", None)
+        if not isinstance(began, dt.datetime):
+            began = getattr(self, "began", None) or snapshot.now_utc()
+        return self.w.now + (snapshot.now_utc() - began)
 
     def lease(self) -> dt.datetime:
         """When a claim posted now runs out: the run's configured timeout and the margin."""

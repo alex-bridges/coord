@@ -514,6 +514,9 @@ class Watcher:
         self.config = config
         self.gh = gh
         self.now = now or snapshot.now_utc()
+        # The wall time that goes with self.now: a tick's wakes run before its review step, so
+        # the reviewer's clock counts from here, not from its own step (Codex on #1088).
+        self.began = snapshot.now_utc()
         self.runner = runner or default_runner
         self.disk = disk or free_gb
         self.git = git or (lambda args: run_git(config.home, args))

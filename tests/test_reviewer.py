@@ -1172,10 +1172,28 @@ class CrossHostClaimTests(ReviewFlowTests):
             return runner(cmd, cwd, env, timeout)
         self.runner = host.runner = long_run
         self.replies = [review_reply()]
+        host.began = wall[0]  # the watcher's wall-clock start, with host.now
         with mock.patch.object(snapshot, "now_utc", side_effect=lambda: wall[0]):
             host.review_step([], None, None, True, {}, user_ok=False)
         self.assertEqual([c["until"] for c in self.claims()],
                          [snapshot.iso(at(5 + 135)), snapshot.iso(at(125 + 270))])
+
+    def test_the_renewal_after_a_long_wake_counts_the_wake(self):
+        """Codex on 3785349: a tick's triage and repair run before its review step, so a clock
+        started at the step still read the tick's start time."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        host = self.host("Tycho", request, 5)
+        wall = [at(5)]
+        host.began = wall[0]
+        self.replies = [review_reply()]
+        with mock.patch.object(snapshot, "now_utc", side_effect=lambda: wall[0]):
+            host.review_step([], None, None, True, {}, user_ok=False)  # finished; held to 5 + 270
+            host.now = host.began = at(140)  # the next tick starts...
+            wall[0] = at(260)  # ...and its wake takes two 60-min runs before the review step
+            host.review_step([], None, None, True, {}, user_ok=False)
+        self.assertEqual([c["until"] for c in self.claims()],
+                         [snapshot.iso(at(65)), snapshot.iso(at(275)), snapshot.iso(at(260 + 270))])
 
     def owner_at(self, minutes):
         owner = reviewer.claim_owner(self.app.rest_paginated("repos/{repo}/issues/7/comments"), 7, HEAD, "opus",
