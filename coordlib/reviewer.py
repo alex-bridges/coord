@@ -695,7 +695,7 @@ class Reviews:
 
     def lease(self) -> dt.datetime:
         """When a claim posted now runs out: the run's configured timeout and the margin."""
-        return self.w.now + dt.timedelta(seconds=self.config.review_timeout) + CLAIM_MARGIN
+        return self.clock() + dt.timedelta(seconds=self.config.review_timeout) + CLAIM_MARGIN
 
     def gap(self) -> dt.timedelta:
         """The longest this host can go between two renewals of the claims it holds
@@ -720,12 +720,12 @@ class Reviews:
         its host runs (#1056)."""
         path = f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100"
         comments = self.app.rest_paginated(path)
-        owner = claim_owner(comments, request["pr"], head, request["model"], self.w.now)
+        owner = claim_owner(comments, request["pr"], head, request["model"], self.clock())
         if owner is None or (owner["agent"] == self.agent() and owner["until"] < self.lease()):
             self.post_claim(request, record, head, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
                                                    f"(asked in {request.get('url') or 'a comment'}).")
             comments = self.app.rest_paginated(path)
-            owner = claim_owner(comments, request["pr"], head, request["model"], self.w.now)
+            owner = claim_owner(comments, request["pr"], head, request["model"], self.clock())
         if request["id"] in answered(comments, self.app.repo) \
                 or posted_review(comments, request["pr"], head, request["model"], self.app.repo) is not None:
             # A holder whose claim lapsed while its finished review waited posted it since

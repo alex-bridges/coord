@@ -1011,6 +1011,26 @@ class CodexRound7Tests(ReviewFlowTests):
 class CrossHostClaimTests(ReviewFlowTests):
     """Two leaders during a lease overlap (#1056): one review per (PR, head, model), not two."""
 
+    def setUp(self):
+        super().setUp()
+        # Claims are dated by clock(), the tick's time plus wall time since the watcher began:
+        # a still wall clock keeps the expected expiries exact (a test that moves it patches it).
+        still = mock.patch.object(snapshot, "now_utc", return_value=at(0))
+        still.start()
+        self.addCleanup(still.stop)
+
+    def test_the_first_lease_counts_the_time_before_it(self):
+        """Codex on 8c9171c: reads and the checkout update before the claim could take more
+        than the margin, and the lease was dated from the tick's start."""
+        self.app.echo_posts = True
+        request = reviewer.requests([self.ask(1)])[0]
+        host = self.host("Tycho", request, 5)
+        host.began = at(5)
+        self.replies = [review_reply()]
+        with mock.patch.object(snapshot, "now_utc", return_value=at(35)):  # 30 min of pre-review work
+            host.review_step([], None, None, True, {})
+        self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(35 + 45 + 15))])
+
     def host(self, name, request, minutes):
         config = make_config(os.path.join(self.tmp.name, name), agent=f"conductor@{name}:conductor")
         os.makedirs(config.state_dir, exist_ok=True)
