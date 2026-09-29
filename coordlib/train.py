@@ -16,8 +16,11 @@ AND again just before main moves — the `train` label is intent, not approval:
 - the current head is reviewed: Codex 👍 on it (review.codex_state), or a clean review
   of it by any agent (Alex, 2026-09-26), recorded by `coord train review` in a comment
   naming that head. That record, like Alex's approval below, counts only when a
-  trusted user posted it, never a bot (snapshot.trusted_attestation);
-- no unanswered Codex findings;
+  trusted user posted it, never a bot (snapshot.trusted_attestation). It counts while
+  Codex is still re-reviewing the head, too (Alex, 2026-09-29, #1181): the train waits
+  for Codex only on a head with no clean review recorded;
+- no unanswered Codex findings, clean review or not. Findings that land while the PR
+  is in a batch take it out at the final check, before main moves;
 - CI at the head not red (pending is fine: the batch runs the gates anyway). A check
   GitHub never started (review.NOT_RUN_PREFIX, e.g. refused by the Actions budget) is
   in `ci.not_run`, not `ci.failing`: it neither holds the PR nor counts for it;
@@ -75,7 +78,7 @@ READY, HOLD, DROP = "ready", "hold", "drop"
 HOLD_DRAFT = "draft"
 HOLD_PARTIAL_DATA = "partial-data"
 HOLD_NEEDS_ALEX = "needs-alex"
-HOLD_NO_REVIEW = "no-review"  # Codex re-reviewing, or neither a Codex 👍 nor a recorded clean review at the head
+HOLD_NO_REVIEW = "no-review"  # neither a Codex 👍 nor a recorded clean review at the head (Codex re-reviewing or not)
 HOLD_UNANSWERED_FINDINGS = "unanswered-findings"
 HOLD_CI_RED = "ci-red"
 HOLD_HEAD_MOVED = "head-moved"  # the step's own checks, not eligibility: the head moved under a batch
@@ -173,7 +176,11 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         return HOLD, HOLD_UNANSWERED_FINDINGS, ("an inisa-sidechain review requested changes at this head "
                                                 f"{str(pr.get('head'))[:9]}; only a new push answers it")
     codex = pr.get("codex") or {}
-    if codex.get("reviewing"):
+    # A clean review recorded for this exact head is its review, whether or not Codex is
+    # still looking (Alex, 2026-09-29, #1181: "Yes, clean review suffices"). It releases
+    # only the wait for Codex: findings on the head still hold it, just below.
+    clean_at_head = bool(pr.get("reviewedHead")) and pr.get("reviewedHead") == pr.get("head")
+    if codex.get("reviewing") and not clean_at_head:
         return HOLD, HOLD_NO_REVIEW, "Codex is re-reviewing it"
     if pr.get("unansweredFindings"):
         # Checked before the 👍: Codex answering a head with findings (a COMMENTED review,

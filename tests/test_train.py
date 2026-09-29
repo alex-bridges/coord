@@ -130,9 +130,7 @@ class EligibilityTests(unittest.TestCase):
         self.assertNotIn("--head aaaaaaa", reason, "never pre-filled with the current head")
         self.assertEqual(train.assess(self.unreviewed(head=None))[0], train.HOLD, "no head and no record is not a match")
 
-    def test_codex_re_reviewing_still_holds_a_recorded_review(self):
-        pr = dict(self.unreviewed(), codex={"approved": False, "reviewing": True})
-        self.assertEqual(train.eligibility(dict(pr, reviewedHead=pr["head"])), (train.HOLD, "Codex is re-reviewing it"))
+    # A recorded clean review of the head while Codex re-reviews it: test_train_clean_review (#1181).
 
     def test_a_record_of_either_kind_sets_the_reviewed_head(self):
         head = "a" * 40
