@@ -263,6 +263,17 @@ class CodexStateTests(unittest.TestCase):
         state = review.codex_state(pr_node(reactions={"nodes": [reaction("THUMBS_UP", 5, "alex-bridges")]}))
         self.assertFalse(state["approved"])
 
+    def test_null_nodes_are_skipped(self):
+        # GitHub can return a null node in a connection without an `errors` entry; one
+        # null reaction crashed the train step on 2026-09-30 (run 10000098).
+        node = pr_node(reactions={"nodes": [None, reaction("THUMBS_UP", 30)]})
+        node["comments"]["nodes"].insert(0, None)
+        node["reviewThreads"] = {"nodes": [None, {"isResolved": False, "comments": {"nodes": [None]}}]}
+        self.assertTrue(review.codex_state(node)["approved"])
+        self.assertEqual(review.unanswered_findings(node), 0)
+        node["commits"]["nodes"] = [None]
+        self.assertIsNone(review.head_pushed_at(node))
+
     def test_commit_date_is_the_fallback_push_time(self):
         node = pr_node(reactions={"nodes": [reaction("THUMBS_UP", 80)]})
         node["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"] = []
