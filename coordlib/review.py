@@ -137,13 +137,19 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
     for thread in threads:
         if thread.get("isResolved"):
             continue
-        comments = _nodes(thread.get("comments"))
+        comments = ((thread.get("comments") or {}).get("nodes")) or []
         if not comments:
+            continue
+        if not isinstance(comments[0], dict):
+            # Who started the thread is unknown, and the next comment did not start it:
+            # count it rather than let a null hide a finding (Codex on #1218).
+            count += 1
             continue
         starter = (comments[0].get("author") or {}).get("login")
         if not is_bot(starter):
             continue
-        answered = any(not is_bot((c.get("author") or {}).get("login")) for c in comments[1:])
+        answered = any(isinstance(c, dict) and not is_bot((c.get("author") or {}).get("login"))
+                       for c in comments[1:])
         if not answered:
             count += 1
     return count

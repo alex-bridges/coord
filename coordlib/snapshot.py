@@ -225,6 +225,12 @@ def rest_files(gh: GitHub, number: int) -> List[str]:
     return paths
 
 
+def _drop_nulls(connection: Optional[Dict[str, Any]]) -> None:
+    """Remove null entries from a connection's nodes in place (totalCount is kept)."""
+    if connection and isinstance(connection.get("nodes"), list):
+        connection["nodes"] = [n for n in connection["nodes"] if isinstance(n, dict)]
+
+
 def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     """Make every list in a PR node whole before any rule reads it.
 
@@ -238,6 +244,20 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     """
     number = node["number"]
     incomplete: List[str] = []
+    # GitHub can return a null node inside a connection with no `errors` entry (a null
+    # reaction crashed the train step on 2026-09-30, run 10000098). Dropping it leaves
+    # the connection shorter than its totalCount, so the completions below re-read that
+    # list over REST. Where a null cannot be re-read or its position matters (the head
+    # commit, a review thread or its starter), the PR is held on partial data instead.
+    for key in ("files", "labels", "comments", "reactions"):
+        _drop_nulls(node.get(key))
+    commit_nodes = ((node.get("commits") or {}).get("nodes")) or []
+    if commit_nodes and not isinstance(commit_nodes[-1], dict):
+        incomplete.append("head commit (GitHub returned it empty)")
+    else:
+        head = (commit_nodes[-1].get("commit") or {}) if commit_nodes else {}
+        _drop_nulls((head.get("statusCheckRollup") or {}).get("contexts"))
+        _drop_nulls(head.get("checkSuites"))
     files = node.get("files") or {}
     if truncated(files) or any(f.get("changeType") == "RENAMED" for f in files.get("nodes") or []):
         paths = rest_files(gh, number)
@@ -256,7 +276,7 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
             {"content": REACTION_NAMES.get(r.get("content"), _upper(r.get("content"))), "createdAt": r.get("created_at"),
              "user": {"login": (r.get("user") or {}).get("login")}} for r in listed]}
     commits = ((node.get("commits") or {}).get("nodes")) or []
-    if commits:
+    if commits and isinstance(commits[-1], dict):
         commit = commits[-1].get("commit") or {}
         sha = commit.get("oid") or node.get("headRefOid")
         rollup = commit.get("statusCheckRollup") or {}
@@ -279,7 +299,14 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
         page_info = more["pageInfo"]
         cursor = page_info.get("endCursor")
     threads["pageInfo"] = {"hasNextPage": False, "endCursor": cursor}
-    if any(truncated(t.get("comments")) for t in threads.get("nodes") or []):
+    thread_nodes = threads.get("nodes") or []
+    if any(not isinstance(t, dict) for t in thread_nodes) or any(
+            not isinstance(c, dict) for t in thread_nodes if isinstance(t, dict)
+            for c in ((t.get("comments") or {}).get("nodes") or [])):
+        # A null thread could hide an unanswered finding, and a null comment shifts which
+        # one started its thread: neither can be guessed around.
+        incomplete.append("review threads (GitHub returned an empty thread or comment)")
+    elif any(truncated(t.get("comments")) for t in thread_nodes):
         incomplete.append("review-thread comments (a thread longer than 50)")
     node["incomplete"] = incomplete
 

@@ -270,7 +270,10 @@ class CodexStateTests(unittest.TestCase):
         node["comments"]["nodes"].insert(0, None)
         node["reviewThreads"] = {"nodes": [None, {"isResolved": False, "comments": {"nodes": [None]}}]}
         self.assertTrue(review.codex_state(node)["approved"])
-        self.assertEqual(review.unanswered_findings(node), 0)
+        self.assertEqual(review.unanswered_findings(node), 1, "a null starter counts; it is not skipped")
+        node["reviewThreads"] = {"nodes": [{"isResolved": False, "comments": {"nodes": [
+            None, {"author": {"login": BOT}}]}}]}
+        self.assertEqual(review.unanswered_findings(node), 1, "the bot reply did not start the thread")
         node["commits"]["nodes"] = [None]
         self.assertIsNone(review.head_pushed_at(node))
 
@@ -1045,6 +1048,27 @@ class CodexRoundSevenTests(unittest.TestCase):
         verdict, reason = train.eligibility(dict(pr, ci={"failing": [], "pending": [], "started": []}))
         self.assertEqual(verdict, train.HOLD)
         self.assertIn("only part of", reason)
+
+    def test_null_nodes_are_re_read_or_hold_the_pr(self):
+        # Codex on #1218: the nulls must be handled where the snapshot completes a PR
+        # node, not only in the rules that read it afterwards.
+        node = pr_node(reactions={"totalCount": 2, "nodes": [None, None]})
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = {"totalCount": 1, "nodes": [None]}
+        snapshot.complete_pr_node(self.Fake(), node)
+        pr = snapshot.summarize_pr(node)
+        self.assertTrue(pr["codex"]["approved"], "the null reactions were re-read over REST")
+        self.assertEqual(pr["ci"]["failing"], ["Android"], "the null check was re-read over REST")
+        self.assertEqual(pr["incomplete"], [])
+        for threads in ({"nodes": [None]},
+                        {"nodes": [{"isResolved": False, "comments": {"nodes": [None, {"author": {"login": BOT}}]}}]}):
+            node = pr_node(reviewThreads=threads)
+            snapshot.complete_pr_node(self.Fake(), node)
+            self.assertEqual(snapshot.summarize_pr(node)["incomplete"],
+                             ["review threads (GitHub returned an empty thread or comment)"])
+        node = pr_node()
+        node["commits"]["nodes"] = [None]
+        snapshot.complete_pr_node(self.Fake(), node)
+        self.assertEqual(snapshot.summarize_pr(node)["incomplete"], ["head commit (GitHub returned it empty)"])
 
     def test_a_fork_pr_with_the_same_branch_name_is_never_taken_for_local_work(self):
         fork = snapshot.summarize_pr(pr_node(number=200, headRefName="feature/x", isCrossRepository=True))
