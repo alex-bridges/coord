@@ -479,9 +479,27 @@ class WatcherTests(unittest.TestCase):
         watcher = conductor.Watcher(self.config, self.gh, now=NOW)
         watcher.records = conductor.coord_comments(self.gh.issue_comments)
         watcher.issue = 900
+        watcher.state["beatComment"] = 1
         watcher.beat(False, {})
         self.assertIn(("PATCH", "repos/{repo}/issues/comments/2"), self.gh.calls)
         self.assertNotIn(("PATCH", "repos/{repo}/issues/comments/1"), self.gh.calls)
+
+    def test_forged_saved_beat_id_posts_once_then_reuses_the_new_comment(self):
+        payload = {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,
+                   "beat": snapshot.iso(at(-1))}
+        forged = self.gh.raw(marker.compose("beat", payload), -1, comment_id=1)
+        forged["user"] = {"login": "mallory", "type": "User"}
+        self.gh.issue_comments = [forged]
+        self.gh.clock_minutes = 0
+        watcher = conductor.Watcher(self.config, self.gh, now=NOW)
+        watcher.records = conductor.coord_comments(self.gh.issue_comments)
+        watcher.issue = 900
+        watcher.state["beatComment"] = 1
+        watcher.beat(False, {})
+        watcher.beat(True, {})
+        self.assertEqual([method for method, _ in self.gh.calls], ["POST", "PATCH"])
+        self.assertEqual(self.gh.calls[1][1], "repos/{repo}/issues/comments/1001")
+        self.assertEqual(len(self.gh.issue_comments), 2)
 
     def test_a_standby_takes_over_when_the_leader_goes_quiet(self):
         leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:c",
