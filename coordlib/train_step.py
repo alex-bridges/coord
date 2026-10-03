@@ -601,8 +601,9 @@ class Step:
         base, members = train.parse_batch(
             self.git.out("log", "--first-parent", f"--max-count={train.BATCH_CAP + 1}",
                          f"--format={train.LOG_FORMAT}", tip), name)
-        if not members:
-            self.note(f"{name}: its tip names the batch but no batch merges were found; leaving it for a person")
+        if not self.valid_batch_chain(base, members, tip):
+            self.note(f"{name}: its commit chain or merge trees do not match the train's build; deleting the batch")
+            self.delete_branch(name)
             return
         numbers = ", ".join(f"#{m['pr']}" for m in members)
         run = self.settle(name, tip, self.batch_run(name, tip))
@@ -760,6 +761,28 @@ class Step:
         verb = "main fast-forwarded to" if self.mode == "live" else "dry run: would have fast-forwarded main to"
         self.note(f"{name} ({numbers}): CI green; {verb} {tip[:9]}")
         self.finish(name, tip, members, prs, run)
+
+    def valid_batch_chain(self, base: Optional[str], members: List[Dict[str, Any]], tip: str) -> bool:
+        """Accept only the exact sequence of merge trees the train would build.
+
+        A train/* ref and its trailers can be pushed by a collaborator. Neither a
+        matching CI run nor matching second parents prove that its tree contains only
+        reviewed PR content.
+        """
+        if base is None or not 0 < len(members) <= train.BATCH_CAP:
+            return False
+        commits = self.git.out("rev-list", "--first-parent", "--reverse", f"{base}..{tip}").splitlines()
+        if len(commits) != len(members):
+            return False
+        parent = base
+        for commit, member in zip(commits, members):
+            if self.git.out("rev-list", "--parents", "-n", "1", commit).split() != [commit, parent, member["sha"]]:
+                return False
+            merged = self.git.run("merge-tree", "--write-tree", "--no-messages", parent, member["sha"], check=False)
+            if merged.returncode != 0 or self.git.out("rev-parse", f"{commit}^{{tree}}") != merged.stdout.split()[0]:
+                return False
+            parent = commit
+        return parent == tip
 
     def build(self, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
         queued = [pr for pr in prs.values() if train.TRAIN_LABEL in pr["labels"]]

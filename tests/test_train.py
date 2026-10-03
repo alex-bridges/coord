@@ -668,6 +668,43 @@ class StepTests(unittest.TestCase):
         for head in (h1, h2):
             subprocess.check_call(["git", "-C", self.origin, "merge-base", "--is-ancestor", head, tip])
 
+    def test_forged_batch_tree_cannot_fast_forward_main(self):
+        h1 = self.pr_branch(1, "c.txt", "reviewed\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        message = sh(self.origin, "log", "-1", "--format=%B", tip)
+        # Keep the train's subject, trailer, base, and reviewed PR parent, but
+        # replace the generated tree with one containing unreviewed content.
+        self.write("unreviewed.txt", "injected\n")
+        sh(self.work, "add", "unreviewed.txt")
+        tree = sh(self.work, "write-tree")
+        forged = sh(self.work, "commit-tree", tree, "-p", self.main, "-p", h1, "-m", message)
+        sh(self.work, "push", "-q", "--force", "origin", f"{forged}:refs/heads/{name}")
+        sh(self.clone, "fetch", "-q", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}")
+        self.run_on(fake, name, forged, conclusion="success")
+
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("commit chain or merge trees" in line for line in lines), lines)
+
+    def test_batch_with_extra_first_parent_commit_cannot_fast_forward_main(self):
+        h1 = self.pr_branch(1, "c.txt", "reviewed\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        message = sh(self.origin, "log", "-1", "--format=%B", tip)
+        sh(self.work, "fetch", "-q", "origin", f"refs/heads/{name}")
+        self.write("unreviewed.txt", "injected\n")
+        sh(self.work, "add", "unreviewed.txt")
+        tree = sh(self.work, "write-tree")
+        forged = sh(self.work, "commit-tree", tree, "-p", tip, "-m", message)
+        sh(self.work, "push", "-q", "--force", "origin", f"{forged}:refs/heads/{name}")
+        sh(self.clone, "fetch", "-q", "origin", f"+refs/heads/{name}:refs/remotes/origin/{name}")
+        self.run_on(fake, name, forged, conclusion="success")
+
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("commit chain or merge trees" in line for line in lines), lines)
+
     def closed_issues(self, fake):
         return [path.rsplit("/", 1)[1] for method, path, body in fake.writes
                 if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
