@@ -9,7 +9,7 @@ Sources, and why each is trustworthy without anyone maintaining it:
   issue is still open and whether its branch exists
 
 A board costs about 5 + (running workflow runs) + (failed check runs at PR heads, and
-one more for each refused one, at most MAX_CHECK_RUN_READS a head) calls; `calls`
+two more for each refused one, at most MAX_CHECK_RUN_READS a head) calls; `calls`
 records it.
 """
 
@@ -110,7 +110,7 @@ REACTION_NAMES = {"+1": "THUMBS_UP", "eyes": "EYES", "-1": "THUMBS_DOWN"}
 
 
 # The most REST reads attach_first_annotations may spend on one commit: annotation
-# reads and attempt listings together. Past it a failed run is left as it is and stays
+# reads, job records, and attempt listings together. Past it a failed run stays
 # red: the cap can hold a PR, never let one through.
 MAX_CHECK_RUN_READS = 10
 
@@ -138,7 +138,8 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
        show only the newest), and the first annotation of each other failed attempt. A
        refused re-run must not hide an earlier real failure (review of #1032). The run
        is marked review.NO_OTHER_ATTEMPT_FAILED only if every such attempt was read and
-       was itself a refusal.
+       was itself a refusal. Each refused attempt must also have an Actions job record
+       proving it never received a runner or steps; annotation text alone is forgeable.
 
     At most MAX_CHECK_RUN_READS reads per commit. Whatever the cap or a missing
     `databaseId` leaves unread stays red.
@@ -157,6 +158,19 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
             return None
         listed = gh.rest(f"repos/{{repo}}/check-runs/{run_id}/annotations?per_page=1") or []
         return {"nodes": [{"message": a.get("message")} for a in listed[:1]]}
+
+    def job_never_started(run_id: Any, name: str) -> bool:
+        """Only an Actions job without a runner or steps can be a billing refusal."""
+        if not spend():
+            return False
+        try:
+            job = gh.rest(f"repos/{{repo}}/actions/jobs/{run_id}")
+        except GitHubError:
+            return False  # third-party checks and unreadable jobs remain red
+        return (isinstance(job, dict) and job.get("id") == run_id
+                and job.get("head_sha") == sha and job.get("name") == name
+                and job.get("status") == "completed" and job.get("conclusion") == "failure"
+                and job.get("runner_id") == 0 and job.get("steps") == [])
 
     def other_attempt_failed(context: Dict[str, Any]) -> bool:
         """False only when every other failed attempt of this check name was read and was a
@@ -179,6 +193,8 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
             attempt["annotations"] = first_annotation(attempt["databaseId"])
             if attempt["annotations"] is None or not review.first_annotation_is_refusal(attempt):
                 return True
+            if not job_never_started(attempt["databaseId"], attempt["name"]):
+                return True
         return False
 
     for context in contexts:
@@ -189,7 +205,7 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
         if annotations is None:
             break  # the cap is spent: this run and every later one stay red
         context["annotations"] = annotations
-        if review.first_annotation_is_refusal(context):
+        if review.first_annotation_is_refusal(context) and job_never_started(run_id, context.get("name") or ""):
             context[review.NO_OTHER_ATTEMPT_FAILED] = not other_attempt_failed(context)
 
 

@@ -19,7 +19,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from coordlib import cli, identity, marker, render, review, snapshot  # noqa: E402
-from coordlib.gh import GitHub, repo_from_remote_url  # noqa: E402
+from coordlib.gh import GitHub, GitHubError, repo_from_remote_url  # noqa: E402
 
 NOW = dt.datetime(2026, 9, 24, 17, 0, tzinfo=dt.timezone.utc)
 BOT = "chatgpt-codex-connector[bot]"
@@ -1069,6 +1069,15 @@ def annotation_path(run_id):
     return f"repos/{{repo}}/check-runs/{run_id}/annotations?per_page=1"
 
 
+def job_path(run_id):
+    return f"repos/{{repo}}/actions/jobs/{run_id}"
+
+
+def unstarted_job(run_id, name):
+    return {"id": run_id, "name": name, "head_sha": "a" * 40,
+            "status": "completed", "conclusion": "failure", "runner_id": 0, "steps": []}
+
+
 def attempts_path(encoded_name, sha="a" * 40):
     return f"repos/{{repo}}/commits/{sha}/check-runs?check_name={encoded_name}&filter=all&per_page=100"
 
@@ -1084,7 +1093,7 @@ class NotRunGraphQLTests(unittest.TestCase):
     class Fake:
         repo, owner, name = "o/r", "o", "r"
 
-        def __init__(self, contexts, annotations, attempts=None):
+        def __init__(self, contexts, annotations, attempts=None, jobs=None):
             node = pr_node()
             node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"] = list(contexts)
             self.nodes = [node]
@@ -1092,6 +1101,9 @@ class NotRunGraphQLTests(unittest.TestCase):
             self.attempts = attempts or {}  # check name -> REST runs, every attempt
             self.latest = {c.get("name"): rest_run(c.get("databaseId"), c.get("name"), (c.get("conclusion") or "").lower())
                            for c in contexts if c.get("__typename") == "CheckRun"}
+            runs = list(self.latest.values()) + [r for group in self.attempts.values() for r in group]
+            self.jobs = {r["id"]: unstarted_job(r["id"], r["name"]) for r in runs}
+            self.jobs.update(jobs or {})
             self.paths = []
 
         def graphql(self, query, variables=None):
@@ -1104,6 +1116,11 @@ class NotRunGraphQLTests(unittest.TestCase):
             if "/annotations" in path:
                 run_id = int(path.split("check-runs/")[1].split("/")[0])
                 return [{"message": m, "annotation_level": "failure"} for m in self.annotations[run_id]]
+            if "/actions/jobs/" in path:
+                job = self.jobs.get(int(path.rsplit("/", 1)[1]))
+                if job is None:
+                    raise GitHubError("job unavailable")
+                return job
             raise AssertionError(path)
 
         def rest_paginated(self, path):
@@ -1142,10 +1159,10 @@ class NotRunGraphQLTests(unittest.TestCase):
         self.assertEqual(ci["failing"], ["Android", "AppGamma", "legacy status"],
                          "another annotation, none, and a commit status stay red")
         self.assertEqual(fake.paths, [
-            annotation_path(10000099), LINUX_ATTEMPTS,
+            annotation_path(10000099), job_path(10000099), LINUX_ATTEMPTS,
             annotation_path(3),
             annotation_path(4),
-            annotation_path(5), WINDOWS_ATTEMPTS,
+            annotation_path(5), job_path(5), WINDOWS_ATTEMPTS,
         ], "only completed, failure-class, non-ignored runs are read; attempts are listed only for a refusal")
 
     def test_a_green_head_costs_no_call(self):
@@ -1168,7 +1185,7 @@ class NotRunGraphQLTests(unittest.TestCase):
                          attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "failure")]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
-        self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS, annotation_path(21)])
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS, annotation_path(21)])
 
     def test_two_refused_attempts_are_not_run(self):
         fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")],
@@ -1176,20 +1193,59 @@ class NotRunGraphQLTests(unittest.TestCase):
                          attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "failure")]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([], [LINUX]))
-        self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS, annotation_path(21)])
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS,
+                                      annotation_path(21), job_path(21)])
 
     def test_a_single_refused_attempt_is_not_run(self):
         fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")], annotations={22: [BILLING_REFUSED]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([], [LINUX]))
-        self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS])
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS])
+
+    def test_spoofed_refusal_from_started_verdict_stays_red(self):
+        started = dict(unstarted_job(22, "CI verdict"), runner_id=23,
+                       steps=[{"name": "run", "conclusion": "failure"}])
+        fake = self.Fake(contexts=[self.run_node(22, "CI verdict", "FAILURE")],
+                         annotations={22: [BILLING_REFUSED]}, jobs={22: started})
+        ci = self.ci(fake)
+        self.assertEqual((ci["verdict"], ci["failing"], ci["not_run"]),
+                         ("failure", ["CI verdict"], []))
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22)])
+        from coordlib import train
+        pr = snapshot.summarize_pr(fake.nodes[0])
+        pr["codex"] = {"approved": True}
+        self.assertEqual(train.assess(pr)[1], train.HOLD_CI_RED)
+
+    def test_missing_or_mismatched_job_record_stays_red(self):
+        good = unstarted_job(22, LINUX)
+        invalid = (None, dict(good, head_sha="b" * 40), dict(good, id=21),
+                   dict(good, steps=[{"name": "ran"}]), dict(good, runner_id=None))
+        for job in invalid:
+            with self.subTest(job=job):
+                fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")],
+                                 annotations={22: [BILLING_REFUSED]}, jobs={22: job})
+                ci = self.ci(fake)
+                self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
+                self.assertEqual(fake.paths, [annotation_path(22), job_path(22)])
+
+    def test_spoofed_refusal_on_earlier_attempt_stays_red(self):
+        started = dict(unstarted_job(21, LINUX), runner_id=23,
+                       steps=[{"name": "run", "conclusion": "failure"}])
+        fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")],
+                         annotations={22: [BILLING_REFUSED], 21: [BILLING_REFUSED]},
+                         attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "failure")]},
+                         jobs={21: started})
+        ci = self.ci(fake)
+        self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS,
+                                      annotation_path(21), job_path(21)])
 
     def test_earlier_attempts_that_passed_or_were_cancelled_are_not_read(self):
         fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")], annotations={22: [BILLING_REFUSED]},
                          attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "success"),
                                            rest_run(20, LINUX, "cancelled")]})
         self.assertEqual(self.ci(fake)["not_run"], [LINUX])
-        self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS])
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS])
 
     def test_an_earlier_failure_with_no_annotation_or_no_id_is_red_unread(self):
         for earlier in (rest_run(21, LINUX, "failure", annotations_count=0), rest_run(None, LINUX, "failure")):
@@ -1197,17 +1253,20 @@ class NotRunGraphQLTests(unittest.TestCase):
                              attempts={LINUX: [rest_run(22, LINUX, "failure"), earlier]})
             ci = self.ci(fake)
             self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
-            self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS])
+            self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS])
 
     def test_the_cap_covers_earlier_attempts_and_what_it_leaves_unread_is_red(self):
-        # 1 read for the run, 1 listing, then 8 earlier refused attempts fit; the 9th does not.
+        # The current annotation, job, and listing take 3 reads; each earlier
+        # refusal takes 2 more. The fourth earlier job cannot fit under the cap.
         earlier = [rest_run(n, LINUX, "failure") for n in range(100, 109)]
         fake = self.Fake(contexts=[self.run_node(22, LINUX, "FAILURE")],
                          annotations={n: [BILLING_REFUSED] for n in [22] + list(range(100, 109))},
                          attempts={LINUX: [rest_run(22, LINUX, "failure")] + earlier})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
-        self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS] + [annotation_path(n) for n in range(100, 108)])
+        self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS]
+                         + [p for n in range(100, 103) for p in (annotation_path(n), job_path(n))]
+                         + [annotation_path(103)])
         self.assertEqual(len(fake.paths), snapshot.MAX_CHECK_RUN_READS)
 
     def test_a_listing_without_the_refused_run_itself_is_broken_and_red(self):
@@ -1218,11 +1277,11 @@ class NotRunGraphQLTests(unittest.TestCase):
                              attempts={LINUX: listing})
             ci = self.ci(fake)
             self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []), listing)
-            self.assertEqual(fake.paths, [annotation_path(22), LINUX_ATTEMPTS])
+            self.assertEqual(fake.paths, [annotation_path(22), job_path(22), LINUX_ATTEMPTS])
 
     def test_a_cap_spent_before_the_listing_leaves_the_refusal_red(self):
-        # 9 real reds and 1 refusal: the refusal's own read is the 10th, so its listing
-        # finds the cap spent and the run must stay red.
+        # 9 real reds and 1 refusal: its annotation is the 10th read, so its job
+        # cannot be checked and the run stays red.
         reds = [self.run_node(n, f"real {n}", "FAILURE") for n in range(1, 10)]
         fake = self.Fake(contexts=reds + [self.run_node(22, LINUX, "FAILURE")],
                          annotations={**{n: [REAL_FAILURE] for n in range(1, 10)}, 22: [BILLING_REFUSED]})
@@ -1239,10 +1298,10 @@ class NotRunGraphQLTests(unittest.TestCase):
                          + [self.run_node(n, f"job {n:02d}", "FAILURE") for n in range(1, count + 1)],
                          annotations={n: [BILLING_REFUSED] for n in range(1, count + 1)})
         ci = self.ci(fake)
-        # Each single-attempt refusal costs two reads (its annotation, its attempts): 5 fit.
+        # Each single-attempt refusal costs three reads (annotation, job, attempts).
         self.assertEqual(len(fake.paths), snapshot.MAX_CHECK_RUN_READS)
-        self.assertEqual(ci["not_run"], [f"job {n:02d}" for n in range(1, 6)])
-        self.assertEqual(ci["failing"], [f"job {n:02d}" for n in range(6, count + 1)] + ["no id"],
+        self.assertEqual(ci["not_run"], [f"job {n:02d}" for n in range(1, 4)])
+        self.assertEqual(ci["failing"], [f"job {n:02d}" for n in range(4, count + 1)] + ["no id"],
                          "what was not read is held as red")
 
 
@@ -1250,18 +1309,27 @@ class NotRunRestTests(unittest.TestCase):
     """The same NOT RUN rule on the REST fallback, through the same helper."""
 
     class Fake(RestFallbackTests.Fake):
-        def __init__(self, runs, annotations, attempts=None):
+        def __init__(self, runs, annotations, attempts=None, jobs=None):
             super().__init__(AssertionError("GraphQL must not be tried"))
             self.runs = runs
             self.annotations = annotations  # run id -> messages
             self.attempts = attempts or {}  # check name -> REST runs, every attempt
             self.latest = {r["name"]: r for r in runs}
+            all_runs = list(runs) + [r for group in self.attempts.values() for r in group]
+            self.jobs = {r["id"]: unstarted_job(r["id"], r["name"]) for r in all_runs}
+            self.jobs.update(jobs or {})
 
         def rest(self, path, method="GET", body=None):
             if "/annotations" in path:
                 self.paths.append(path)
                 run_id = int(path.split("check-runs/")[1].split("/")[0])
                 return [{"message": m, "annotation_level": "failure"} for m in self.annotations[run_id]]
+            if "/actions/jobs/" in path:
+                self.paths.append(path)
+                job = self.jobs.get(int(path.rsplit("/", 1)[1]))
+                if job is None:
+                    raise GitHubError("job unavailable")
+                return job
             return super().rest(path, method, body)
 
         def rest_paginated(self, path):
@@ -1278,8 +1346,8 @@ class NotRunRestTests(unittest.TestCase):
         return snapshot.summarize_pr(nodes[0])["ci"]
 
     def extra_reads(self, fake):
-        """What attach_first_annotations spent: annotation reads and attempt listings, in order."""
-        return [p for p in fake.paths if "/annotations" in p or "check_name=" in p]
+        """What attach_first_annotations spent: annotation, job and attempt reads."""
+        return [p for p in fake.paths if "/annotations" in p or "/actions/jobs/" in p or "check_name=" in p]
 
     def test_the_three_cases_and_reads_only_failure_class_runs(self):
         fake = self.Fake(
@@ -1288,7 +1356,7 @@ class NotRunRestTests(unittest.TestCase):
                 rest_run(2, LINUX, "failure"),
                 rest_run(3, "Android", "failure"),
                 rest_run(4, "AppGamma", "failure", annotations_count=0),        # nothing to read
-                rest_run(5, WINDOWS, "timed_out"),
+                rest_run(5, WINDOWS, "failure"),
                 rest_run(6, "Docs", "cancelled"),
                 rest_run(7, "Select lanes", "skipped"),
                 rest_run(8, "LegacyCI | AppBeta · Test (PR + main) | Test - iOS", "action_required"),  # ignored
@@ -1302,9 +1370,9 @@ class NotRunRestTests(unittest.TestCase):
         self.assertEqual(ci["failing"], ["Android", "AppGamma"], "another annotation, and none, stay red")
         self.assertEqual(ci["pending"], ["CoreKit debug gate"])
         self.assertEqual(self.extra_reads(fake), [
-            annotation_path(2), LINUX_ATTEMPTS,
+            annotation_path(2), job_path(2), LINUX_ATTEMPTS,
             annotation_path(3),
-            annotation_path(5), WINDOWS_ATTEMPTS,
+            annotation_path(5), job_path(5), WINDOWS_ATTEMPTS,
         ], "only failure-class, non-ignored runs with an annotation are read; attempts only for a refusal")
 
     def test_a_failure_whose_annotation_list_comes_back_empty_stays_failing(self):
@@ -1324,7 +1392,8 @@ class NotRunRestTests(unittest.TestCase):
                          attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "failure")]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([LINUX], []))
-        self.assertEqual(self.extra_reads(fake), [annotation_path(22), LINUX_ATTEMPTS, annotation_path(21)])
+        self.assertEqual(self.extra_reads(fake), [annotation_path(22), job_path(22), LINUX_ATTEMPTS,
+                                                  annotation_path(21)])
 
     def test_two_refused_attempts_are_not_run(self):
         fake = self.Fake(runs=[rest_run(22, LINUX, "failure")],
@@ -1332,13 +1401,14 @@ class NotRunRestTests(unittest.TestCase):
                          attempts={LINUX: [rest_run(22, LINUX, "failure"), rest_run(21, LINUX, "failure")]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([], [LINUX]))
-        self.assertEqual(self.extra_reads(fake), [annotation_path(22), LINUX_ATTEMPTS, annotation_path(21)])
+        self.assertEqual(self.extra_reads(fake), [annotation_path(22), job_path(22), LINUX_ATTEMPTS,
+                                                  annotation_path(21), job_path(21)])
 
     def test_a_single_refused_attempt_is_not_run(self):
         fake = self.Fake(runs=[rest_run(22, LINUX, "failure")], annotations={22: [BILLING_REFUSED]})
         ci = self.ci(fake)
         self.assertEqual((ci["failing"], ci["not_run"]), ([], [LINUX]))
-        self.assertEqual(self.extra_reads(fake), [annotation_path(22), LINUX_ATTEMPTS])
+        self.assertEqual(self.extra_reads(fake), [annotation_path(22), job_path(22), LINUX_ATTEMPTS])
 
     def test_reads_are_capped_and_an_unread_failure_stays_red(self):
         count = 12
@@ -1346,8 +1416,8 @@ class NotRunRestTests(unittest.TestCase):
         fake = self.Fake(runs=runs, annotations={n: [BILLING_REFUSED] for n in range(1, count + 1)})
         ci = self.ci(fake)
         self.assertEqual(len(self.extra_reads(fake)), snapshot.MAX_CHECK_RUN_READS)
-        self.assertEqual(ci["not_run"], [f"job {n:02d}" for n in range(1, 6)])
-        self.assertEqual(ci["failing"], [f"job {n:02d}" for n in range(6, count + 1)],
+        self.assertEqual(ci["not_run"], [f"job {n:02d}" for n in range(1, 4)])
+        self.assertEqual(ci["failing"], [f"job {n:02d}" for n in range(4, count + 1)],
                          "a run the cap left unread is held as red, never waved through")
 
     def test_the_graphql_path_completes_a_truncated_rollup_with_annotations_too(self):
@@ -1358,7 +1428,7 @@ class NotRunRestTests(unittest.TestCase):
         snapshot.complete_pr_node(fake, node)
         ci = snapshot.summarize_pr(node)["ci"]
         self.assertEqual((ci["failing"], ci["not_run"]), (["Android"], [LINUX]))
-        self.assertEqual(self.extra_reads(fake), [annotation_path(2), LINUX_ATTEMPTS, annotation_path(3)])
+        self.assertEqual(self.extra_reads(fake), [annotation_path(2), job_path(2), LINUX_ATTEMPTS, annotation_path(3)])
 
 
 class OverlapAndTrainTests(unittest.TestCase):

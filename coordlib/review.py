@@ -161,9 +161,9 @@ def first_annotation_is_refusal(context: Dict[str, Any]) -> bool:
     return isinstance(message, str) and message.startswith(NOT_RUN_PREFIX)
 
 
-# Set on a refused run by snapshot.attach_first_annotations, and only there, once it
-# has read every other attempt of the same check name at the commit and found none
-# that failed for real.
+# Set on a refused run by snapshot.attach_first_annotations, and only there, once
+# the Actions job record proves this run never received a runner or steps and every
+# other attempt of the same check name was read without a real failure.
 NO_OTHER_ATTEMPT_FAILED = "noOtherAttemptFailed"
 
 
@@ -173,7 +173,7 @@ def never_started(context: Dict[str, Any]) -> bool:
     The rollup and REST's default `filter=latest` show only the newest attempt of a
     check. A real failure on attempt 1 followed by a re-run the budget refused would
     otherwise read as not run, and the red would vanish (review of #1032). So a refusal
-    counts only when the snapshot has also cleared the other attempts
+    counts only when the snapshot has confirmed the job never started and cleared the other attempts
     (NO_OTHER_ATTEMPT_FAILED is True). Fails closed: without that, the run stays red.
     """
     return first_annotation_is_refusal(context) and context.get(NO_OTHER_ATTEMPT_FAILED) is True
@@ -235,4 +235,3 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     # A name that also failed for real is red, never "not run".
     return {"verdict": verdict, "failing": sorted(set(failing)), "pending": sorted(set(pending)),
             "started": sorted(set(started)), "not_run": sorted(set(not_run) - set(failing))}
-
