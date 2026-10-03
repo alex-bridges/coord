@@ -101,6 +101,20 @@ class ProtocolTests(unittest.TestCase):
         beat = {"v": 1, "kind": "conductor", "agent": "a", "event": "beat", "beat": "now", "seenThrough": None}
         self.assertEqual(marker.decode(marker.encode(beat)), beat)
 
+    def test_legacy_claude_footer_preserves_published_v1_records(self):
+        footer = "\n\n---\n🤖 Generated with [Claude Code](https://claude.ai/code)"
+        for payload in (
+            {"v": 1, "kind": "claim", "agent": "claude@host:worktree", "issue": 12},
+            {"v": 1, "kind": "train-add", "agent": "claude@host:worktree",
+             "pr": 15, "head": "a" * 40},
+        ):
+            with self.subTest(kind=payload["kind"]):
+                body = marker.compose("original comment", payload) + footer
+                self.assertEqual(marker.decode(body), payload)
+                self.assertEqual(marker.strip(body), "original comment")
+                self.assertIsNone(marker.decode("> " + marker.encode(payload) + footer))
+                self.assertIsNone(marker.decode(body + "\nadditional text"))
+
     def comments(self, payloads):
         class Fake:
             def rest_paginated(self, path):
