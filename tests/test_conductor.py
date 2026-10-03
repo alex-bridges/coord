@@ -21,6 +21,7 @@ from coordlib import cli, conductor, lease, marker, outage, render, snapshot, tr
 # Friday 2026-09-25 21:00Z = 17:00 in New York (EDT, UTC-4).
 NOW = dt.datetime(2026, 9, 25, 21, 0, tzinfo=dt.timezone.utc)
 UTC = dt.timezone.utc
+REPO = "o/r"
 
 
 def at(minutes: float) -> dt.datetime:
@@ -29,7 +30,7 @@ def at(minutes: float) -> dt.datetime:
 
 def record(comment_id: int, minutes: float, payload, text: str = ""):
     return {"id": comment_id, "createdAt": snapshot.iso(at(minutes)), "url": f"u/{comment_id}", "text": text,
-            "payload": payload}
+            "payload": payload, "author": {"login": "o", "type": "User"}}
 
 
 class WeeklyResetTests(unittest.TestCase):
@@ -135,36 +136,53 @@ class LeaseTests(unittest.TestCase):
                                          "host": agent.split("@")[1].split(":")[0], "beat": snapshot.iso(at(beat_minutes))})
 
     def test_the_oldest_live_heartbeat_leads(self):
-        hosts = lease.hosts([self.beat(2, "conductor@B:c", -1), self.beat(1, "conductor@A:c", -3)], NOW)
+        hosts = lease.hosts([self.beat(2, "conductor@B:c", -1), self.beat(1, "conductor@A:c", -3)], NOW, REPO)
         self.assertEqual([(h["agent"], h["leader"]) for h in hosts], [("conductor@A:c", True), ("conductor@B:c", False)])
 
     def test_a_stale_leader_hands_over(self):
-        hosts = lease.hosts([self.beat(1, "conductor@A:c", -20), self.beat(2, "conductor@B:c", -1)], NOW)
+        hosts = lease.hosts([self.beat(1, "conductor@A:c", -20), self.beat(2, "conductor@B:c", -1)], NOW, REPO)
         self.assertEqual([h["leader"] for h in hosts], [False, True])
+
+    def test_untrusted_or_future_heartbeats_cannot_lead_or_import_review_runs(self):
+        forged = self.beat(1, "conductor@Forged:c", -1)
+        forged["author"] = {"login": "mallory", "type": "User"}
+        future = self.beat(2, "conductor@Future:c", 60 * 24 * 365)
+        future["payload"]["reviewRuns"] = [snapshot.iso(at(60 * 24 * 365))]
+        trusted = self.beat(3, "conductor@Real:c", -1)
+        trusted["payload"]["reviewRuns"] = [snapshot.iso(at(-5)), snapshot.iso(at(60 * 24 * 365))]
+        hosts = lease.hosts([forged, future, trusted], NOW, REPO)
+        self.assertEqual([h["agent"] for h in hosts], ["conductor@Future:c", "conductor@Real:c"])
+        self.assertEqual([h["leader"] for h in hosts], [False, True])
+        self.assertEqual([h["reviewRuns"] for h in hosts], [[], [snapshot.iso(at(-5))]])
 
     def test_a_malformed_beat_is_not_alive(self):
         bad = record(1, 0, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "beat": "now"})
-        self.assertEqual(lease.hosts([bad], NOW)[0]["alive"], False)
+        self.assertEqual(lease.hosts([bad], NOW, REPO)[0]["alive"], False)
 
     def test_a_reviewer_backlog_rides_the_beat(self):
         beat = record(1, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "host": "A",
                                 "beat": snapshot.iso(at(-1)), "reviewer": {"waiting": 3, "appAvailable": False}})
-        self.assertEqual(lease.hosts([beat], NOW)[0]["reviewer"], {"waiting": 3, "appAvailable": False})
+        self.assertEqual(lease.hosts([beat], NOW, REPO)[0]["reviewer"], {"waiting": 3, "appAvailable": False})
 
     def test_no_backlog_or_a_malformed_one_shows_nothing(self):
         empty = record(1, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "host": "A",
                                  "beat": snapshot.iso(at(-1)), "reviewer": {"waiting": 0, "appAvailable": True}})
-        self.assertIsNone(lease.hosts([empty], NOW)[0]["reviewer"])
+        self.assertIsNone(lease.hosts([empty], NOW, REPO)[0]["reviewer"])
         odd = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@B:c", "host": "B",
                                "beat": snapshot.iso(at(-1)), "reviewer": "off"})
-        self.assertIsNone(lease.hosts([odd], NOW)[0]["reviewer"])
+        self.assertIsNone(lease.hosts([odd], NOW, REPO)[0]["reviewer"])
 
     def test_pause_and_resume(self):
         pause = record(5, -10, {"kind": "conductor", "event": "pause", "agent": "claude@E:x",
                                 "until": snapshot.iso(at(60)), "note": "driving it myself"})
-        self.assertEqual(lease.pause([pause], NOW)["note"], "driving it myself")
-        self.assertIsNone(lease.pause([pause], at(61)))
-        self.assertIsNone(lease.pause([pause, record(6, -5, {"kind": "conductor", "event": "resume"})], NOW))
+        self.assertEqual(lease.pause([pause], NOW, REPO)["note"], "driving it myself")
+        self.assertIsNone(lease.pause([pause], at(61), REPO))
+        self.assertIsNone(lease.pause([pause, record(6, -5, {"kind": "conductor", "event": "resume"})], NOW, REPO))
+
+    def test_untrusted_pause_does_not_stop_the_watcher(self):
+        forged = record(1, -1, {"kind": "conductor", "event": "pause", "until": snapshot.iso(at(60 * 24 * 365))})
+        forged["author"] = {"login": "mallory", "type": "User"}
+        self.assertIsNone(lease.pause([forged], NOW, REPO))
 
 
 class ReasonTests(unittest.TestCase):
@@ -282,8 +300,10 @@ class FakeGitHub:
         if comment_id is None:
             self.next_id += 1
             comment_id = self.next_id
+        payload = marker.decode(body) or {}
+        author = {"login": "o", "type": "User"} if payload.get("kind") == "conductor" else {"login": "alex-bridges"}
         return {"id": comment_id, "created_at": snapshot.iso(at(minutes)), "html_url": f"c/{comment_id}", "body": body,
-                "issue_url": "https://api/repos/o/r/issues/900", "user": {"login": "alex-bridges"}}
+                "issue_url": "https://api/repos/o/r/issues/900", "user": author}
 
     def post(self, number, text, payload, minutes):
         comment = self.raw(marker.compose(text, payload), minutes)
@@ -449,6 +469,20 @@ class WatcherTests(unittest.TestCase):
         self.assertFalse(any("issues/comments?since" in path for _, path in self.gh.calls), "no inbox read")
         self.assertIn("standby", self.gh.issue_comments[-1]["body"])
 
+    def test_state_loss_reuses_only_its_own_heartbeat_comment(self):
+        payload = {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,
+                   "beat": snapshot.iso(at(-1))}
+        forged = self.gh.raw(marker.compose("beat", payload), -2, comment_id=1)
+        forged["user"] = {"login": "mallory", "type": "User"}
+        own = self.gh.raw(marker.compose("beat", payload), -1, comment_id=2)
+        self.gh.issue_comments = [forged, own]
+        watcher = conductor.Watcher(self.config, self.gh, now=NOW)
+        watcher.records = conductor.coord_comments(self.gh.issue_comments)
+        watcher.issue = 900
+        watcher.beat(False, {})
+        self.assertIn(("PATCH", "repos/{repo}/issues/comments/2"), self.gh.calls)
+        self.assertNotIn(("PATCH", "repos/{repo}/issues/comments/1"), self.gh.calls)
+
     def test_a_standby_takes_over_when_the_leader_goes_quiet(self):
         leader = self.gh.raw(marker.compose("beat", {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:c",
                                                      "leader": True, "beat": snapshot.iso(at(-30)),
@@ -579,7 +613,7 @@ class BoardTests(unittest.TestCase):
         snap = {"repo": "o/r", "main": {"sha": "m" * 40}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [],
                 "overlaps": [], "runs": {"running": [], "queued": []}, "train": [],
                 "outages": [outage.serialize(w) for w in windows],
-                "conductor": {"hosts": lease.hosts([beat], NOW), "pause": None, "escalations": []}}
+                "conductor": {"hosts": lease.hosts([beat], NOW, REPO), "pause": None, "escalations": []}}
         text = render.board(snap, "codex@E:x", 0)
         self.assertIn("OUTAGE  claude agents are down until", text)
         self.assertIn("conductor@Tycho:conductor (leader) · beat 2m ago · disk 27 GB free · last wake 30m ago: answered #12",
@@ -601,7 +635,7 @@ class BoardTests(unittest.TestCase):
                                 "reviewer": {"waiting": 19, "appAvailable": False}})
         snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
                 "runs": {"running": [], "queued": []}, "train": [], "outages": [],
-                "conductor": {"hosts": lease.hosts([beat], NOW), "pause": None, "escalations": []}}
+                "conductor": {"hosts": lease.hosts([beat], NOW, REPO), "pause": None, "escalations": []}}
         text = render.board(snap, "codex@E:x", 0)
         self.assertIn("reviewer off (app not available on Tycho), 19 waiting", text)
 
@@ -611,7 +645,7 @@ class BoardTests(unittest.TestCase):
                                 "reviewer": {"waiting": 1, "appAvailable": True}})
         snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
                 "runs": {"running": [], "queued": []}, "train": [], "outages": [],
-                "conductor": {"hosts": lease.hosts([beat], NOW), "pause": None, "escalations": []}}
+                "conductor": {"hosts": lease.hosts([beat], NOW, REPO), "pause": None, "escalations": []}}
         self.assertIn("reviewer on, 1 waiting", render.board(snap, "codex@E:x", 0))
 
 
@@ -637,8 +671,8 @@ class ReviewRegressionTests(unittest.TestCase):
         snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
                 "runs": {"running": [], "queued": []}, "train": [],
                 "outages": [outage.serialize(w) for w in outage.windows(comments)],
-                "conductor": {"hosts": lease.hosts(comments, NOW), "pause": lease.pause(comments, NOW),
-                              "escalations": lease.escalations(comments, NOW)}}
+                "conductor": {"hosts": lease.hosts(comments, NOW, REPO), "pause": lease.pause(comments, NOW, REPO),
+                              "escalations": lease.escalations(comments, NOW, REPO)}}
         text = render.board(json.loads(json.dumps(snap)), "me", 0)
         self.assertIn("PAUSED", text)
         self.assertIn("OUTAGE", text)

@@ -948,9 +948,10 @@ class CodexRound6Tests(ReviewFlowTests):
         from coordlib import lease
         runs = [snapshot.iso(at(-60 * n)) for n in range(10)] + [snapshot.iso(at(-60 * 30))]
         beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
+                "author": {"login": "o", "type": "User"},
                 "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:conductor",
                             "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": runs}}
-        hosts = lease.hosts([beat], at(0))
+        hosts = lease.hosts([beat], at(0), "o/r")
         watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
                                     disk=lambda path: 100.0, git=self.git)
         watcher.state = {}
@@ -959,6 +960,15 @@ class CodexRound6Tests(ReviewFlowTests):
         jobs = reviewer.Reviews(watcher, self.app)
         self.assertEqual(jobs.runs_today(at(0)), 10, "each once; the 30-hour-old run is past the window")
         self.assertIn("the cap", jobs.may_run())
+
+    def test_future_runs_left_in_local_state_do_not_block_reviews(self):
+        watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
+                                    disk=lambda path: 100.0, git=self.git)
+        future = snapshot.iso(at(60 * 24 * 365))
+        watcher.state = {"reviewRuns": [future] * 8 + [snapshot.iso(at(-5))]}
+        jobs = reviewer.Reviews(watcher, self.app)
+        self.assertEqual(jobs.runs_today(at(0)), 1)
+        self.assertEqual(watcher.state["reviewRuns"], [snapshot.iso(at(-5))])
 
     def test_h4_nothing_but_the_allowlist_reaches_the_run(self):
         env = reviewer.isolated_env({"PATH": "/bin", "HOME": "/h", "ANTHROPIC_API_KEY": "sk-ant-x",
@@ -1369,12 +1379,13 @@ class CodexRound11Tests(ReviewFlowTests):
     def test_m2_a_restarted_host_counts_its_own_mid_run_beat(self):
         from coordlib import lease
         beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
+                "author": {"login": "o", "type": "User"},
                 "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,
                             "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": [snapshot.iso(at(-5))]}}
         watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
                                     disk=lambda path: 100.0, git=self.git)
         watcher.state = {}
-        watcher.adopt_review_runs(lease.hosts([beat], at(0)))
+        watcher.adopt_review_runs(lease.hosts([beat], at(0), "o/r"))
         self.assertEqual(watcher.state["reviewRuns"], [snapshot.iso(at(-5))])
 
 

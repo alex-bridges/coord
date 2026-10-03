@@ -582,7 +582,7 @@ class Watcher:
 
     def role(self) -> Tuple[bool, List[Dict[str, Any]]]:
         """(am I the leader, every host), counting my own beat as fresh: I am alive now."""
-        hosts = lease.hosts(self.records, self.now)
+        hosts = lease.hosts(self.records, self.now, self.gh.repo)
         mine = next((h for h in hosts if h["agent"] == self.config.agent), None)
         if mine is None:
             return not any(h["alive"] for h in hosts), hosts
@@ -607,9 +607,8 @@ class Watcher:
         with self.lock:
             comment_id = self.state.get("beatComment")
             if not isinstance(comment_id, int):
-                comment_id = next((c["id"] for c in self.records if c["payload"].get("kind") == "conductor"
-                                   and c["payload"].get("event") == "beat"
-                                   and c["payload"].get("agent") == self.config.agent), None)
+                comment_id = next((h["commentId"] for h in lease.hosts(self.records, self.now, self.gh.repo)
+                                   if h["agent"] == self.config.agent), None)
             if isinstance(comment_id, int):
                 try:
                     self.gh.rest(f"repos/{{repo}}/issues/comments/{comment_id}", method="PATCH", body=body)
@@ -761,7 +760,7 @@ class Watcher:
         if github_ok and exhausted:
             self.escalate(exhausted)
         down = outage.down(windows, self.config.agent, self.now)
-        pause = lease.pause(self.records, self.now) if github_ok else None
+        pause = lease.pause(self.records, self.now, self.gh.repo) if github_ok else None
         # A standby wakes only for its own machine; GitHub duties are the leader's.
         wakeable = [r for r in todo if r["wake"] and (leader or r["kind"] == "disk-low")]
         wakes_today = len(self.state.get("wakes") or [])

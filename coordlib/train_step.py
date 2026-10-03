@@ -54,7 +54,7 @@ WAKE_JOB = "Wake the merge train"
 FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
 # A comment that asks Codex for a review: the mention at the start of a line, as people
 # and the train write it (a sentence quoting it mid-line is not a request).
-_CODEX_REQUEST = re.compile(r"(?m)^\s*@codex\s+review\b", re.IGNORECASE)
+_CODEX_REQUEST = re.compile(r"(?m)^[ \t]*@codex[ \t]+review\b", re.IGNORECASE)
 
 
 class GitError(RuntimeError):

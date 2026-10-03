@@ -47,6 +47,14 @@ ATTESTERS = ((ALEX, True),
 FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
 
 
+class CodexRequestTests(unittest.TestCase):
+    def test_request_starts_on_its_own_line_without_crossing_blank_lines(self):
+        pattern = train_step._CODEX_REQUEST
+        self.assertIsNone(pattern.search("\n" * 65536))
+        self.assertIsNone(pattern.search("\n  \n@codex\nreview"))
+        self.assertIsNotNone(pattern.search("a comment\n  @codex review please"))
+
+
 def compose_record(text, payload):
     return marker.compose(text, dict({"v": 1, "agent": "codex@test:train"}, **payload))
 

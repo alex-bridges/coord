@@ -857,26 +857,47 @@ def describe_overlap(files: List[str], other: List[str], files_label: str = "", 
     which contains: A.swift`, so a new file is not read as one the other work touches.
     Without `files_label` (`coord claim`, where `files` are the claimant's own), a
     directory of the claimant's is shown as the other side's paths `(inside Tests/X/)`.
+    Bound the detail to what the board/claim command can display: nested directory
+    claims must not multiply the snapshot's size by repeating every child path.
     """
-    same, dirs = set(), {}  # dirs: (declaring side, directory) -> paths inside it
-    for f in files:
-        f = f.rstrip("/")
-        for g in other:
-            g = g.rstrip("/")
+    same, dirs = set(), {}  # dirs: (declaring side, directory) -> [count, up to three paths]
+    other_paths = {p.rstrip("/") for p in other}
+    for f in {p.rstrip("/") for p in files}:
+        for g in other_paths:
             if f == g:
                 same.add(f)
+                continue
             elif f.startswith(g + "/"):
-                dirs.setdefault(("other", g), set()).add(f)
+                key, child = ("other", g), f
             elif g.startswith(f + "/"):
-                dirs.setdefault(("files", f), set()).add(g)
-    out = sorted(same)
-    for (side, directory), inside in sorted(dirs.items(), key=lambda item: item[0][1]):
+                key, child = ("files", f), g
+            else:
+                continue
+            count, sample = dirs.setdefault(key, [0, set()])
+            dirs[key][0] = count + 1
+            if len(sample) < 3:
+                sample.add(child)
+            elif child < max(sample):
+                sample.remove(max(sample))
+                sample.add(child)
+    limit = 5  # coord claim displays five; the board displays only three
+    out = sorted(same)[:limit]
+    omitted = max(0, len(same) - limit)
+    for (side, directory), (count, inside) in sorted(dirs.items(), key=lambda item: (item[0][1], item[0][0])):
+        if len(out) == limit:
+            omitted += 1
+            continue
         label = (other_label if side == "other" else files_label).split(" (")[0]  # "claim #7 (agent)" -> "claim #7"
         if side == "files" and not files_label:
-            out.append(f"{', '.join(sorted(inside))} (inside {directory}/)")
+            names = ", ".join(sorted(inside))
+            more = f", +{count - len(inside)} more" if count > len(inside) else ""
+            out.append(f"{names}{more} (inside {directory}/)")
             continue
         names = ", ".join(sorted(p[len(directory) + 1:] for p in inside))
-        out.append(f"{directory}/ (directory{', ' + label if label else ''}), which contains: {names}")
+        more = f", +{count - len(inside)} more" if count > len(inside) else ""
+        out.append(f"{directory}/ (directory{', ' + label if label else ''}), which contains: {names}{more}")
+    if omitted:
+        out.append(f"+{omitted} more overlap locations")
     return out
 
 
@@ -1065,8 +1086,8 @@ def build(gh: GitHub, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
         "messages": messages,
         # Outage windows of the last CLAIM_WINDOW_DAYS; `active` ones are what the board shows.
         "outages": [outage.serialize(w) for w in outage_windows],
-        "conductor": {"hosts": lease.hosts(comments, now), "pause": lease.pause(comments, now),
-                      "escalations": lease.escalations(comments, now)},
+        "conductor": {"hosts": lease.hosts(comments, now, gh.repo), "pause": lease.pause(comments, now, gh.repo),
+                      "escalations": lease.escalations(comments, now, gh.repo)},
         "staleClaims": [c for c in resolved if c["mergedPr"] is not None],
         "claimComments": [c for c in comments if c["payload"].get("kind") in ("claim", "release")],
         "apiCalls": gh.calls,
