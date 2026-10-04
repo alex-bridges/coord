@@ -438,6 +438,16 @@ class ReviewFixTests(ReviewFlowTests):
         self.app.fail_posts = 1
         self.tick(5)
         self.assertEqual((len(self.reviews()), self.app.markers("review")), (1, []))
+        clean = self.user.posts[0]
+        self.assertIn("## Review by inisa-sidechain: PASS", clean)
+        self.assertIn("looks careful", clean)
+        self.assertIn("No findings.", clean)
+        self.assertEqual((marker.decode(clean) or {}).get("kind"), "review-clean")
+        prs = [{"number": 7}]
+        snapshot.attach_head_records(prs, [{"payload": marker.decode(clean), "on": 7,
+                                           "author": {"login": "o", "type": "User"}}], "o/r")
+        self.assertEqual(prs[0]["reviewedHead"], HEAD,
+                         "the train may count the review only because its full text is already public")
         self.tick(10)
         self.assertEqual(len(self.reviews()), 1, "no second run")
         self.assertEqual(len(self.app.markers("review")), 1)

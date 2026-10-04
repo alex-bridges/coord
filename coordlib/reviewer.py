@@ -321,9 +321,9 @@ def answered(comments: List[Dict[str, Any]], repo: str) -> set:
     ids = set()
     for comment in comments:
         payload = marker.decode(comment.get("body")) or {}
-        # A pass's review-clean record names its request too: posted before the review, it is
-        # the one durable trace if a leader died between the two (Codex on #1049). Not a
-        # withdrawal (head ""), which follows its blocking review.
+        # A pass's review-clean record names its request too: it contains the full rendered
+        # review before the app mirror is posted, so it is the durable trace if a leader dies
+        # between the two. A withdrawal (head "") follows its blocking review instead.
         if ours(comment, payload, repo) and payload.get("request") is not None \
                 and (payload.get("kind") == "review" or payload.get("head")):
             ids.add(payload["request"])
@@ -863,9 +863,10 @@ class Reviews:
 
     def publish(self, request: Dict[str, Any], record: Dict[str, Any], posting: Dict[str, Any], key: str) -> None:
         """Post a finished review. For a pass that counts: the `review-clean` record (on
-        Alex's identity: the train counts no bot's), the `reviewed` label, then the review
-        (so a posted review means every step before it happened, which a new leader's rescan
-        relies on). For a blocking verdict: the review first (its marker holds the head),
+        Alex's identity: the train counts no bot's) contains the complete rendered review;
+        the `reviewed` label and app mirror follow it. The train can therefore count the
+        record even if posting the app mirror fails. For a blocking verdict: the review first
+        (its marker holds the head),
         then the withdrawal of a recorded clean review of that head. Each step is remembered,
         so a retry repeats none that succeeded; once one has, the decision is frozen
         (`started`)."""
@@ -878,9 +879,9 @@ class Reviews:
                 self.w.say(f"review of #{request['pr']} waits to record its clean review: Alex's API budget is low")
                 return
             self.attest(request, head, f"**Clean review** of head `{head[:9]}` by `{self.agent()}` "
-                                       f"({request['model']}), recorded by coord's reviewer: the review follows, "
-                                       f"requested in {request.get('url') or 'a comment'}.\n\n"
-                                       "It counts as the review of this head only; a new push needs a new review.",
+                                       f"({request['model']}), requested in {request.get('url') or 'a comment'}. "
+                                       "It counts as the review of this head only; a new push needs a new review.\n\n"
+                                       + posting["body"],
                         {"head": head, "model": request["model"]})
             posting.update(recorded=True, started=True)
         if posting["counts"] and not posting.get("labelled"):
