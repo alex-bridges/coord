@@ -1362,6 +1362,15 @@ class NotRunRestTests(unittest.TestCase):
 
 
 class OverlapAndTrainTests(unittest.TestCase):
+    def test_nested_directory_overlap_has_bounded_description(self):
+        dirs = ["a/" + "/".join(["d"] * depth) for depth in range(1, 176)]
+        files = [dirs[-1] + f"/file-{n:03}.swift" for n in range(160)]
+        described = snapshot.describe_overlap(dirs, files, "claim #1", "claim #2")
+        self.assertLess(len("; ".join(described)), 20_000)
+        self.assertLessEqual(len(described), 6)
+        self.assertIn("+157 more", described[0])
+        self.assertIn("more overlap locations", described[-1])
+
     def test_directory_claim_overlaps_file(self):
         pr = snapshot.summarize_pr(pr_node())
         claims = [{"issue": 9, "agent": "a", "pr": None, "files": ["Packages/CoreKit/Sources/"]}]

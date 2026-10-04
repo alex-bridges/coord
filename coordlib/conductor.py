@@ -566,8 +566,6 @@ class Watcher:
             self.issue = state_issue
         else:
             self.issue = conductor_issue(self.gh, create=create)
-            if self.issue != state_issue:
-                self.state.pop("beatComment", None)
         if self.issue is None:
             return
         since = iso(self.now - dt.timedelta(days=snapshot.CLAIM_WINDOW_DAYS))
@@ -582,7 +580,7 @@ class Watcher:
 
     def role(self) -> Tuple[bool, List[Dict[str, Any]]]:
         """(am I the leader, every host), counting my own beat as fresh: I am alive now."""
-        hosts = lease.hosts(self.records, self.now)
+        hosts = lease.hosts(self.records, self.now, self.gh.repo)
         mine = next((h for h in hosts if h["agent"] == self.config.agent), None)
         if mine is None:
             return not any(h["alive"] for h in hosts), hosts
@@ -605,21 +603,20 @@ class Watcher:
                 + (f"\n\nLast wake {wake.get('at')}: {wake.get('summary')}" if wake.get("at") else ""))
         body = {"body": marker.compose(text, payload)}
         with self.lock:
-            comment_id = self.state.get("beatComment")
-            if not isinstance(comment_id, int):
-                comment_id = next((c["id"] for c in self.records if c["payload"].get("kind") == "conductor"
-                                   and c["payload"].get("event") == "beat"
-                                   and c["payload"].get("agent") == self.config.agent), None)
+            # Select from authenticated records, not a locally persisted comment ID.
+            own = next((h for h in lease.hosts(self.records, self.now, self.gh.repo)
+                        if h["agent"] == self.config.agent), None)
+            comment_id = own["commentId"] if own else None
             if isinstance(comment_id, int):
                 try:
                     self.gh.rest(f"repos/{{repo}}/issues/comments/{comment_id}", method="PATCH", body=body)
-                    self.state["beatComment"] = comment_id
                     return
                 except GitHubError as error:
                     if "404" not in str(error):
                         raise
+                    self.records = [c for c in self.records if c["id"] != comment_id]
             posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
-            self.state["beatComment"] = posted.get("id")
+            self.records.extend(coord_comments([posted]))  # another beat this tick reuses the new comment
 
     def adopt_review_runs(self, hosts: List[Dict[str, Any]]) -> None:
         """Every host's review runs of the last 24 h (from its heartbeat) count toward this
@@ -761,7 +758,7 @@ class Watcher:
         if github_ok and exhausted:
             self.escalate(exhausted)
         down = outage.down(windows, self.config.agent, self.now)
-        pause = lease.pause(self.records, self.now) if github_ok else None
+        pause = lease.pause(self.records, self.now, self.gh.repo) if github_ok else None
         # A standby wakes only for its own machine; GitHub duties are the leader's.
         wakeable = [r for r in todo if r["wake"] and (leader or r["kind"] == "disk-low")]
         wakes_today = len(self.state.get("wakes") or [])

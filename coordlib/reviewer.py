@@ -533,7 +533,8 @@ class Reviews:
             self.done_heads.pop(key)
 
     def runs_today(self, now: dt.datetime) -> int:
-        self.runs[:] = [r for r in self.runs if (_time(r) and now - _time(r) < dt.timedelta(days=1))]
+        self.runs[:] = [r for r in self.runs if (run := _time(r)) is not None
+                        and dt.timedelta(0) <= now - run < dt.timedelta(days=1)]
         return len(self.runs)
 
     def step(self, issue_comments: List[Dict[str, Any]], windows: List[Dict[str, Any]], blocked: str,

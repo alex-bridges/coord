@@ -67,19 +67,27 @@ def _reviewer(value: Any) -> Optional[Dict[str, Any]]:
     return {"waiting": waiting, "appAvailable": value.get("appAvailable") is True}
 
 
-def _records(comments: Iterable[Dict[str, Any]], event: str) -> List[Dict[str, Any]]:
-    return sorted((c for c in comments if (c.get("payload") or {}).get("kind") == "conductor"
+def _owner_records(comments: Iterable[Dict[str, Any]], repo: str) -> List[Dict[str, Any]]:
+    """Conductor controls are owner-authored; a marker's agent field is self-declared."""
+    owner = repo.split("/", 1)[0].lower()
+    return [c for c in comments if (c.get("author") or {}).get("type") == "User"
+            and str((c.get("author") or {}).get("login") or "").lower() == owner]
+
+
+def _records(comments: Iterable[Dict[str, Any]], event: str, repo: str) -> List[Dict[str, Any]]:
+    return sorted((c for c in _owner_records(comments, repo) if (c.get("payload") or {}).get("kind") == "conductor"
                    and c["payload"].get("event") == event), key=lambda c: c.get("id") or 0)
 
 
-def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelta = LEASE_TTL) -> List[Dict[str, Any]]:
+def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, repo: str,
+          ttl: dt.timedelta = LEASE_TTL) -> List[Dict[str, Any]]:
     """Every host's heartbeat, oldest comment first, with `alive` and `leader`.
 
-    A host with several heartbeat comments (a lost state file) counts by its oldest.
+    A host with several trusted heartbeat comments (a lost state file) counts by its oldest.
     """
     comments = list(comments)
     seen: Dict[str, Dict[str, Any]] = {}
-    for comment in _records(comments, "beat"):
+    for comment in _records(comments, "beat", repo):
         agent = str(comment["payload"].get("agent") or "")
         if agent and agent not in seen:
             seen[agent] = comment
@@ -88,7 +96,7 @@ def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelt
     for agent, comment in seen.items():
         payload = comment["payload"]
         beat = _time(payload.get("beat"))
-        alive = beat is not None and now - beat <= ttl
+        alive = beat is not None and dt.timedelta(0) <= now - beat <= ttl
         leader = alive and not leader_found
         leader_found = leader_found or leader
         out.append({
@@ -98,16 +106,18 @@ def hosts(comments: Iterable[Dict[str, Any]], now: dt.datetime, ttl: dt.timedelt
             "lastWake": _wake(payload.get("lastWake")), "pending": _number(payload.get("pending")),
             "disk": _number(payload.get("disk")), "wasLeader": payload.get("leader") is True,
             # Review runs of the last 24 h, so the daily cap follows the lead (reviewer.py).
-            "reviewRuns": [r for r in (payload.get("reviewRuns") or []) if isinstance(r, str) and _time(r)][:100],
+            "reviewRuns": [r for r in (payload.get("reviewRuns") or []) if isinstance(r, str)
+                           and (run := _time(r)) is not None
+                           and dt.timedelta(0) <= now - run < dt.timedelta(days=1)][:100],
             "reviewer": _reviewer(payload.get("reviewer")),
         })
     return out
 
 
-def pause(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> Optional[Dict[str, Any]]:
+def pause(comments: Iterable[Dict[str, Any]], now: dt.datetime, repo: str) -> Optional[Dict[str, Any]]:
     """The pause in force, if any: the newest pause/resume record decides."""
     latest = None
-    for comment in sorted((c for c in comments if (c.get("payload") or {}).get("kind") == "conductor"
+    for comment in sorted((c for c in _owner_records(comments, repo) if (c.get("payload") or {}).get("kind") == "conductor"
                            and c["payload"].get("event") in ("pause", "resume")), key=lambda c: c.get("id") or 0):
         latest = comment
     if latest is None or latest["payload"].get("event") != "pause":
@@ -119,9 +129,9 @@ def pause(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> Optional[Dict
             "note": _text(latest["payload"].get("note")), "url": _text(latest.get("url"))}
 
 
-def escalations(comments: Iterable[Dict[str, Any]], now: dt.datetime) -> List[Dict[str, Any]]:
+def escalations(comments: Iterable[Dict[str, Any]], now: dt.datetime, repo: str) -> List[Dict[str, Any]]:
     out = []
-    for comment in _records(comments, "escalate"):
+    for comment in _records(comments, "escalate", repo):
         posted = _time(comment.get("createdAt"))
         if posted is not None and now - posted <= ESCALATION_WINDOW:
             out.append({"at": comment.get("createdAt"), "agent": _text(comment["payload"].get("agent")),
