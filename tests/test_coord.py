@@ -984,6 +984,38 @@ class RestFallbackTests(unittest.TestCase):
         self.assertEqual((pr["mergeable"], pr["fromFork"], pr["labels"], pr["closes"]),
                          ("CONFLICTING", False, ["train"], [55, 56]))
 
+    def test_a_null_pullrequests_page_node_falls_back_to_rest_without_blocking_graphql(self):
+        # Codex on #1218: a null entry in the top-level `pullRequests` page carries no
+        # number to complete over REST, and GitHub sends no `errors` entry with it (the
+        # same silent gap as the null reaction fixed elsewhere in complete_pr_node), so
+        # dropping it would read as that PR no longer being open.
+        class NullPageFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [None]}}}
+
+        fake = NullPageFake()
+        main, nodes = snapshot.fetch_prs(fake)
+        self.assertEqual(main["sha"], "m" * 40, "the REST fallback's main, not the null GraphQL page")
+        self.assertEqual([n["number"] for n in nodes], [7], "the REST fixture's PR, read whole")
+        self.assertFalse(getattr(fake, "graphql_blocked", False),
+                         "a null page node is a one-off gap, not a lasting proxy block like a 403")
+
+    def test_fetch_prs_graphql_itself_raises_for_a_null_page_node(self):
+        from coordlib.gh import NullPageNode
+
+        class NullPageFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [None]}}}
+
+        with self.assertRaises(NullPageNode):
+            snapshot.fetch_prs_graphql(NullPageFake())
+
     def test_other_graphql_errors_are_not_swallowed(self):
         from coordlib.gh import GitHubError
         fake = self.Fake(GitHubError("HTTP 502 POST https://api.github.com/graphql: bad gateway"))
@@ -1059,6 +1091,10 @@ class CodexRoundSevenTests(unittest.TestCase):
         self.assertTrue(pr["codex"]["approved"], "the null reactions were re-read over REST")
         self.assertEqual(pr["ci"]["failing"], ["Android"], "the null check was re-read over REST")
         self.assertEqual(pr["incomplete"], [])
+        node = pr_node(closingIssuesReferences={"totalCount": 2, "nodes": [None, {"number": 55}]})
+        snapshot.complete_pr_node(self.Fake(), node)
+        self.assertEqual(snapshot.summarize_pr(node)["closes"], [55],
+                         "the null closingIssuesReferences entry was dropped, not read as a crash")
         for threads in ({"nodes": [None]},
                         {"nodes": [{"isResolved": False, "comments": {"nodes": [None, {"author": {"login": BOT}}]}}]}):
             node = pr_node(reviewThreads=threads)

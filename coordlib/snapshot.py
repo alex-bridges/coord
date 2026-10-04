@@ -23,7 +23,7 @@ import urllib.parse
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from . import lease, marker, outage, review, train
-from .gh import AppAuthError, GitHub, GitHubError, NotFound
+from .gh import AppAuthError, GitHub, GitHubError, NotFound, NullPageNode
 
 CLAIM_WINDOW_DAYS = 14
 STALE_HOURS = 48
@@ -249,7 +249,7 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     # the connection shorter than its totalCount, so the completions below re-read that
     # list over REST. Where a null cannot be re-read or its position matters (the head
     # commit, a review thread or its starter), the PR is held on partial data instead.
-    for key in ("files", "labels", "comments", "reactions"):
+    for key in ("files", "labels", "comments", "reactions", "closingIssuesReferences"):
         _drop_nulls(node.get(key))
     commit_nodes = ((node.get("commits") or {}).get("nodes")) or []
     if commit_nodes and not isinstance(commit_nodes[-1], dict):
@@ -325,6 +325,12 @@ def fetch_prs_graphql(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]
         branch = repo.get("defaultBranchRef") or {}
         main = {"name": branch.get("name", "main"), "sha": (branch.get("target") or {}).get("oid", "")}
         page = repo["pullRequests"]
+        if any(n is None for n in page["nodes"]):
+            # No `errors` entry accompanies this (the same class of gap as the null
+            # reaction on #1218); the node carries no number to complete over REST, and
+            # dropping it would read as that PR no longer being open. Give up on GraphQL
+            # for this fetch and let the REST fallback read the page directly.
+            raise NullPageNode("pullRequests page held a null node with no GraphQL error")
         nodes.extend(page["nodes"])
         if not page["pageInfo"]["hasNextPage"]:
             break
@@ -485,6 +491,8 @@ def with_rest_fallback(gh: GitHub, graphql_call: Callable[[], Any], rest_call: C
         return graphql_call()
     except AppAuthError:
         raise  # no app token: not a proxy's GraphQL refusal
+    except NullPageNode:
+        return rest_call()  # a null page entry has no id to complete; re-read it over REST
     except GitHubError as error:
         message = str(error)
         if "403" in message and "graphql" in message.lower():
