@@ -133,7 +133,8 @@ class FakeApp:
             if getattr(self, "echo_posts", False):  # one app shared by two hosts: each reads the other's posts
                 return list(self.pr_comments) + [
                     {"id": number, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"}, "body": body,
-                     "html_url": f"https://github.com/o/r/pull/7#issuecomment-{number}"}
+                     "html_url": f"https://github.com/o/r/pull/7#issuecomment-{number}",
+                     "created_at": getattr(self, "claim_posted_at", snapshot.iso(at(0)))}
                     for number, body in self.comments]
             return list(self.pr_comments)
         if path.startswith("repos/{repo}/issues/") and "/comments" in path:
@@ -180,6 +181,7 @@ class ReviewFlowTests(unittest.TestCase):
         self.gh = FakeGitHub()
         self.config = make_config(os.path.join(self.tmp.name, "state"))
         self.app = FakeApp()
+        self.app.echo_posts = True  # normal API reads observe claims just posted
         self.user = FakeUser()
         self.runs, self.replies, self.git_calls = [], [], []
         self.snap = mock.patch.object(cli, "get_snapshot", return_value={"prs": [], "claims": [], "train": []})
@@ -591,7 +593,7 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertIn("not shown", body)
         self.assertEqual(payload["counts"]["P3"], 300)
 
-    def test_c7_a_run_that_dirties_the_checkout_is_undone(self):
+    def test_c7_a_dirty_checkout_is_reported_without_discarding_edits(self):
         states = iter([(0, ""), (0, " M README.md\n")])
         calls = []
 
@@ -605,8 +607,9 @@ class CodexRoundTests(ReviewFlowTests):
         self.ask(1)
         self.replies = [review_reply()]
         lines = self.tick(5)
-        self.assertIn(["reset", "-q", "--hard"], calls)
-        self.assertTrue(any("restored it" in line for line in lines))
+        self.assertNotIn(["reset", "-q", "--hard"], calls)
+        self.assertNotIn(["clean", "-fdq"], calls)
+        self.assertTrue(any("became dirty" in line for line in lines))
 
     def test_c7_a_checkout_dirty_before_the_run_is_left_alone(self):
         calls = []
@@ -1051,6 +1054,14 @@ class CrossHostClaimTests(ReviewFlowTests):
             host.review_step([], None, None, True, {})
         self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(35 + 45 + 15))])
 
+    def test_review_waits_when_posted_claim_is_not_visible_on_verification_read(self):
+        self.app.echo_posts = False
+        request = reviewer.requests([self.ask(1)])[0]
+        host = self.host("Tycho", request, 5)
+        host.review_step([], None, None, True, {})
+        self.assertEqual(self.reviews(), [])
+        self.assertEqual(host.state["reviews"][str(request["id"])]["status"], "pending")
+
     def host(self, name, request, minutes):
         config = make_config(os.path.join(self.tmp.name, name), agent=f"conductor@{name}:conductor")
         os.makedirs(config.state_dir, exist_ok=True)
@@ -1288,6 +1299,7 @@ class CrossHostClaimTests(ReviewFlowTests):
 
     def test_an_expired_claim_frees_the_review(self):
         self.app.echo_posts = True
+        self.app.claim_posted_at = snapshot.iso(at(5))
         self.app.pr_comments.append(self.other_claim(4))  # its host died mid-run
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [review_reply()]
@@ -1603,7 +1615,7 @@ class CodexRound17Tests(ReviewFlowTests):
         self.tick(5)
         self.assertRegex(self.reviews()[0]["env"]["COORD_REVIEW_RUN"], r"^[0-9a-f]{16}$")
 
-    def test_s2_a_blocking_review_over_a_moved_base_holds_nothing(self):
+    def test_s2_a_blocking_review_over_a_moved_base_still_holds_the_head(self):
         self.app.pr["base"] = {"ref": "claude/parent", "sha": "b" * 40}
         runner = self.runner
 
@@ -1616,9 +1628,9 @@ class CodexRound17Tests(ReviewFlowTests):
         self.replies = [review_reply([{"severity": "P1", "summary": "bug"}])]
         self.tick(5)
         review = self.app.markers("review")[0]
-        self.assertEqual(review["verdict"], "stale")
+        self.assertEqual(review["verdict"], "changes")
         comment = {"user": {"login": reviewer.APP_LOGIN}}
-        self.assertIsNone(snapshot.sidechain_blocks(comment, review), "a stale verdict holds nothing")
+        self.assertEqual(snapshot.sidechain_blocks(comment, review), HEAD)
         self.assertIn("base moved", self.app.posts[-1])
 
     def test_s3_no_run_unless_the_checkout_is_detached_at_origin_main(self):

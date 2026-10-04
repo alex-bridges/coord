@@ -410,7 +410,10 @@ def valid_plan(plan: Any, batch: Optional[str] = None) -> bool:
     for member in members:
         if not isinstance(member, dict) or type(member.get("pr")) is not int or member["pr"] <= 0 \
                 or not isinstance(member.get("head"), str) or not re.fullmatch(r"[0-9a-f]{40}", member["head"]) \
-                or (member.get("queuedAt") is not None and not isinstance(member["queuedAt"], str)):
+                or (member.get("queuedAt") is not None and not isinstance(member["queuedAt"], str)) \
+                or ("closes" in member and (not isinstance(member["closes"], list)
+                    or len(member["closes"]) > 100
+                    or any(type(number) is not int or number <= 0 for number in member["closes"]))):
             return False
     selected = lanes.get("lanes")
     if lanes.get("class") not in (LIGHT, HEAVY) \

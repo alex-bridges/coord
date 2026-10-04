@@ -16,7 +16,8 @@ from coordlib.gh import GitHub
 MAILBOX = 1001
 PLAIN = 1070
 # This machine's cached board: a message sent without --on, so it was posted on the mailbox.
-BOARD = {"messages": [{"on": MAILBOX, "payload": {"kind": "msg", "v": 1, "agent": "claude@x:y",
+BOARD = {"messages": [{"on": MAILBOX, "author": {"login": "o", "type": "User"},
+                       "payload": {"kind": "msg", "v": 1, "agent": "claude@x:y",
                                                   "to": ["conductor@*"]}}]}
 
 
@@ -76,7 +77,7 @@ class MailboxLearnedByInboxTests(unittest.TestCase):
         self.mailbox_comment = {
             "id": 77, "created_at": now, "html_url": "https://example.invalid/m",
             "issue_url": f"https://api.github.com/repos/o/r/issues/{MAILBOX}",
-            "user": {"login": "alex-bridges"},
+            "user": {"login": "o", "type": "User"},
             "body": "**From** `claude@x:y` **to** `conductor@*`\n\nhello\n\n"
                     + marker.encode({"kind": "msg", "v": 1, "agent": "claude@x:y", "to": ["conductor@*"]}),
         }
@@ -116,6 +117,14 @@ class MailboxLearnedByInboxTests(unittest.TestCase):
         comment = dict(self.mailbox_comment, issue_url=f"https://api.github.com/repos/o/r/issues/{PLAIN}",
                        body="reply\n\n" + marker.encode({"kind": "msg", "v": 1, "agent": "claude@x:y",
                                                             "to": ["conductor@*"], "on": PLAIN}))
+        self.run_cli(["inbox"], [comment])
+        code, calls, _ = self.run_cli(["send", "hi", "--on", str(PLAIN)])
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual([m for m, _ in calls], ["POST"])
+
+    def test_forged_mailbox_marker_on_real_issue_is_not_remembered(self):
+        comment = dict(self.mailbox_comment, issue_url=f"https://api.github.com/repos/o/r/issues/{PLAIN}",
+                       user={"login": "outsider", "type": "User"})
         self.run_cli(["inbox"], [comment])
         code, calls, _ = self.run_cli(["send", "hi", "--on", str(PLAIN)])
         self.assertEqual(code, EXIT_OK)

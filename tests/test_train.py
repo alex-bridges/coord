@@ -625,9 +625,12 @@ class StepTests(unittest.TestCase):
         self.assertEqual(sh(self.origin, "show", f"{name}:a.txt"), "ONE\nline 2\nTHREE",
                          "both edits to one file, merged without a checkout")
 
-    def build_batch(self, fake_nodes_heads):
+    def build_batch(self, fake_nodes_heads, closing_refs=None):
         """Build a batch with the step itself, return (fake, name, tip)."""
         nodes = [ready_node(n, h, f"pr{n}") for n, h in fake_nodes_heads]
+        for node in nodes:
+            if closing_refs and node["number"] in closing_refs:
+                node["closingIssuesReferences"] = {"nodes": closing_refs[node["number"]]}
         fake = FakeGitHub(nodes, self.main)
         for index, (number, head) in enumerate(fake_nodes_heads):
             self.queue(fake, number, head, 50 - index)
@@ -819,7 +822,7 @@ class StepTests(unittest.TestCase):
         self.step(fake, mode="dry-run").run()
         self.assertEqual(self.closed_issues(fake), [])
 
-    def test_a_later_step_finishing_the_batch_reads_the_merged_prs_body(self):
+    def test_a_later_step_uses_frozen_closing_refs_after_pr_body_changes(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
@@ -828,20 +831,20 @@ class StepTests(unittest.TestCase):
         sh(self.origin, "update-ref", "refs/heads/main", tip)
         fake.nodes = []  # merged: no longer an open PR
         fake.pull_bodies = {1: "Fixes the thing.\n\nCloses #56"}
-        fake.issue_states = {56: "open"}
+        fake.issue_states = {55: "open", 56: "open"}
         fake.writes.clear()
         self.step(fake).run()
-        self.assertEqual(self.closed_issues(fake), ["56"])
+        self.assertEqual(self.closed_issues(fake), ["55"])
 
     def test_closing_is_best_effort_and_never_touches_prs_or_other_repositories(self):
         # Substitute review of #1050: a permanent error must not stall the train; a PR number
         # or another repository's issue must never be closed.
         h1 = self.pr_branch(1, "c.txt", "c\n")
-        fake, name, tip = self.build_batch([(1, h1)])
-        fake.nodes[0]["closingIssuesReferences"] = {"nodes": [
+        refs = [
             {"number": 55}, {"number": 56}, {"number": 57},
             {"number": 58, "repository": {"nameWithOwner": "someone/else"}},
-            {"number": 59, "repository": {"nameWithOwner": "O/R"}}]}
+            {"number": 59, "repository": {"nameWithOwner": "O/R"}}]
+        fake, name, tip = self.build_batch([(1, h1)], {1: refs})
         fake.issue_states = {55: "missing", 56: "open-pr", 57: "open", 58: "open", 59: "open"}
         self.run_on(fake, name, tip, conclusion="success")
         lines = self.step(fake).run()
@@ -1435,7 +1438,7 @@ class StepTests(unittest.TestCase):
     def test_the_actions_train_repeats_a_hand_runs_notice_at_most_once(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
         self.add(fake, 1, self.H1, 30)
-        fake.login = "alex-bridges"
+        fake.login = "o"
         self.step(fake, agent=self.HAND).run()
         self.step(fake, agent=self.HAND).run()
         self.assertEqual(fake.posted("held"), [1], "a hand run counts its own notice")
@@ -1450,7 +1453,7 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.login = "alex-bridges"
+        fake.login = "o"
         self.step(fake, mode="dry-run", agent=self.HAND).run()
         self.step(fake, mode="dry-run", agent=self.HAND).run()  # the batch branch is still there
         self.assertEqual(fake.posted("green-dry-run"), [1])
@@ -1655,6 +1658,14 @@ class StepTests(unittest.TestCase):
             self.step(fake).train_added(pr)
             self.assertEqual(pr["overtakenBy"], expected)
 
+    def test_manual_notice_does_not_accept_an_outsider_own_record(self):
+        gh = type("GH", (), {"repo": "example-owner/example-repo"})()
+        step = train_step.Step(gh, None, "dry-run", agent="claude@host:manual", log=lambda _: None)
+        payload = {"kind": "train", "agent": step.agent}
+        self.assertFalse(step.own_record({"user": {"login": "outsider", "type": "User"}}, payload))
+        self.assertTrue(step.own_record({"user": {"login": "alex-bridges", "type": "User"}}, payload))
+        self.assertTrue(step.own_record({"user": {"login": snapshot.SIDECHAIN_LOGIN, "type": "Bot"}}, payload))
+
     def test_only_the_trains_own_overtake_record_counts(self):
         # Every agent posts as alex-bridges and can write any marker (own_record, #1037): a
         # forged record must not give heavy its turn early, and the train's own must hold.
@@ -1785,7 +1796,9 @@ class StepTests(unittest.TestCase):
         fake, name, tip = self.build_batch([(1, h1)])
         plan = train.read_plan(sh(self.origin, "log", "-1", "--format=%B", tip), name)
         self.assertEqual(plan["base"], self.main)
-        self.assertEqual(plan["members"], [{"pr": 1, "head": h1, "queuedAt": snapshot.iso(NOW - dt.timedelta(minutes=50))}])
+        self.assertEqual(plan["members"], [{"pr": 1, "head": h1,
+                                             "queuedAt": snapshot.iso(NOW - dt.timedelta(minutes=50)),
+                                             "closes": [55]}])
         self.assertEqual((plan["lanePlan"]["class"], plan["lanePlan"]["lanes"]), (train.LIGHT, ["docs"]))
         self.run_on(fake, name, tip, conclusion="success", run_attempt=2)
         self.step(fake).run()

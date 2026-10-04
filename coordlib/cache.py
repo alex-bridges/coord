@@ -98,7 +98,9 @@ def mailboxes_path(repo: str) -> str:
 def load_mailboxes(repo: str) -> List[int]:
     """Mailbox issue numbers an `inbox` read or a `send` on this machine has seen (#1070)."""
     data = _read(mailboxes_path(repo))
-    numbers = (data or {}).get("numbers") if isinstance(data, dict) else None
+    # Version 1 cached unauthenticated comment markers indefinitely. Discard it
+    # so a forged marker seen before the author check cannot poison future sends.
+    numbers = data.get("numbers") if isinstance(data, dict) and data.get("version") == 2 else None
     return [n for n in numbers if isinstance(n, int)] if isinstance(numbers, list) else []
 
 
@@ -108,7 +110,7 @@ def remember_mailboxes(repo: str, numbers: List[int]) -> None:
     known = set(load_mailboxes(repo))
     new = {n for n in numbers if isinstance(n, int)} - known
     if new:
-        _write(mailboxes_path(repo), {"numbers": sorted(known | new)})
+        _write(mailboxes_path(repo), {"version": 2, "numbers": sorted(known | new)})
 
 
 def budget_path(repo: str) -> str:

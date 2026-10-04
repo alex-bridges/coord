@@ -492,13 +492,15 @@ def known_mailboxes(repo: str) -> set:
     cached, which `inbox` then read directly (Codex on #1098). No call (`send` must stay
     cheap and always run), so a cold cache knows none."""
     cached = cache.load_snapshot(repo, float("inf"))
-    return mailbox_numbers((cached or {}).get("messages") or []) | set(cache.load_mailboxes(repo))
+    return mailbox_numbers((cached or {}).get("messages") or [], repo) | set(cache.load_mailboxes(repo))
 
 
-def mailbox_numbers(messages: List[Dict[str, Any]]) -> set:
-    """Issues carrying a message record without `on`: `send` put it on the mailbox."""
+def mailbox_numbers(messages: List[Dict[str, Any]], repo: str) -> set:
+    """Trusted mailbox posts only; a marker's shape cannot authenticate its author."""
     return {m.get("on") for m in messages if isinstance(m.get("on"), int)
-            and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})}
+            and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})
+            and (snapshot.trusted_attestation(m.get("author"), repo)
+                 or (m.get("author") or {}).get("login") == snapshot.SIDECHAIN_LOGIN)}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:
@@ -652,8 +654,8 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
             print("  " + text.replace("\n", "\n  "))
             print(f"  {item['url']}")
     cache.remember_mailboxes(gh.repo, sorted(mailbox_numbers(
-        [{"on": _number_from_url(c.get("issue_url", "")), "payload": marker.decode(c.get("body"))}
-         for c in issue_comments])))
+        [{"on": _number_from_url(c.get("issue_url", "")), "payload": marker.decode(c.get("body")),
+          "author": snapshot.comment_author(c)} for c in issue_comments], gh.repo)))
     if not args.peek and not args.all and not args.since:
         window = started - CURSOR_OVERLAP
         # Earlier ids matter only while the earlier read's window overlaps the new one.

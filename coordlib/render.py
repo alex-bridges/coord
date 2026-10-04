@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from typing import Any, Dict, List, Optional
 
 from . import outage, review, train
@@ -34,6 +35,17 @@ def stale_words(snapshot: Dict[str, Any]) -> str:
 def _clip(text: str, width: int) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _brief_identity(value: Any, *, agent: bool = False) -> str:
+    """Only fixed-shape identifiers may enter Claude's automatic startup context.
+
+    Claims come from GitHub comments, not from a trusted local process. A full
+    board read can show unusual values, but the SessionStart brief must never
+    turn a multiline comment field into another apparent instruction.
+    """
+    pattern = r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)?" if agent else r"[A-Za-z0-9._/-]+"
+    return value if isinstance(value, str) and len(value) <= 160 and re.fullmatch(pattern, value) else "(invalid)"
 
 
 def _count(n: int, noun: str) -> str:
@@ -267,9 +279,10 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     lines.extend(outage_line(window, now) for window in active_outages(snapshot, now))
     for pr in snapshot["prs"][:limit]:
         owner = claim_owner(snapshot, pr)
-        who = f" [{owner['agent']}]" if owner else ""
-        lines.append(f"  PR #{pr['number']} {pr['branch']}{who}: {ci_words(pr['ci'])}, {codex_words(pr)}")
+        who = f" [{_brief_identity(owner['agent'], agent=True)}]" if owner else ""
+        lines.append(f"  PR #{pr['number']} {_brief_identity(pr['branch'])}{who}: {ci_words(pr['ci'])}, {codex_words(pr)}")
     for claim in open_claims[: max(0, limit - len(snapshot["prs"]))]:
-        lines.append(f"  claim #{claim['issue']} {claim['branch']} [{claim['agent']}]" + (" stale" if claim["stale"] else ""))
+        lines.append(f"  claim #{claim['issue']} {_brief_identity(claim['branch'])} "
+                     f"[{_brief_identity(claim['agent'], agent=True)}]" + (" stale" if claim["stale"] else ""))
     lines.append("  details: Tools/coord/coord board · messages: Tools/coord/coord inbox")
     return "\n".join(lines) + "\n"

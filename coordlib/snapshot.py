@@ -43,7 +43,7 @@ commits(last: 1) { nodes { commit {
   checkSuites(first: 20) { totalCount nodes { createdAt } }
   statusCheckRollup { state contexts(first: 100) { totalCount nodes {
     __typename
-    ... on CheckRun { databaseId name status conclusion }
+    ... on CheckRun { id databaseId name status conclusion }
     ... on StatusContext { context state }
   } } }
 } } }
@@ -141,8 +141,10 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
        was itself a refusal. Each refused attempt must also have an Actions job record
        proving it never received a runner or steps; annotation text alone is forgeable.
 
-    At most MAX_CHECK_RUN_READS reads per commit. Whatever the cap or a missing
-    `databaseId` leaves unread stays red.
+    At most MAX_CHECK_RUN_READS reads per commit. GraphQL `databaseId` is a
+    32-bit Int and can be null for current 64-bit Actions IDs; resolve those
+    through the REST run's matching node ID before reading annotations.
+    Whatever the cap or an unresolved ID leaves unread stays red.
     """
     budget = [MAX_CHECK_RUN_READS]
 
@@ -151,6 +153,16 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
             return False
         budget[0] -= 1
         return True
+
+    missing = [c for c in contexts if c.get("__typename") == "CheckRun"
+               and c.get("databaseId") is None and c.get("id")]
+    if missing and spend():
+        ids = {c["id"]: c for c in missing}
+        for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?filter=latest&per_page=100"):
+            for run in page.get("check_runs", []):
+                context = ids.get(run.get("node_id"))
+                if context is not None:
+                    context["databaseId"] = run.get("id")
 
     def first_annotation(run_id: Any) -> Optional[Dict[str, Any]]:
         """The run's `annotations` connection, or None when the cap is spent."""
@@ -214,10 +226,16 @@ def rest_contexts(gh: GitHub, sha: str) -> List[Dict[str, Any]]:
     rollup's node shape."""
     runs = [r for page in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/check-runs?per_page=100")
             for r in page.get("check_runs", [])]
-    statuses = (gh.rest(f"repos/{{repo}}/commits/{sha}/status") or {}).get("statuses", [])
+    # The list endpoint is paginated and newest first. Keep the newest state for
+    # each context; an older red attempt must not override its green replacement.
+    latest_statuses: Dict[str, Dict[str, Any]] = {}
+    for status in gh.rest_paginated(f"repos/{{repo}}/commits/{sha}/statuses?per_page=100"):
+        context = status.get("context")
+        if context is not None:
+            latest_statuses.setdefault(context, status)
     return ([rest_run_node(r) for r in runs]
-            + [{"__typename": "StatusContext", "context": c.get("context"), "state": _upper(c.get("state"))}
-               for c in statuses])
+            + [{"__typename": "StatusContext", "context": c["context"], "state": _upper(c.get("state"))}
+               for c in latest_statuses.values()])
 
 
 def rest_codex_summary(gh: GitHub, number: int) -> List[Dict[str, Any]]:

@@ -359,6 +359,8 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
                      f"This does not count for the train: {blocked_by}.")
     if outcome == "stale":
         lines.append(f"These findings do not hold the head: {blocked_by}.")
+    elif outcome == "changes" and blocked_by:
+        lines.append(f"The finding still holds this head because {blocked_by}; re-review the changed diff.")
     lines.append("")
     if result.get("summary"):
         lines += [result["summary"], ""]
@@ -736,8 +738,10 @@ class Reviews:
         if owner is not None and owner["agent"] != self.agent():
             self.w.say(f"review of #{request['pr']} waits: {owner['agent']} holds its claim {owner['url']}")
             return False
-        if owner is not None:
-            record.update(claimUntil=snapshot.iso(owner["until"]), claimHead=head)
+        if owner is None:
+            self.w.say(f"review of #{request['pr']} waits: no live claim owner is visible yet")
+            return False
+        record.update(claimUntil=snapshot.iso(owner["until"]), claimHead=head)
         return True
 
     def hold_claims(self) -> None:
@@ -748,6 +752,13 @@ class Reviews:
         would run and bill the review again, with its own attempt count. Called at the start
         and end of every review_step, for every such record, not only the one handled."""
         for record in list(self.state.values()):
+            if isinstance(record, dict) and not record.get("claimHead"):
+                # The persisted pre-claimHead format still has the exact head
+                # on an unfinished review. Renew its lease during an upgrade.
+                previous = record.get("posting") or record.get("finished") or {}
+                head = previous.get("head") if isinstance(previous, dict) else None
+                if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}", head):
+                    record["claimHead"] = head
             if isinstance(record, dict) and record.get("claimHead") \
                     and (record.get("status") == "pending" or record.get("unsent")):
                 self.keep_claim(record)
@@ -842,16 +853,16 @@ class Reviews:
         head, found, outcome, run = finished["head"], finished["found"], finished["verdict"], finished["run"]
         comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
         blocked_by = blocked_head(comments, request["pr"], head) if outcome == "pass" else None
-        # The diff reviewed was head against this base. If the PR's base moved or it was
-        # retargeted since, either verdict is about another diff: a pass is advice, and a
-        # `changes` is posted as `stale`, which holds nothing (Codex on #1049).
+        # A pass on an obsolete diff cannot approve the current base. A blocking
+        # finding still holds this head: otherwise retargeting the PR during a
+        # review could suppress the finding without changing the head.
         current = self.app.rest(f"repos/{{repo}}/pulls/{request['pr']}") or {}
         if finished.get("base") and base_of(current) != finished["base"]:
             moved = f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
             if outcome == "pass":
                 blocked_by = blocked_by or moved
             else:
-                outcome, blocked_by = "stale", moved
+                blocked_by = moved
         counts = outcome == "pass" and not blocked_by
         # A blocking review of a head whose clean review is recorded withdraws that record;
         # the blocking marker holds the head in the train either way (Codex on #1049).
@@ -919,16 +930,13 @@ class Reviews:
                 body={"body": marker.compose(text, payload)})
 
     def restore_checkout(self, was_clean: bool) -> None:
-        """Undo whatever a review run left in the conductor's checkout. The guard confines its
-        edits, but not every shell redirect; a dirty checkout would stop update_checkout
-        (Codex on #1049). A checkout that was dirty before the run is someone's, left alone."""
+        """Report unexpected checkout edits without discarding concurrent human work."""
         if not was_clean:
             return
         code, dirty = self.w.git(["status", "--porcelain"])
         if code == 0 and dirty.strip():
-            self.w.git(["reset", "-q", "--hard"])
-            self.w.git(["clean", "-fdq"])
-            self.w.say(f"a review run changed the conductor's checkout; restored it ({_clip(dirty, 160)})")
+            self.w.say(f"the conductor checkout became dirty during a review; inspect it before updating "
+                       f"({_clip(dirty, 160)})")
 
     def agent(self) -> str:
         return f"reviewer@{self.config.host}:review"
