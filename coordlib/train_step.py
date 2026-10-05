@@ -938,7 +938,13 @@ class Step:
                      env=self.app_push_env() if workflow_batch else None)
         if workflow_batch:
             self.note(f"{name}: it changes .github/workflows/; pushed with the inisa-sidechain app token")
-        self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+        try:
+            self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+        except GitHubError as error:
+            if not workflow_batch:
+                raise
+            self.refuse_gateless_batch(name, main, member_heads, prs, error)
+            return
         numbers = ", ".join(f"#{n}" for n in merged)
         for number in merged:
             self.comment(number, (
@@ -946,6 +952,31 @@ class Step:
                 f"({'live' if self.mode == 'live' else 'dry run'})."
             ), "testing", batch=name, tip=tip, members=merged)
         self.note(f"{name}: built {numbers} on main {main[:9]} -> {tip[:9]}; dispatched ci.yml lanes={train.CI_LANES}")
+
+
+    def refuse_gateless_batch(self, name: str, main: str, member_heads: List[Dict[str, Any]],
+                              prs: Dict[int, Dict[str, Any]], error: GitHubError) -> None:
+        """A workflow batch whose ci.yml GitHub would not dispatch: the batch deleted,
+        renamed or broke the gate it is meant to be tested by (Codex P1 on #1311). Left at
+        the front, the batch would block every PR behind it. The branch goes; when GitHub
+        refused the workflow itself (404 or 422, not a passing outage) the PRs that change
+        workflow files leave the train for a hand merge, and the rest wait for the next batch."""
+        self.note(f"{name}: ci.yml could not be dispatched on the batch ({error}); deleting it")
+        self.record_outcome("abandoned", f"Merge train: `{name}` has no dispatchable ci.yml; deleting the batch.")
+        self.delete_branch(name)
+        if not re.search(r"\b(404|422)\b", str(error)):
+            return  # possibly transient: the next step rebuilds and tries again
+        for member in member_heads:
+            number, head = member["pr"], member["head"]
+            base = self.git.run("merge-base", main, head, check=False).stdout.strip()
+            if base and not self.changes_workflows(base, head):
+                continue
+            reason = (f"ci.yml, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
+                      f"{train.WORKFLOW_DIR} in a way that removes or breaks the gate, so this PR is merged by hand")
+            self.remove_label(number, train.TRAIN_LABEL)
+            self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason,
+                         to=self.recipients(prs.get(number)))
+            self.note(f"#{number} removed: {reason}")
 
 
 def ensure_labels(gh: GitHub) -> None:

@@ -501,6 +501,8 @@ class FakeGitHub:
         raise AssertionError(f"unexpected paginated call {path}")
 
     def dispatch_workflow(self, workflow, ref, inputs=None):
+        if getattr(self, "dispatch_error", ""):
+            raise GitHubError(self.dispatch_error)
         self.dispatched.append((workflow, ref, inputs))
 
     def posted(self, event):
@@ -2022,6 +2024,37 @@ class WorkflowTokenStepTests(unittest.TestCase):
                 self.assertEqual(self.batch(), ("", ""), lines)
                 self.assertTrue(any(f"#1 held: it changes {source}" in line for line in lines), lines)
                 self.assertEqual(merger.writes, [])
+
+    def test_a_batch_that_removes_the_ci_gate_is_deleted_and_its_workflow_pr_removed(self):
+        # PR 1 renames ci.yml away (Alex approved it); PR 2 is ordinary. GitHub refuses
+        # the dispatch at the batch ref, which no longer has ci.yml (Codex P1 on #1311).
+        head, node = self.renamed_out(1, ".github/workflows/ci.yml", "old/ci.yml")
+        node["labels"]["nodes"].append({"name": "alex-approved"})
+        h2 = self.pr_branch(2, "c.txt", "c\n")
+        fake = FakeGitHub([node, ready_node(2, h2, "pr2")], self.main)
+        self.queue(fake, 1, head, 20)
+        self.queue(fake, 2, h2, 10)
+        self.approve(fake, 1, head)
+        fake.dispatch_error = "HTTP 404: Not Found (workflow ci.yml not found at ref)"
+        merger = FakeAppGitHub([], self.main)
+        lines = self.step(fake, merger).run()
+        name, _ = self.batch()  # the fake records the delete; it does not perform it
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes,
+                      "the gateless batch must not stay at the front")
+        self.assertEqual(fake.posted("removed"), [1], "only the PR that changes workflow files leaves")
+        self.assertEqual(fake.posted("testing"), [])
+
+    def test_a_transient_dispatch_failure_deletes_the_batch_but_removes_nobody(self):
+        head, node = self.approved_workflow_pr()
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        self.approve(fake, 1, head)
+        fake.dispatch_error = "HTTP 502 (injected)"
+        merger = FakeAppGitHub([], self.main)
+        lines = self.step(fake, merger).run()
+        name, _ = self.batch()
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes, lines)
+        self.assertEqual(fake.posted("removed"), [], "a passing outage removes nobody; the next step rebuilds")
 
     def test_a_truncated_file_list_is_completed_with_both_sides_of_a_rename(self):
         fake = FakeGitHub([], self.main)
