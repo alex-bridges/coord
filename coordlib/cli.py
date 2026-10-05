@@ -694,7 +694,7 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     if pr is None:
         print(f"coord: #{args.pr} is not an open pull request", file=sys.stderr)
         return EXIT_NOT_FOUND
-    verdict, reason = train.eligibility(pr)
+    verdict, reason = train.eligibility(pr, workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
     if verdict == train.DROP:
         print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
         return EXIT_CONFLICT
@@ -855,7 +855,8 @@ def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
     queue = []
     for entry in snap["train"]:
         pr = prs.get(entry["pr"])
-        verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
+        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+                           if pr else (train.DROP, "not open"))
         queue.append(dict(entry, verdict=verdict, reason=reason))
     if args.json:
         print(json.dumps({"schema": 1, "status": "stale" if low else "ok", "reason": low or None,
@@ -962,7 +963,14 @@ def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
 
 
 def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
-    step = train_step.Step(gh, train_step.Git(args.repo_dir), args.mode, agent=identity.agent_id())
+    # merge-train.yml passes the inisa-sidechain app's installation token here, and only
+    # here, when it could mint one; without it workflow PRs are dropped for a hand merge.
+    app_token = os.environ.get(train.WORKFLOW_TOKEN_ENV) or ""
+    merger = GitHub(repo=gh.repo, transport="http", token=app_token) if app_token else None
+    if merger is None:
+        print(f"coord: no {train.WORKFLOW_TOKEN_ENV}: PRs that change .github/workflows/ are dropped "
+              "for a hand merge", file=sys.stderr)
+    step = train_step.Step(gh, train_step.Git(args.repo_dir), args.mode, agent=identity.agent_id(), merger=merger)
     try:
         lines = step.run()
     except train_step.GitError as error:
