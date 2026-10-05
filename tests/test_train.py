@@ -1994,6 +1994,41 @@ class WorkflowTokenStepTests(unittest.TestCase):
         self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
         self.assertEqual(merger.writes, [])
 
+    def renamed_out(self, number, source, destination):
+        """PR `number` renames `source` (put on main first) to `destination`; its GitHub
+        file list names only the destination, as GitHub may (Codex P1 on #1311)."""
+        sh(self.work, "checkout", "-q", "main")
+        self.write(source, "guarded\n")
+        self.main = self.commit("guarded file on main")
+        sh(self.work, "push", "-q", "origin", "main")
+        sh(self.work, "checkout", "-q", "-b", f"pr{number}", self.main)
+        os.makedirs(os.path.join(self.work, os.path.dirname(destination)), exist_ok=True)
+        sh(self.work, "mv", source, destination)
+        head = self.commit(f"pr {number}: rename")
+        sh(self.work, "push", "-q", "origin", f"HEAD:refs/pull/{number}/head")
+        sh(self.work, "checkout", "-q", "main")
+        return head, ready_node(number, head, f"pr{number}", files=(destination,))
+
+    def test_a_rename_out_of_a_guarded_directory_still_needs_alex(self):
+        for source, destination in ((".github/workflows/x.yml", "elsewhere/x.yml"),
+                                    ("Tools/coord/coordlib/x.py", "elsewhere/x.py")):
+            with self.subTest(source=source):
+                self.setUp()
+                head, node = self.renamed_out(1, source, destination)
+                fake = FakeGitHub([node], self.main)
+                self.queue(fake, 1, head, 20)
+                merger = FakeAppGitHub([], self.main)
+                lines = self.step(fake, merger).run()
+                self.assertEqual(self.batch(), ("", ""), lines)
+                self.assertTrue(any(f"#1 held: it changes {source}" in line for line in lines), lines)
+                self.assertEqual(merger.writes, [])
+
+    def test_a_truncated_file_list_is_completed_with_both_sides_of_a_rename(self):
+        fake = FakeGitHub([], self.main)
+        fake.rest_paginated = lambda path: [{"filename": "elsewhere/x.yml", "previous_filename": ".github/workflows/x.yml"}]
+        files = self.step(fake).all_files({"number": 1, "filesTruncated": True})
+        self.assertEqual(sorted(files), [".github/workflows/x.yml", "elsewhere/x.yml"])
+
     def test_a_workflow_batch_whose_token_is_gone_does_not_move_main(self):
         head, node = self.approved_workflow_pr()
         fake = FakeGitHub([node], self.main)

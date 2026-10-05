@@ -464,9 +464,21 @@ class Step:
         self.note(f"#{number}: asked Codex to review {head[:9]}: {reason}")
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
+        """The PR's complete file list when the summary's was cut short, both sides of
+        every rename (snapshot.rest_files), else None."""
         if not pr.get("filesTruncated"):
             return None
-        return [f["filename"] for f in self.gh.rest_paginated(f"repos/{{repo}}/pulls/{pr['number']}/files?per_page=100")]
+        return snapshot.rest_files(self.gh, pr["number"])
+
+    def gate_files(self, pr: Dict[str, Any], main: str) -> List[str]:
+        """The paths train.assess gates on (workflow files, ALEX_ONLY_PATHS): GitHub's list
+        plus what git itself will merge, `git diff --no-renames` from the merge base, which
+        names both sides of a rename whatever GitHub's list says. A path renamed out of a
+        guarded directory therefore still needs Alex's approval (Codex on #1311)."""
+        listed = self.all_files(pr)
+        paths = list(listed if listed is not None else pr.get("files") or [])
+        diff = self.changed_paths(main, pr["number"], pr["head"]) if pr.get("head") else None
+        return paths + [path for path in diff or [] if path not in paths]
 
     def lane_classes(self, main: str, ready: List[Dict[str, Any]]) -> Dict[int, str]:
         """LIGHT or HEAVY for each ready PR (train.LaneClassifier), judged by the lane
@@ -767,7 +779,7 @@ class Step:
                 problem = "was taken out of the train"
             else:
                 self.train_added(pr)  # refresh the recorded-review and approval heads for the final check
-                verdict, hold, reason = train.assess(pr, all_files=self.all_files(pr),
+                verdict, hold, reason = train.assess(pr, all_files=self.gate_files(pr, main),
                                                      workflow_token=self.workflow_token)
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"
@@ -834,7 +846,7 @@ class Step:
         for pr in queued:
             added = self.train_added(pr)
             entries.append({"pr": pr["number"], "at": added.get("at") or "9999"})
-            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.all_files(pr),
+            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.gate_files(pr, main),
                                                                 workflow_token=self.workflow_token)
             verdicts[pr["number"]] = (verdict, reason)
         entries.sort(key=lambda e: (e["at"], e["pr"]))
