@@ -251,6 +251,13 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     # commit, a review thread or its starter), the PR is held on partial data instead.
     for key in ("files", "labels", "comments", "reactions", "closingIssuesReferences"):
         _drop_nulls(node.get(key))
+    if truncated(node.get("closingIssuesReferences")):
+        # Unlike files/labels/comments/reactions, this one can't be re-read over REST
+        # without losing fidelity: rest_pr_node can only recover a body "Closes #N"
+        # keyword, not an issue linked through the sidebar (Codex on #1218). Guessing
+        # the shortened list is authoritative would let `close_issues` skip an issue
+        # whose closing reference landed on the dropped node, leaving its claim open.
+        incomplete.append("closing issues (GitHub returned a null entry)")
     commit_nodes = ((node.get("commits") or {}).get("nodes")) or []
     if commit_nodes and not isinstance(commit_nodes[-1], dict):
         incomplete.append("head commit (GitHub returned it empty)")
@@ -492,7 +499,17 @@ def with_rest_fallback(gh: GitHub, graphql_call: Callable[[], Any], rest_call: C
     except AppAuthError:
         raise  # no app token: not a proxy's GraphQL refusal
     except NullPageNode:
-        return rest_call()  # a null page entry has no id to complete; re-read it over REST
+        # A one-off gap (gh.py), not a lasting block like the 403 case below: retry the
+        # same GraphQL fetch once before paying the REST fallback's cost. Unlike a null
+        # reaction or label, a null `pullRequests` page entry forces the fallback to
+        # rebuild EVERY PR in the batch via REST, and REST's closingIssuesReferences can
+        # only recover a body "Closes #N" keyword, not a sidebar-linked issue (#1218) —
+        # so a transient glitch here would silently cost every open PR's closing-issue
+        # fidelity, not just the affected one, unless it actually recurs.
+        try:
+            return graphql_call()
+        except NullPageNode:
+            return rest_call()
     except GitHubError as error:
         message = str(error)
         if "403" in message and "graphql" in message.lower():

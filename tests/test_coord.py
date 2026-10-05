@@ -1002,6 +1002,32 @@ class RestFallbackTests(unittest.TestCase):
         self.assertEqual([n["number"] for n in nodes], [7], "the REST fixture's PR, read whole")
         self.assertFalse(getattr(fake, "graphql_blocked", False),
                          "a null page node is a one-off gap, not a lasting proxy block like a 403")
+        self.assertEqual(fake.graphql_calls, 2,
+                         "a one-off gap is retried once before paying the REST fallback's cost "
+                         "(it can't see sidebar-linked closing issues for any PR in the batch)")
+
+    def test_a_null_pullrequests_page_node_that_clears_on_retry_never_reaches_rest(self):
+        # Codex round 2 on #1218: falling to REST for a transient glitch costs every PR
+        # in the batch its sidebar-linked closing issues, not just the one with the null
+        # node. A retry of the same GraphQL fetch recovers without paying that cost.
+        class RecoversFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                if self.graphql_calls == 1:
+                    return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                            "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                              "nodes": [None]}}}
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [pr_node(number=9)]}}}
+
+            def rest_paginated(self, path):
+                raise AssertionError("REST fallback must not run when the retry recovers: " + path)
+
+        fake = RecoversFake()
+        main, nodes = snapshot.fetch_prs(fake)
+        self.assertEqual(fake.graphql_calls, 2)
+        self.assertEqual([n["number"] for n in nodes], [9], "the retried GraphQL page, not a REST rebuild")
 
     def test_fetch_prs_graphql_itself_raises_for_a_null_page_node(self):
         from coordlib.gh import NullPageNode
@@ -1093,8 +1119,12 @@ class CodexRoundSevenTests(unittest.TestCase):
         self.assertEqual(pr["incomplete"], [])
         node = pr_node(closingIssuesReferences={"totalCount": 2, "nodes": [None, {"number": 55}]})
         snapshot.complete_pr_node(self.Fake(), node)
-        self.assertEqual(snapshot.summarize_pr(node)["closes"], [55],
+        pr = snapshot.summarize_pr(node)
+        self.assertEqual(pr["closes"], [55],
                          "the null closingIssuesReferences entry was dropped, not read as a crash")
+        self.assertEqual(pr["incomplete"], ["closing issues (GitHub returned a null entry)"],
+                         "the dropped entry can't be re-read over REST without losing sidebar-linked "
+                         "issues, so the shortened list must not be read as authoritative (Codex round 2)")
         for threads in ({"nodes": [None]},
                         {"nodes": [{"isResolved": False, "comments": {"nodes": [None, {"author": {"login": BOT}}]}}]}):
             node = pr_node(reviewThreads=threads)
