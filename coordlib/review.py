@@ -42,6 +42,13 @@ NOT_RUN_PREFIX = "The job was not started because"
 _IGNORED_CHECK_PREFIXES = ("LegacyCI | ",)
 
 
+
+def _nodes(connection: Any) -> List[Dict[str, Any]]:
+    """A GraphQL connection's nodes, without the nulls GitHub sometimes returns in them
+    (a reaction whose user it will not show, with no `errors` entry). One null reaction
+    crashed the merge train's step on 2026-09-30 (run 10000098)."""
+    return [n for n in ((connection or {}).get("nodes") or []) if isinstance(n, dict)]
+
 def parse_time(value: Optional[str]) -> Optional[dt.datetime]:
     if not value:
         return None
@@ -61,12 +68,12 @@ def is_bot(login: Optional[str]) -> bool:
 
 def _head_commit(pr: Dict[str, Any]) -> Dict[str, Any]:
     nodes = ((pr.get("commits") or {}).get("nodes")) or []
-    return (nodes[-1].get("commit") or {}) if nodes else {}
+    return ((nodes[-1] or {}).get("commit") or {}) if nodes else {}
 
 
 def head_pushed_at(pr: Dict[str, Any]) -> Optional[dt.datetime]:
     commit = _head_commit(pr)
-    suites = ((commit.get("checkSuites") or {}).get("nodes")) or []
+    suites = _nodes(commit.get("checkSuites"))
     times = [parse_time(s.get("createdAt")) for s in suites if s.get("createdAt")]
     times = [t for t in times if t is not None]
     if times:
@@ -85,7 +92,7 @@ def summary_reviewed_commit(pr: Dict[str, Any]) -> Optional[str]:
     commit and says Completed when the review is done (on #975/#984/#986 it names
     exactly the approved head). None while a review runs or when there is no summary.
     """
-    for comment in ((pr.get("comments") or {}).get("nodes")) or []:
+    for comment in _nodes(pr.get("comments")):
         login = (comment.get("author") or {}).get("login") or ""
         body = comment.get("body") or ""
         if login.startswith(CODEX_LOGIN_PREFIX) and SUMMARY_MARKER in body:
@@ -105,7 +112,7 @@ def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     another branch, or a force-push back to an older head), so an old 👍 could pass
     for a head Codex never reviewed (substitute review of #989).
     """
-    reactions = ((pr.get("reactions") or {}).get("nodes")) or []
+    reactions = _nodes(pr.get("reactions"))
     bot = [r for r in reactions if ((r.get("user") or {}).get("login") or "").startswith(CODEX_LOGIN_PREFIX)]
     thumbs = [parse_time(r.get("createdAt")) for r in bot if r.get("content") == "THUMBS_UP"]
     eyes = any(r.get("content") == "EYES" for r in bot)
@@ -125,7 +132,7 @@ def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def unanswered_findings(pr: Dict[str, Any]) -> int:
-    threads = ((pr.get("reviewThreads") or {}).get("nodes")) or []
+    threads = _nodes(pr.get("reviewThreads"))
     count = 0
     for thread in threads:
         if thread.get("isResolved"):
@@ -133,10 +140,16 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
         comments = ((thread.get("comments") or {}).get("nodes")) or []
         if not comments:
             continue
+        if not isinstance(comments[0], dict):
+            # Who started the thread is unknown, and the next comment did not start it:
+            # count it rather than let a null hide a finding (Codex on #1218).
+            count += 1
+            continue
         starter = (comments[0].get("author") or {}).get("login")
         if not is_bot(starter):
             continue
-        answered = any(not is_bot((c.get("author") or {}).get("login")) for c in comments[1:])
+        answered = any(isinstance(c, dict) and not is_bot((c.get("author") or {}).get("login"))
+                       for c in comments[1:])
         if not answered:
             count += 1
     return count
@@ -189,7 +202,7 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     a reason to hold or to merge.
     """
     rollup = _head_commit(pr).get("statusCheckRollup") or {}
-    contexts = ((rollup.get("contexts") or {}).get("nodes")) or []
+    contexts = _nodes(rollup.get("contexts"))
     failing: List[str] = []
     pending: List[str] = []
     started: List[str] = []

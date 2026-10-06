@@ -263,6 +263,20 @@ class CodexStateTests(unittest.TestCase):
         state = review.codex_state(pr_node(reactions={"nodes": [reaction("THUMBS_UP", 5, "alex-bridges")]}))
         self.assertFalse(state["approved"])
 
+    def test_null_nodes_are_skipped(self):
+        # GitHub can return a null node in a connection without an `errors` entry; one
+        # null reaction crashed the train step on 2026-09-30 (run 10000098).
+        node = pr_node(reactions={"nodes": [None, reaction("THUMBS_UP", 30)]})
+        node["comments"]["nodes"].insert(0, None)
+        node["reviewThreads"] = {"nodes": [None, {"isResolved": False, "comments": {"nodes": [None]}}]}
+        self.assertTrue(review.codex_state(node)["approved"])
+        self.assertEqual(review.unanswered_findings(node), 1, "a null starter counts; it is not skipped")
+        node["reviewThreads"] = {"nodes": [{"isResolved": False, "comments": {"nodes": [
+            None, {"author": {"login": BOT}}]}}]}
+        self.assertEqual(review.unanswered_findings(node), 1, "the bot reply did not start the thread")
+        node["commits"]["nodes"] = [None]
+        self.assertIsNone(review.head_pushed_at(node))
+
     def test_commit_date_is_the_fallback_push_time(self):
         node = pr_node(reactions={"nodes": [reaction("THUMBS_UP", 80)]})
         node["commits"]["nodes"][0]["commit"]["checkSuites"]["nodes"] = []
@@ -970,6 +984,64 @@ class RestFallbackTests(unittest.TestCase):
         self.assertEqual((pr["mergeable"], pr["fromFork"], pr["labels"], pr["closes"]),
                          ("CONFLICTING", False, ["train"], [55, 56]))
 
+    def test_a_null_pullrequests_page_node_falls_back_to_rest_without_blocking_graphql(self):
+        # Codex on #1218: a null entry in the top-level `pullRequests` page carries no
+        # number to complete over REST, and GitHub sends no `errors` entry with it (the
+        # same silent gap as the null reaction fixed elsewhere in complete_pr_node), so
+        # dropping it would read as that PR no longer being open.
+        class NullPageFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [None]}}}
+
+        fake = NullPageFake()
+        main, nodes = snapshot.fetch_prs(fake)
+        self.assertEqual(main["sha"], "m" * 40, "the REST fallback's main, not the null GraphQL page")
+        self.assertEqual([n["number"] for n in nodes], [7], "the REST fixture's PR, read whole")
+        self.assertFalse(getattr(fake, "graphql_blocked", False),
+                         "a null page node is a one-off gap, not a lasting proxy block like a 403")
+        self.assertEqual(fake.graphql_calls, 2,
+                         "a one-off gap is retried once before paying the REST fallback's cost "
+                         "(it can't see sidebar-linked closing issues for any PR in the batch)")
+
+    def test_a_null_pullrequests_page_node_that_clears_on_retry_never_reaches_rest(self):
+        # Codex round 2 on #1218: falling to REST for a transient glitch costs every PR
+        # in the batch its sidebar-linked closing issues, not just the one with the null
+        # node. A retry of the same GraphQL fetch recovers without paying that cost.
+        class RecoversFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                if self.graphql_calls == 1:
+                    return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                            "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                              "nodes": [None]}}}
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [pr_node(number=9)]}}}
+
+            def rest_paginated(self, path):
+                raise AssertionError("REST fallback must not run when the retry recovers: " + path)
+
+        fake = RecoversFake()
+        main, nodes = snapshot.fetch_prs(fake)
+        self.assertEqual(fake.graphql_calls, 2)
+        self.assertEqual([n["number"] for n in nodes], [9], "the retried GraphQL page, not a REST rebuild")
+
+    def test_fetch_prs_graphql_itself_raises_for_a_null_page_node(self):
+        from coordlib.gh import NullPageNode
+
+        class NullPageFake(self.Fake):
+            def graphql(self, query, variables=None):
+                self.graphql_calls += 1
+                return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": "m" * 40}},
+                                        "pullRequests": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+                                                          "nodes": [None]}}}
+
+        with self.assertRaises(NullPageNode):
+            snapshot.fetch_prs_graphql(NullPageFake())
+
     def test_other_graphql_errors_are_not_swallowed(self):
         from coordlib.gh import GitHubError
         fake = self.Fake(GitHubError("HTTP 502 POST https://api.github.com/graphql: bad gateway"))
@@ -1034,6 +1106,35 @@ class CodexRoundSevenTests(unittest.TestCase):
         verdict, reason = train.eligibility(dict(pr, ci={"failing": [], "pending": [], "started": []}))
         self.assertEqual(verdict, train.HOLD)
         self.assertIn("only part of", reason)
+
+    def test_null_nodes_are_re_read_or_hold_the_pr(self):
+        # Codex on #1218: the nulls must be handled where the snapshot completes a PR
+        # node, not only in the rules that read it afterwards.
+        node = pr_node(reactions={"totalCount": 2, "nodes": [None, None]})
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"] = {"totalCount": 1, "nodes": [None]}
+        snapshot.complete_pr_node(self.Fake(), node)
+        pr = snapshot.summarize_pr(node)
+        self.assertTrue(pr["codex"]["approved"], "the null reactions were re-read over REST")
+        self.assertEqual(pr["ci"]["failing"], ["Android"], "the null check was re-read over REST")
+        self.assertEqual(pr["incomplete"], [])
+        node = pr_node(closingIssuesReferences={"totalCount": 2, "nodes": [None, {"number": 55}]})
+        snapshot.complete_pr_node(self.Fake(), node)
+        pr = snapshot.summarize_pr(node)
+        self.assertEqual(pr["closes"], [55],
+                         "the null closingIssuesReferences entry was dropped, not read as a crash")
+        self.assertEqual(pr["incomplete"], ["closing issues (GitHub returned a null entry)"],
+                         "the dropped entry can't be re-read over REST without losing sidebar-linked "
+                         "issues, so the shortened list must not be read as authoritative (Codex round 2)")
+        for threads in ({"nodes": [None]},
+                        {"nodes": [{"isResolved": False, "comments": {"nodes": [None, {"author": {"login": BOT}}]}}]}):
+            node = pr_node(reviewThreads=threads)
+            snapshot.complete_pr_node(self.Fake(), node)
+            self.assertEqual(snapshot.summarize_pr(node)["incomplete"],
+                             ["review threads (GitHub returned an empty thread or comment)"])
+        node = pr_node()
+        node["commits"]["nodes"] = [None]
+        snapshot.complete_pr_node(self.Fake(), node)
+        self.assertEqual(snapshot.summarize_pr(node)["incomplete"], ["head commit (GitHub returned it empty)"])
 
     def test_a_fork_pr_with_the_same_branch_name_is_never_taken_for_local_work(self):
         fork = snapshot.summarize_pr(pr_node(number=200, headRefName="feature/x", isCrossRepository=True))

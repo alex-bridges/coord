@@ -66,6 +66,13 @@ class AppAuthError(GitHubError):
     """
 
 
+class NullPageNode(GitHubError):
+    """GraphQL returned a null entry inside a top-level connection page (no `errors`
+    entry) — seen on `pullRequests` (#1218). The entry carries no id to complete over
+    REST, and dropping it would read as the PR no longer being open, so the caller
+    re-fetches the whole page over REST instead of guessing."""
+
+
 # What must never reach a terminal or a log: GitHub tokens (an installation token is
 # `ghs_…`, and the stateless kind embeds a JWT), JWTs, PEM blocks, and long base64 runs
 # (the Keychain holds the key as base64).
