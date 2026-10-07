@@ -208,6 +208,101 @@ class MintTests(AppTestCase):
         self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.json")))
         self.assertTrue(os.path.exists(held), "another config's hold is not ours to clear")
 
+    def test_reinstall_cleanup_keeps_a_replacement_minted_after_its_first_read(self):
+        self.seed_token("read")
+        held = self.hold("read")
+        tokens = self.tokens()
+        path = tokens.path("read")
+        replacement = dict(read_json(path), installation_id=999, token="new-installation-token")
+        old_seen, resume = threading.Event(), threading.Event()
+        original_read = apptoken._read_json
+        errors = []
+
+        def paused_read(candidate):
+            entry = original_read(candidate)
+            if candidate == path and threading.current_thread() is worker and not old_seen.is_set():
+                old_seen.set()
+                if not resume.wait(5):
+                    raise AssertionError("replacement writer never resumed cleanup")
+            return entry
+
+        def clean():
+            try:
+                tokens._forget_other_installations("ops", 999)
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(apptoken, "_read_json", paused_read)
+        worker = threading.Thread(target=clean, daemon=True)
+        try:
+            with tokens._lock("read"):
+                worker.start()
+                self.assertTrue(old_seen.wait(5), "cleanup never read the old entry")
+                # A cooperating mint commits the new token while cleanup still has
+                # its old snapshot. Cleanup must re-read after acquiring this lock.
+                tokens._store("read", replacement)
+                resume.set()
+        finally:
+            resume.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "cleanup deadlocked on the other kind")
+        self.assertEqual(errors, [])
+        self.assertEqual(read_json(path), replacement, "the fresh token must not be unlinked")
+        self.assertTrue(os.path.exists(held), "the replacement's hold is not obsolete cleanup")
+
+    def test_reinstall_cleanup_releases_its_mint_lock_before_taking_the_other_kind(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        cleanup = tokens._forget_other_installations
+        checked = []
+        self.patch(apptoken, "LOCK_TIMEOUT_SECONDS", 0.2)
+
+        def check(kind, installation):
+            # A second descriptor cannot acquire the same flock while token()'s
+            # original descriptor still owns it. This bounds the deadlock witness.
+            with tokens._lock(kind):
+                checked.append(kind)
+            cleanup(kind, installation)
+
+        self.patch(tokens, "_forget_other_installations", check)
+        self.assertTrue(tokens.token("ops"))
+        self.assertEqual(checked, ["ops"])
+        self.assertFalse(os.path.exists(tokens.path("read")))
+
+    def test_both_kinds_can_finish_a_reinstall_together(self):
+        for kind in apptoken.KINDS:
+            self.seed_token(kind, expires_in=-10)
+        self.server.installation = 999
+        stored = threading.Barrier(2)
+        original_store = apptoken.AppTokens._store
+        results, errors = {}, []
+
+        def store_together(source, kind, entry):
+            original_store(source, kind, entry)
+            stored.wait(5)  # both own their distinct mint locks at this point
+
+        def mint(kind):
+            try:
+                results[kind] = self.tokens().token(kind)
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(apptoken.AppTokens, "_store", store_together)
+        workers = [threading.Thread(target=mint, args=(kind,), daemon=True) for kind in apptoken.KINDS]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        self.assertFalse(any(worker.is_alive() for worker in workers), "cross-kind cleanup deadlocked")
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), set(apptoken.KINDS))
+        self.assertEqual(self.server.mints, 2)
+        for kind, token in results.items():
+            entry = read_json(os.path.join(self.token_dir, f"{kind}.json"))
+            self.assertEqual((entry["token"], entry["installation_id"]), (token, 999))
+
     def test_a_cached_token_whose_permissions_differ_is_never_used(self):
         wrong = {"read": dict(apptoken.READ_PERMISSIONS, issues="write"), "ops": apptoken.READ_PERMISSIONS}
         for kind, permissions in wrong.items():
