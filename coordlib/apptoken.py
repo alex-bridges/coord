@@ -585,14 +585,15 @@ class AppTokens:
                     os.unlink(tmp)
 
     @contextlib.contextmanager
-    def _lock(self, kind: str) -> Iterator[None]:
+    def _lock(self, kind: str, *, timeout: Optional[float] = None) -> Iterator[None]:
+        timeout = LOCK_TIMEOUT_SECONDS if timeout is None else timeout
         try:
             os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
             fd = os.open(os.path.join(self.cache_dir, f"{kind}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         except OSError as error:
             raise AppAuthError(f"the token cache {self.cache_dir} cannot be used ({error.strerror})") from None
         try:
-            deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+            deadline = time.monotonic() + timeout
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -600,9 +601,9 @@ class AppTokens:
                 except OSError as error:
                     if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
                         raise AppAuthError(f"the token cache lock failed ({error.strerror})") from None
-                if time.monotonic() > deadline:
+                if time.monotonic() >= deadline:
                     raise AppAuthError(f"another coord process has held the {kind} token lock for "
-                                       f"{LOCK_TIMEOUT_SECONDS}s (a Keychain prompt waiting?)")
+                                       f"{timeout}s (a Keychain prompt waiting?)")
                 time.sleep(0.05)
             yield
         finally:
@@ -722,17 +723,19 @@ class AppTokens:
         return entry
 
     def _forget_other_installations(self, kind: str, installation: int) -> None:
-        """After a reinstall the installation id changes. The other kind's cached token (and
-        any hold on it) for this config belongs to the old installation: drop them, so both
-        kinds, and the budget principal (`installation_id`), converge on the new one.
-        Call without a mint lock held: cleanup locks the other kind."""
+        """Best-effort removal of the other kind's obsolete installation token.
+
+        Call without a mint lock held; skip a busy or unavailable other-kind lock so
+        cleanup never delays or fails our successful mint. Holds name no installation:
+        leave them for their owning kind's success or expiry, even beside an old token.
+        """
         for other in KINDS:
             # Avoid waiting on an unrelated mint when no obsolete entry exists.
             entry = _read_json(self.path(other)) if other != kind else None
             if not entry or not self._same_config(entry) or not _is_int(entry.get("installation_id")) \
                     or entry["installation_id"] == installation:
                 continue
-            with self._lock(other):
+            with contextlib.suppress(AppAuthError), self._lock(other, timeout=0):
                 # The other mint may have replaced the old entry since our peek.
                 entry = _read_json(self.path(other))
                 if not entry or not self._same_config(entry) or not _is_int(entry.get("installation_id")) \
@@ -740,10 +743,6 @@ class AppTokens:
                     continue
                 with contextlib.suppress(OSError):
                     os.unlink(self.path(other))
-                record = _read_json(self.failed_path(other))
-                if record and self._same_config(record):  # another config's hold is not ours to clear
-                    with contextlib.suppress(OSError):
-                        os.unlink(self.failed_path(other))
 
 
 def _staged(error: Exception, stage: str, kinds: Sequence[str]) -> AppAuthError:

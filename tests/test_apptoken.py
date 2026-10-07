@@ -166,7 +166,7 @@ class MintTests(AppTestCase):
     def test_after_a_reinstall_both_kinds_converge_on_the_new_installation(self):
         # Codex on 2d13f6b1e (P2): the ops mint found the new installation, and read.json kept
         # the old one, which installation_id() (the budget principal) read first. The other
-        # kind's entry of the old installation, and its hold, go when a mint finds a new one.
+        # kind's old token goes. A hold names no installation and must expire on its own.
         old_read = self.seed_token("read")  # the old installation, still unexpired
         self.seed_token("ops", expires_in=-10)
         held = self.hold("read")
@@ -175,12 +175,12 @@ class MintTests(AppTestCase):
         tokens.token("ops")
         self.assertEqual(self.server.discoveries, 1, "the old installation answered 404, the new one was found")
         self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.json")), "the old installation's token")
-        self.assertFalse(os.path.exists(held), "and its hold")
+        self.assertTrue(os.path.exists(held), "the hold cannot be attributed to the old token")
         self.assertEqual(read_json(os.path.join(self.token_dir, "ops.json"))["installation_id"], 999)
         self.assertEqual(tokens.installation_id(), 999)
         self.assertEqual(self.tokens().installation_id(), 999, "a new process keys the budget on the new one")
         self.assertEqual(budget.app_principal(self.tokens().installation_id()), budget.app_principal(999))
-        new_read = self.tokens().token("read")
+        new_read = self.tokens(clock=lambda: time.time() + apptoken.FAILURE_HOLD_SECONDS + 1).token("read")
         self.assertNotEqual(new_read, old_read)
         self.assertEqual(read_json(os.path.join(self.token_dir, "read.json"))["installation_id"], 999)
         self.assertEqual(self.server.discoveries, 1, "found once")
@@ -241,7 +241,7 @@ class MintTests(AppTestCase):
                 # A cooperating mint commits the new token while cleanup still has
                 # its old snapshot. Cleanup must re-read after acquiring this lock.
                 tokens._store("read", replacement)
-                resume.set()
+            resume.set()  # allow the recheck only after the replacement writer unlocks
         finally:
             resume.set()
             worker.join(5)
@@ -270,6 +270,91 @@ class MintTests(AppTestCase):
         self.assertTrue(tokens.token("ops"))
         self.assertEqual(checked, ["ops"])
         self.assertFalse(os.path.exists(tokens.path("read")))
+
+    def test_a_busy_other_kind_does_not_delay_or_fail_a_successful_mint(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        old_read = read_json(tokens.path("read"))
+
+        def no_wait(seconds):
+            self.fail("optional cross-kind cleanup must not wait for a lock")
+
+        self.patch(apptoken.time, "sleep", no_wait)
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+            self.assertEqual(tokens.token("ops"), token, "successful cleanup skips must not poison this process")
+        self.assertEqual(self.server.tokens[token], "ops")
+        self.assertEqual(tokens._failures, {})
+        self.assertEqual(read_json(tokens.path("ops"))["installation_id"], 999)
+        self.assertEqual(read_json(tokens.path("read")), old_read, "busy cleanup leaves the other kind alone")
+
+    def test_an_unavailable_cleanup_lock_does_not_fail_a_successful_mint(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        lock = tokens._lock
+
+        def unavailable(kind, **kwargs):
+            if kind == "read":
+                raise AppAuthError("synthetic cleanup lock cannot be opened")
+            return lock(kind, **kwargs)
+
+        self.patch(tokens, "_lock", unavailable)
+        token = tokens.token("ops")
+        self.assertEqual(self.server.tokens[token], "ops")
+        self.assertEqual(tokens._failures, {})
+
+    def test_reinstall_cleanup_preserves_a_new_failure_hold_beside_an_old_token(self):
+        self.seed_token("read", expires_in=-10)
+        self.server.installation = 999
+        self.server.refuse_kinds = {"read"}
+        tokens = self.tokens()
+        path = tokens.path("read")
+        old_seen, resume = threading.Event(), threading.Event()
+        original_read = apptoken._read_json
+        errors = []
+
+        def paused_read(candidate):
+            entry = original_read(candidate)
+            if candidate == path and threading.current_thread() is worker and not old_seen.is_set():
+                old_seen.set()
+                if not resume.wait(5):
+                    raise AssertionError("failed mint never resumed cleanup")
+            return entry
+
+        def clean():
+            try:
+                tokens._forget_other_installations("ops", 999)
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(apptoken, "_read_json", paused_read)
+        worker = threading.Thread(target=clean, daemon=True)
+        try:
+            with tokens._lock("read"):
+                worker.start()
+                self.assertTrue(old_seen.wait(5), "cleanup never read the old token")
+                with self.assertRaises(AppAuthError):
+                    tokens._mint_remembering_failure("read")
+                with open(tokens.failed_path("read"), "rb") as handle:
+                    fresh_hold = handle.read()
+            resume.set()  # cleanup must acquire the lock after the failed mint releases it
+        finally:
+            resume.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "cleanup deadlocked")
+        self.assertEqual(errors, [])
+        self.assertFalse(os.path.exists(path), "the obsolete token is still removed")
+        with open(tokens.failed_path("read"), "rb") as handle:
+            self.assertEqual(handle.read(), fresh_hold, "a fresh failure hold must survive byte-for-byte")
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        with self.assertRaisesRegex(AppAuthError, "a mint failed"):
+            self.tokens().token("read")
+        self.assertEqual(len(self.server.requests), requests, "backoff prevents another mint")
+        self.assertEqual(len(self.security_calls()), key_reads, "backoff prevents another Keychain read")
 
     def test_both_kinds_can_finish_a_reinstall_together(self):
         for kind in apptoken.KINDS:
