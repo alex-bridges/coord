@@ -501,6 +501,8 @@ class FakeGitHub:
         raise AssertionError(f"unexpected paginated call {path}")
 
     def dispatch_workflow(self, workflow, ref, inputs=None):
+        if getattr(self, "dispatch_error", ""):
+            raise GitHubError(self.dispatch_error)
         self.dispatched.append((workflow, ref, inputs))
 
     def posted(self, event):
@@ -1846,6 +1848,247 @@ class StepTests(unittest.TestCase):
         self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})], "only one redispatch after the first request")
         self.assertTrue(any("daily budget" in line for line in lines), lines)
         self.assertEqual(sh(self.origin, "rev-parse", name), tip)
+
+
+class WorkflowTokenEligibilityTests(unittest.TestCase):
+    """With the inisa-sidechain app token, a workflow PR waits for Alex instead of leaving."""
+
+    def summary(self, files=(".github/workflows/ci.yml",), labels=("train",)):
+        return snapshot.summarize_pr(ready_node(1, "a" * 40, "b", files=files, labels=labels))
+
+    def test_without_the_token_a_workflow_pr_is_dropped_as_before(self):
+        verdict, hold, reason = train.assess(self.summary())
+        self.assertEqual((verdict, hold), (train.DROP, ""))
+        self.assertIn("so this PR is merged by hand", reason)
+
+    def test_with_the_token_a_workflow_pr_is_held_for_alex(self):
+        verdict, hold, reason = train.assess(self.summary(), workflow_token=True)
+        self.assertEqual((verdict, hold), (train.HOLD, train.HOLD_NEEDS_ALEX))
+        self.assertIn(".github/workflows/ci.yml", reason)
+        self.assertIn("coord train approve", reason)
+        # A truncated summary is completed by the caller; the full list decides.
+        self.assertEqual(train.assess(self.summary(files=("x",)), all_files=["x", ".github/workflows/a.yml"],
+                                      workflow_token=True)[:2], (train.HOLD, train.HOLD_NEEDS_ALEX))
+
+    def test_alex_approval_of_the_head_releases_it_and_only_that_head(self):
+        approved = self.summary(labels=("train", "alex-approved"))
+        self.assertEqual(train.assess(dict(approved, alexApprovedHead="a" * 40), workflow_token=True)[0], train.READY)
+        self.assertEqual(train.assess(dict(approved, alexApprovedHead="0" * 40), workflow_token=True)[:2],
+                         (train.HOLD, train.HOLD_NEEDS_ALEX), "a new push needs a new approval")
+        self.assertEqual(train.assess(dict(self.summary(), alexApprovedHead="a" * 40), workflow_token=True)[0],
+                         train.HOLD, "the record without the label is not an approval")
+
+    def test_coord_views_let_a_workflow_pr_join_and_show_it_held(self):
+        # `train add`, `train status`, the board: the step, not the view, decides on the token.
+        verdict, reason = train.eligibility(self.summary(), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+        self.assertEqual(verdict, train.HOLD, reason)
+
+    def test_the_token_changes_nothing_for_other_prs(self):
+        pr = self.summary(files=("Packages/CoreKit/Sources/A.swift",))
+        self.assertEqual(train.assess(pr, workflow_token=True), train.assess(pr))
+        self.assertEqual(train.assess(pr, workflow_token=True)[0], train.READY)
+
+
+class FakeAppGitHub(FakeGitHub):
+    """The app-token client the step gets as `merger`: records its writes apart."""
+
+    def token(self):
+        return "app-token-for-tests"
+
+
+class WorkflowTokenStepTests(unittest.TestCase):
+    """A batch that changes .github/workflows/ moves its refs with the app token; the
+    Actions token keeps comments, labels and the CI dispatch; other batches never use it."""
+
+    setUp = StepTests.setUp
+    write = StepTests.write
+    commit = StepTests.commit
+    pr_branch = StepTests.pr_branch
+    queue = StepTests.queue
+    run_on = StepTests.run_on
+    members = StepTests.members
+
+    def step(self, fake, merger=None):
+        step = train_step.Step(fake, train_step.Git(self.clone), "live", now=snapshot.now_utc(),
+                               log=lambda line: None, sleep=lambda seconds: None, merger=merger)
+        pushes = []
+        real_run = step.git.run
+
+        def spy(*args, check=True, env=None):
+            if args and args[0] == "push":
+                pushes.append(dict(env or {}))
+            return real_run(*args, check=check, env=env)
+        step.git.run = spy
+        step.pushes = pushes
+        return step
+
+    def approved_workflow_pr(self, number=1):
+        head = self.pr_branch(number, ".github/workflows/x.yml", "on: push\n")
+        node = ready_node(number, head, f"pr{number}", files=(".github/workflows/x.yml",),
+                          labels=("train", "alex-approved"))
+        return head, node
+
+    def approve(self, fake, number, head):
+        fake.issue_comments[number].append({"created_at": snapshot.iso(NOW), "user": dict(FAKE_OWNER),
+                                            "body": compose_record("approved", {"kind": "alex-approve", "pr": number,
+                                                                                "head": head})})
+
+    def batch(self):
+        sh(self.clone, "fetch", "-q", "origin", "+refs/heads/train/*:refs/remotes/origin/train/*")
+        name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+        return name, (sh(self.origin, "rev-parse", name) if name else "")
+
+    def test_without_the_token_the_workflow_pr_is_removed(self):
+        head, node = self.approved_workflow_pr()
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        self.approve(fake, 1, head)
+        self.step(fake).run()
+        self.assertEqual(fake.posted("removed"), [1])
+        self.assertEqual(self.batch(), ("", ""))
+
+    def test_with_the_token_an_unapproved_workflow_pr_is_held_not_removed(self):
+        head, node = self.approved_workflow_pr()
+        node["labels"] = {"nodes": [{"name": "train"}]}
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        merger = FakeAppGitHub([], self.main)
+        lines = self.step(fake, merger).run()
+        self.assertEqual(fake.posted("removed"), [])
+        self.assertEqual(self.batch(), ("", ""))
+        self.assertTrue(any("#1 held: it changes .github/workflows/x.yml" in line for line in lines), lines)
+        self.assertEqual(merger.writes, [])
+
+    def test_an_approved_workflow_batch_moves_its_refs_with_the_app_token(self):
+        head, node = self.approved_workflow_pr()
+        h2 = self.pr_branch(2, "c.txt", "c\n")
+        fake = FakeGitHub([node, ready_node(2, h2, "pr2")], self.main)
+        self.queue(fake, 1, head, 20)
+        self.queue(fake, 2, h2, 10)
+        self.approve(fake, 1, head)
+        merger = FakeAppGitHub([], self.main)
+        build = self.step(fake, merger)
+        lines = build.run()
+        name, tip = self.batch()
+        self.assertTrue(name, lines)
+        self.assertEqual([m["pr"] for m in self.members(name)], [1, 2])
+        # The push swapped the clone's Actions-token header for the app's, through the
+        # environment (file:// ignores it here; the keys are what reaches git on Actions).
+        self.assertEqual(len(build.pushes), 1)
+        env = build.pushes[0]
+        self.assertEqual((env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_VALUE_0"]), ("2", ""))
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_KEY_1"])
+        self.assertTrue(env["GIT_CONFIG_VALUE_1"].startswith("AUTHORIZATION: basic "))
+        self.assertEqual(fake.dispatched, [("ci.yml", name, {"lanes": "changed"})],
+                         "dispatched with the Actions token, so is_gate_run recognises it")
+        self.assertEqual(merger.dispatched, [])
+        self.assertEqual(merger.writes, [], "comments and labels stay on the Actions token")
+
+        fake.writes.clear()
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake, merger).run()
+        main_moves = ("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False})
+        self.assertIn(main_moves, merger.writes, lines)
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes)
+        self.assertEqual([w for w in merger.writes if "/issues/" in w[1]], [])
+        self.assertNotIn(main_moves, fake.writes)
+        self.assertEqual(sorted(fake.posted("merged")), [1, 2])
+
+    def test_the_token_is_not_used_for_a_batch_without_workflow_changes(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake = FakeGitHub([ready_node(1, h1, "pr1")], self.main)
+        self.queue(fake, 1, h1, 20)
+        merger = FakeAppGitHub([], self.main)
+        build = self.step(fake, merger)
+        build.run()
+        name, tip = self.batch()
+        self.assertTrue(name)
+        self.assertEqual(build.pushes, [{}], "pushed with the clone's own (Actions) credential")
+        self.run_on(fake, name, tip, conclusion="success")
+        self.step(fake, merger).run()
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        self.assertEqual(merger.writes, [])
+
+    def renamed_out(self, number, source, destination):
+        """PR `number` renames `source` (put on main first) to `destination`; its GitHub
+        file list names only the destination, as GitHub may (Codex P1 on #1311)."""
+        sh(self.work, "checkout", "-q", "main")
+        self.write(source, "guarded\n")
+        self.main = self.commit("guarded file on main")
+        sh(self.work, "push", "-q", "origin", "main")
+        sh(self.work, "checkout", "-q", "-b", f"pr{number}", self.main)
+        os.makedirs(os.path.join(self.work, os.path.dirname(destination)), exist_ok=True)
+        sh(self.work, "mv", source, destination)
+        head = self.commit(f"pr {number}: rename")
+        sh(self.work, "push", "-q", "origin", f"HEAD:refs/pull/{number}/head")
+        sh(self.work, "checkout", "-q", "main")
+        return head, ready_node(number, head, f"pr{number}", files=(destination,))
+
+    def test_a_rename_out_of_a_guarded_directory_still_needs_alex(self):
+        for source, destination in ((".github/workflows/x.yml", "elsewhere/x.yml"),
+                                    ("Tools/coord/coordlib/x.py", "elsewhere/x.py")):
+            with self.subTest(source=source):
+                self.setUp()
+                head, node = self.renamed_out(1, source, destination)
+                fake = FakeGitHub([node], self.main)
+                self.queue(fake, 1, head, 20)
+                merger = FakeAppGitHub([], self.main)
+                lines = self.step(fake, merger).run()
+                self.assertEqual(self.batch(), ("", ""), lines)
+                self.assertTrue(any(f"#1 held: it changes {source}" in line for line in lines), lines)
+                self.assertEqual(merger.writes, [])
+
+    def test_a_batch_that_removes_the_ci_gate_is_deleted_and_its_workflow_pr_removed(self):
+        # PR 1 renames ci.yml away (Alex approved it); PR 2 is ordinary. GitHub refuses
+        # the dispatch at the batch ref, which no longer has ci.yml (Codex P1 on #1311).
+        head, node = self.renamed_out(1, ".github/workflows/ci.yml", "old/ci.yml")
+        node["labels"]["nodes"].append({"name": "alex-approved"})
+        h2 = self.pr_branch(2, "c.txt", "c\n")
+        fake = FakeGitHub([node, ready_node(2, h2, "pr2")], self.main)
+        self.queue(fake, 1, head, 20)
+        self.queue(fake, 2, h2, 10)
+        self.approve(fake, 1, head)
+        fake.dispatch_error = "HTTP 404: Not Found (workflow ci.yml not found at ref)"
+        merger = FakeAppGitHub([], self.main)
+        lines = self.step(fake, merger).run()
+        name, _ = self.batch()  # the fake records the delete; it does not perform it
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes,
+                      "the gateless batch must not stay at the front")
+        self.assertEqual(fake.posted("removed"), [1], "only the PR that changes workflow files leaves")
+        self.assertEqual(fake.posted("testing"), [])
+
+    def test_a_transient_dispatch_failure_deletes_the_batch_but_removes_nobody(self):
+        head, node = self.approved_workflow_pr()
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        self.approve(fake, 1, head)
+        fake.dispatch_error = "HTTP 502 (injected)"
+        merger = FakeAppGitHub([], self.main)
+        lines = self.step(fake, merger).run()
+        name, _ = self.batch()
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes, lines)
+        self.assertEqual(fake.posted("removed"), [], "a passing outage removes nobody; the next step rebuilds")
+
+    def test_a_truncated_file_list_is_completed_with_both_sides_of_a_rename(self):
+        fake = FakeGitHub([], self.main)
+        fake.rest_paginated = lambda path: [{"filename": "elsewhere/x.yml", "previous_filename": ".github/workflows/x.yml"}]
+        files = self.step(fake).all_files({"number": 1, "filesTruncated": True})
+        self.assertEqual(sorted(files), [".github/workflows/x.yml", "elsewhere/x.yml"])
+
+    def test_a_workflow_batch_whose_token_is_gone_does_not_move_main(self):
+        head, node = self.approved_workflow_pr()
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        self.approve(fake, 1, head)
+        self.step(fake, FakeAppGitHub([], self.main)).run()
+        name, tip = self.batch()
+        self.assertTrue(name)
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.writes.clear()
+        lines = self.step(fake).run()  # the next step could not mint the token
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertTrue(any("no app token" in line for line in lines), lines)
+        self.assertTrue(any("#1 is no longer ready" in line for line in lines), lines)
 
 
 if __name__ == "__main__":

@@ -56,6 +56,15 @@ BATCH_CAP = 3
 CI_WORKFLOW = "ci.yml"
 CI_LANES = "changed"
 WORKFLOW_DIR = ".github/workflows/"
+# The inisa-sidechain app's installation token, minted by merge-train.yml with contents
+# and workflows write, for the batch pushes and main moves that carry workflow changes.
+# Unset: workflow PRs are dropped for a hand merge, as before the app had the permission.
+WORKFLOW_TOKEN_ENV = "COORD_TRAIN_APP_TOKEN"
+# What coord's own views (`train add`, `train status`, the board, the conductor's stuck
+# check) assume, since they cannot see whether the Actions step will hold that token:
+# that it will (Alex granted the app workflows write, 2026-10-04). Only the step decides;
+# without the token it takes the PR out with the hand-merge comment.
+VIEWS_ASSUME_WORKFLOW_TOKEN = True
 # What governs the unattended conductor: its standing orders, the settings, hooks and
 # deny list its runs load, and the watcher that starts them. The conductor must not be
 # able to widen its own powers through the train, so these wait for Alex's approval of
@@ -126,19 +135,24 @@ LABELS = {
 
 
 def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
-                all_files: Optional[Sequence[str]] = None) -> Tuple[str, str]:
+                all_files: Optional[Sequence[str]] = None, workflow_token: bool = False) -> Tuple[str, str]:
     """(READY | HOLD | DROP, reason). HOLD waits and retries; DROP removes the label.
 
     `all_files` is the complete file list when the summary's list was truncated.
     """
-    verdict, _, reason = assess(pr, head_at_add, all_files)
+    verdict, _, reason = assess(pr, head_at_add, all_files, workflow_token)
     return verdict, reason
 
 
 def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
-           all_files: Optional[Sequence[str]] = None) -> Tuple[str, str, str]:
+           all_files: Optional[Sequence[str]] = None, workflow_token: bool = False) -> Tuple[str, str, str]:
     """(verdict, hold class, reason): `eligibility` plus, for a HOLD, which of
-    HOLD_CLASSES it is ("" for READY and DROP)."""
+    HOLD_CLASSES it is ("" for READY and DROP).
+
+    `workflow_token`: the step holds the inisa-sidechain app's installation token, which
+    may push workflow files (merge-train.yml mints it). Without it a PR that changes
+    `.github/workflows/` is dropped, since the Actions token cannot move main onto it;
+    with it, such a PR waits for Alex's approval of its head, like ALEX_ONLY_PATHS."""
     files = list(all_files) if all_files is not None else pr.get("files", [])
     labels = set(pr.get("labels", []))
     if pr.get("base") != "main":
@@ -149,11 +163,16 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         return DROP, "", (f"its head moved from {head_at_add[:9]} to {str(pr.get('head'))[:9]} after it was added; "
                           "add it again once the new head is reviewed")
     touched = [f for f in files if f.startswith(WORKFLOW_DIR)]
-    if touched:
+    if touched and not workflow_token:
         return DROP, "", (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
                           "so this PR is merged by hand")
+    approved_at_head = ALEX_APPROVED_LABEL in labels and pr.get("alexApprovedHead") == pr.get("head")
+    if touched and not approved_at_head:
+        # CI itself, and the train's own workflow: the app token can merge it, Alex decides.
+        return HOLD, HOLD_NEEDS_ALEX, (f"it changes {touched[0]}, a workflow file the train merges only at a head "
+                                       "Alex approved (`coord train approve`)")
     guarded = [f for f in files if any(f == p or f.startswith(p) for p in ALEX_ONLY_PATHS)]
-    if guarded and not (ALEX_APPROVED_LABEL in labels and pr.get("alexApprovedHead") == pr.get("head")):
+    if guarded and not approved_at_head:
         return HOLD, HOLD_NEEDS_ALEX, (f"it changes {guarded[0]}, which governs the unattended conductor; "
                                        "Alex approves its head (`coord train approve`)")
     if pr.get("mergeable") == "CONFLICTING":

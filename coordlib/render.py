@@ -242,7 +242,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
     for position, entry in enumerate(snapshot["train"], start=1):
         by = f" by {entry['agent']}" if entry.get("agent") else ""
         pr = prs.get(entry["pr"])
-        verdict, reason = train.eligibility(pr, entry.get("headAtAdd")) if pr else (train.DROP, "not open")
+        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+                           if pr else (train.DROP, "not open"))
         state = "ready" if verdict == train.READY else ("held: " if verdict == train.HOLD else "will be removed: ") + reason
         lines.append(f"  {position}. PR #{entry['pr']} · added {ago(entry['addedAt'], now)} ago{by} · {state}")
     lines.append("")

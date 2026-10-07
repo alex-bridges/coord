@@ -258,7 +258,7 @@ def stuck_reasons(snap: Dict[str, Any], now: dt.datetime) -> List[Dict[str, Any]
         added = _time(entry.get("addedAt"))
         if pr is None or added is None or now - added < STUCK_AFTER:
             continue
-        verdict, why = train.eligibility(pr, entry.get("headAtAdd"))
+        verdict, why = train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
         if verdict == train.READY:
             continue
         out.append(reason(f"stuck:{pr['number']}:{pr['head'][:12]}", "stuck",

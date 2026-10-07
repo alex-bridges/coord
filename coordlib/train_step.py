@@ -26,6 +26,7 @@ fetches only the blobs a merge actually needs, instead of checking out main's
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import os
 import re
@@ -82,7 +83,8 @@ class Git:
 class Step:
     def __init__(self, gh: GitHub, git: Git, mode: str, now: Optional[dt.datetime] = None,
                  agent: str = TRAIN_AGENT, log: Callable[[str], None] = print,
-                 sleep: Callable[[float], None] = time.sleep, requester: Optional[GitHub] = None):
+                 sleep: Callable[[float], None] = time.sleep, requester: Optional[GitHub] = None,
+                 merger: Optional[GitHub] = None):
         if mode not in ("dry-run", "live"):
             raise ValueError(f"mode must be dry-run or live, not {mode!r}")
         self.gh = gh
@@ -94,6 +96,13 @@ class Step:
         self.sleep = sleep
         # Who posts `@codex review` (#1101): the step's own identity unless told otherwise.
         self.requester = requester or gh
+        # The inisa-sidechain app's installation token (train.WORKFLOW_TOKEN_ENV), or None.
+        # It moves refs only for a batch that changes .github/workflows/: comments, labels
+        # and CI dispatches stay on the Actions token (so `is_gate_run` still recognises
+        # the train's own gate runs), and ordinary batches never touch it.
+        self.merger = merger
+        self.workflow_token = merger is not None
+        self.ref_writer = gh  # who pushes, moves, deletes and re-reads the refs of the batch at hand
         self.closed_batch = False
         self.lines: List[str] = []
         self._labels_ready = False
@@ -128,10 +137,34 @@ class Step:
 
     def delete_branch(self, name: str) -> None:
         try:
-            self.gh.rest(f"repos/{{repo}}/git/refs/heads/{name}", method="DELETE")
+            self.ref_writer.rest(f"repos/{{repo}}/git/refs/heads/{name}", method="DELETE")
             self.closed_batch = True
         except (NotFound, GitHubError) as error:
             self.note(f"could not delete {name}: {error}")
+
+    def changes_workflows(self, base: str, tip: str) -> bool:
+        """Whether base..tip changes a file under .github/workflows/. A diff that fails
+        counts as a change: the batch then needs the app token."""
+        result = self.git.run("diff", "--name-only", "--no-renames", "-z", base, tip, "--", train.WORKFLOW_DIR,
+                              check=False)
+        return result.returncode != 0 or bool(result.stdout.strip("\0"))
+
+    def choose_ref_writer(self, workflow_batch: bool) -> bool:
+        """Point `ref_writer` at the client that moves this batch's refs: the app for a
+        workflow batch, the Actions token otherwise. False when a workflow batch has no
+        app token to move it (the Actions token is then left in place, and GitHub refuses)."""
+        self.ref_writer = self.merger if workflow_batch and self.merger is not None else self.gh
+        return not workflow_batch or self.merger is not None
+
+    def app_push_env(self) -> Dict[str, str]:
+        """Git config, through the environment so the token never reaches argv, that swaps
+        the clone's Actions-token header for the app's on one push. The empty value first
+        resets the multi-valued http.extraheader the clone step configured."""
+        assert self.merger is not None
+        credential = base64.b64encode(f"x-access-token:{self.merger.token()}".encode()).decode()
+        key = "http.https://github.com/.extraheader"
+        return {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": key, "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": key, "GIT_CONFIG_VALUE_1": f"AUTHORIZATION: basic {credential}"}
 
     def runs_at(self, name: str, tip: str) -> List[Dict[str, Any]]:
         pages = self.gh.rest_paginated(
@@ -434,9 +467,21 @@ class Step:
         self.note(f"#{number}: asked Codex to review {head[:9]}: {reason}")
 
     def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
+        """The PR's complete file list when the summary's was cut short, both sides of
+        every rename (snapshot.rest_files), else None."""
         if not pr.get("filesTruncated"):
             return None
-        return [f["filename"] for f in self.gh.rest_paginated(f"repos/{{repo}}/pulls/{pr['number']}/files?per_page=100")]
+        return snapshot.rest_files(self.gh, pr["number"])
+
+    def gate_files(self, pr: Dict[str, Any], main: str) -> List[str]:
+        """The paths train.assess gates on (workflow files, ALEX_ONLY_PATHS): GitHub's list
+        plus what git itself will merge, `git diff --no-renames` from the merge base, which
+        names both sides of a rename whatever GitHub's list says. A path renamed out of a
+        guarded directory therefore still needs Alex's approval (Codex on #1311)."""
+        listed = self.all_files(pr)
+        paths = list(listed if listed is not None else pr.get("files") or [])
+        diff = self.changed_paths(main, pr["number"], pr["head"]) if pr.get("head") else None
+        return paths + [path for path in diff or [] if path not in paths]
 
     def lane_classes(self, main: str, ready: List[Dict[str, Any]]) -> Dict[int, str]:
         """LIGHT or HEAVY for each ready PR (train.LaneClassifier), judged by the lane
@@ -600,6 +645,11 @@ class Step:
             self.note(f"{name}: its commit chain or merge trees do not match the train's build; deleting the batch")
             self.delete_branch(name)
             return
+        if not self.choose_ref_writer(self.changes_workflows(base, tip)):
+            # Built while the step had the app token, which this one lacks. The final check
+            # below then finds its workflow PR no longer ready and the batch is rebuilt.
+            self.note(f"{name}: it changes .github/workflows/ and this step has no app token "
+                      f"({train.WORKFLOW_TOKEN_ENV})")
         numbers = ", ".join(f"#{m['pr']}" for m in members)
         run = self.settle(name, tip, self.batch_run(name, tip))
         message = self.git.out("log", "-1", "--format=%B", tip)
@@ -724,7 +774,8 @@ class Step:
                 problem = "was taken out of the train"
             else:
                 self.train_added(pr)  # refresh the recorded-review and approval heads for the final check
-                verdict, hold, reason = train.assess(pr, all_files=self.all_files(pr))
+                verdict, hold, reason = train.assess(pr, all_files=self.gate_files(pr, main),
+                                                     workflow_token=self.workflow_token)
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"
             if problem:
@@ -736,13 +787,13 @@ class Step:
                 return
         if self.mode == "live":
             try:
-                self.gh.rest("repos/{repo}/git/refs/heads/main", method="PATCH", body={"sha": tip, "force": False})
+                self.ref_writer.rest("repos/{repo}/git/refs/heads/main", method="PATCH", body={"sha": tip, "force": False})
             except GitHubError as error:
                 # The update may have been applied with its response lost. The batch
                 # branch is the only record of what to clean up, so look before deleting
                 # it, and keep it when even that cannot be told (Codex on #989).
                 try:
-                    now_main = ((self.gh.rest("repos/{repo}/git/ref/heads/main") or {}).get("object") or {}).get("sha")
+                    now_main = ((self.ref_writer.rest("repos/{repo}/git/ref/heads/main") or {}).get("object") or {}).get("sha")
                 except GitHubError as reread:
                     self.note(f"{name} ({numbers}): main update failed ({error}) and main cannot be re-read "
                               f"({reread}); keeping the batch for the next step")
@@ -790,7 +841,8 @@ class Step:
         for pr in queued:
             added = self.train_added(pr)
             entries.append({"pr": pr["number"], "at": added.get("at") or "9999"})
-            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.all_files(pr))
+            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.gate_files(pr, main),
+                                                                workflow_token=self.workflow_token)
             verdicts[pr["number"]] = (verdict, reason)
         entries.sort(key=lambda e: (e["at"], e["pr"]))
         classes = self.lane_classes(main, [prs[n] for n in verdicts if verdicts[n][0] == train.READY])
@@ -863,6 +915,12 @@ class Step:
         tip = self.git.out("commit-tree", tree, "-p", last_parent, "-p", last_head, *paragraphs[:-2],
                            "-m", paragraphs[-1] + "\n" + train.plan_trailer(plan), env=identity)
         self._receipt = dict(plan, tip=tip, run=None)
+        # The Actions token cannot push a branch that changes workflow files; the app can.
+        workflow_batch = any(path.startswith(train.WORKFLOW_DIR) for path in paths)
+        if not self.choose_ref_writer(workflow_batch):
+            # Unreachable while assess() drops workflow PRs without the token; a guard.
+            self.note(f"{name}: it changes .github/workflows/ and this step has no app token; not pushing it")
+            return
         if not self.request_ci("dispatch"):
             return
         if chosen["overtakes"]:
@@ -875,8 +933,17 @@ class Step:
                 f"heavy CI lanes. At most one light batch goes ahead of ready heavy work; heavy goes next."
             ), train.OVERTAKEN_EVENT, batch=name, members=merged)
             self.note(f"{name}: light, ahead of heavy #{chosen['overtakes']} (its one overtake)")
-        self.git.out("push", "--quiet", "origin", f"{tip}:refs/heads/{name}")
-        self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+        self.git.out("push", "--quiet", "origin", f"{tip}:refs/heads/{name}",
+                     env=self.app_push_env() if workflow_batch else None)
+        if workflow_batch:
+            self.note(f"{name}: it changes .github/workflows/; pushed with the inisa-sidechain app token")
+        try:
+            self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+        except GitHubError as error:
+            if not workflow_batch:
+                raise
+            self.refuse_gateless_batch(name, main, member_heads, prs, error)
+            return
         numbers = ", ".join(f"#{n}" for n in merged)
         for number in merged:
             self.comment(number, (
@@ -884,6 +951,31 @@ class Step:
                 f"({'live' if self.mode == 'live' else 'dry run'})."
             ), "testing", batch=name, tip=tip, members=merged)
         self.note(f"{name}: built {numbers} on main {main[:9]} -> {tip[:9]}; dispatched ci.yml lanes={train.CI_LANES}")
+
+
+    def refuse_gateless_batch(self, name: str, main: str, member_heads: List[Dict[str, Any]],
+                              prs: Dict[int, Dict[str, Any]], error: GitHubError) -> None:
+        """A workflow batch whose ci.yml GitHub would not dispatch: the batch deleted,
+        renamed or broke the gate it is meant to be tested by (Codex P1 on #1311). Left at
+        the front, the batch would block every PR behind it. The branch goes; when GitHub
+        refused the workflow itself (404 or 422, not a passing outage) the PRs that change
+        workflow files leave the train for a hand merge, and the rest wait for the next batch."""
+        self.note(f"{name}: ci.yml could not be dispatched on the batch ({error}); deleting it")
+        self.record_outcome("abandoned", f"Merge train: `{name}` has no dispatchable ci.yml; deleting the batch.")
+        self.delete_branch(name)
+        if not re.search(r"\b(404|422)\b", str(error)):
+            return  # possibly transient: the next step rebuilds and tries again
+        for member in member_heads:
+            number, head = member["pr"], member["head"]
+            base = self.git.run("merge-base", main, head, check=False).stdout.strip()
+            if base and not self.changes_workflows(base, head):
+                continue
+            reason = (f"ci.yml, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
+                      f"{train.WORKFLOW_DIR} in a way that removes or breaks the gate, so this PR is merged by hand")
+            self.remove_label(number, train.TRAIN_LABEL)
+            self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason,
+                         to=self.recipients(prs.get(number)))
+            self.note(f"#{number} removed: {reason}")
 
 
 def ensure_labels(gh: GitHub) -> None:
