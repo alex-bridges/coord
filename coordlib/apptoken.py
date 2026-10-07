@@ -415,7 +415,6 @@ class AppTokens:
         security_binary(client_id=self.config["client_id"])
         if kind in self._failures:
             raise AppAuthError(self._failures[kind])
-        minted = False
         try:
             entry = self.cached(kind)
             if entry is None:
@@ -425,11 +424,10 @@ class AppTokens:
                     if entry is None:
                         self._check_failed(kind)  # or failed meanwhile
                         entry = self._mint_remembering_failure(kind)
-                        minted = True
             # Cleanup takes the OTHER kind's lock. Release our mint lock first:
             # read and ops can discover a reinstall concurrently, in either order.
-            if minted:
-                self._forget_other_installations(kind, entry["installation_id"])
+            # A cached replacement retries cleanup skipped by an earlier busy lock.
+            self._forget_other_installations(kind, entry)
         except AppAuthError as error:
             message = redact(str(error))
             for failed in getattr(error, "kinds", (kind,)):
@@ -693,6 +691,13 @@ class AppTokens:
             raise _staged(error, "mint", (kind,)) from None
 
     def _mint_with(self, kind: str, jwt: str, installation: int) -> Dict[str, Any]:
+        # Retain rejection evidence through refreshes of this installation's token.
+        # Successful minting/discovery alone cannot order two different installations.
+        previous = _read_json(self.path(kind))
+        rejected = previous.get("rejected_installation_ids") if previous and self._same_config(previous) \
+            and previous.get("installation_id") == installation and self._private_file(self.path(kind)) else None
+        rejected = {value for value in rejected if _is_int(value) and value > 0} \
+            if isinstance(rejected, list) else set()
         body = {"repositories": [self.name], "permissions": PERMISSIONS[kind]}
         path = f"app/installations/{installation}/access_tokens"
         try:
@@ -700,6 +705,7 @@ class AppTokens:
         except AppAuthError as error:
             if getattr(error, "status", None) != 404:
                 raise
+            rejected.add(installation)
             installation = self._discover(jwt)  # the cached installation is gone: find it again, once
             path = f"app/installations/{installation}/access_tokens"
             minted = self._call("POST", path, jwt, body)
@@ -718,31 +724,53 @@ class AppTokens:
                  "client_id": self.config["client_id"], "repo": self.config["repo"], "minted_at": int(self._clock())}
         if expiry_epoch(entry) is None:
             raise AppAuthError(f"POST {path} answered no usable expires_at")
+        rejected.discard(installation)
+        if rejected:
+            entry["rejected_installation_ids"] = sorted(rejected)
         self._store(kind, entry)
         self.mints += 1
         return entry
 
-    def _forget_other_installations(self, kind: str, installation: int) -> None:
-        """Best-effort removal of the other kind's obsolete installation token.
+    def _forget_other_installations(self, kind: str, replacement: Dict[str, Any]) -> None:
+        """Best-effort removal of a token for an exact installation GitHub rejected.
 
         Call without a mint lock held; skip a busy or unavailable other-kind lock so
-        cleanup never delays or fails our successful mint. Holds name no installation:
-        leave them for their owning kind's success or expiry, even beside an old token.
+        cleanup never delays or fails a successful token lookup. A differing id or a
+        mint timestamp is not rejection evidence: an older mint may finish last. Fresh
+        discovery without a 404 leaves ambiguous entries for refusal/expiry/remint.
+        Holds name no installation: leave them for their owning kind's success or expiry.
         """
+        rejected = replacement.get("rejected_installation_ids")
+        rejected = {value for value in rejected if _is_int(value) and value > 0
+                    and value != replacement["installation_id"]} \
+            if isinstance(rejected, list) else set()
+        if not rejected:
+            return
         for other in KINDS:
-            # Avoid waiting on an unrelated mint when no obsolete entry exists.
-            entry = _read_json(self.path(other)) if other != kind else None
-            if not entry or not self._same_config(entry) or not _is_int(entry.get("installation_id")) \
-                    or entry["installation_id"] == installation:
+            if other == kind:
                 continue
-            with contextlib.suppress(AppAuthError), self._lock(other, timeout=0):
-                # The other mint may have replaced the old entry since our peek.
-                entry = _read_json(self.path(other))
-                if not entry or not self._same_config(entry) or not _is_int(entry.get("installation_id")) \
-                        or entry["installation_id"] == installation:
-                    continue
-                with contextlib.suppress(OSError):
-                    os.unlink(self.path(other))
+            try:
+                # Even an absent cache may have an old mint in flight. Establish
+                # quiescence under its lock before retiring any rejection evidence.
+                with self._lock(other, timeout=0):
+                    path = self.path(other)
+                    entry = _read_json(path)
+                    if entry is None and os.path.lexists(path):
+                        return  # unreadable: retain proof for a later attempt
+                    if entry and self._same_config(entry) and _is_int(entry.get("installation_id")) \
+                            and entry["installation_id"] in rejected:
+                        os.unlink(path)
+            except (AppAuthError, OSError):
+                return  # optional cleanup must not fail or delay this token lookup
+
+        # All other-kind old mints have finished and their rejected tokens are gone.
+        # Release those locks before clearing the proof under our own lock, and do
+        # not overwrite a replacement committed since this lookup read its token.
+        with contextlib.suppress(AppAuthError), self._lock(kind, timeout=0):
+            if _read_json(self.path(kind)) == replacement:
+                pruned = dict(replacement)
+                pruned.pop("rejected_installation_ids", None)
+                self._write_private(self.path(kind), pruned)
 
 
 def _staged(error: Exception, stage: str, kinds: Sequence[str]) -> AppAuthError:
