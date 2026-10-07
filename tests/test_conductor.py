@@ -193,13 +193,15 @@ class ReasonTests(unittest.TestCase):
             {"id": 3, "reason": "to conductor@*", "from": "train@actions", "on": 9, "text": "held", "url": "u3"},
             {"id": 4, "reason": "to conductor@*", "from": "train@actions", "on": 9, "text": "held", "url": "u4"},
             {"id": 5, "reason": "to conductor@*", "from": "train@actions", "on": 9, "text": "out", "url": "u5"},
+            {"id": 6, "reason": "to conductor@*", "from": "train@actions", "on": 9, "text": "git unavailable", "url": "u6"},
         ]
         payloads = {3: {"kind": "train", "event": "held", "hold": "no-review"},
                     4: {"kind": "train", "event": "held", "hold": "ci-red"},
-                    5: {"kind": "train", "event": "ejected"}}
+                    5: {"kind": "train", "event": "ejected"},
+                    6: {"kind": "train", "event": "held", "hold": "merge-check"}}
         wakes = {r["key"]: r["wake"] for r in conductor.message_reasons(items, payloads)}
         self.assertEqual(wakes, {"comment:1": True, "comment:2": False, "comment:3": False,
-                                 "comment:4": True, "comment:5": True})
+                                 "comment:4": True, "comment:5": True, "comment:6": True})
 
     def test_only_the_newest_completed_run_counts(self):
         red = {"id": 2, "status": "completed", "conclusion": "failure", "name": "CI", "event": "push", "head_sha": "abc"}
