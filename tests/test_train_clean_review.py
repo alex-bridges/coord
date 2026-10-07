@@ -97,6 +97,7 @@ class RuleTests(unittest.TestCase):
         Codex and nothing else."""
         reviewed = self.pr(reviewedHead=HEAD)
         holds = [
+            ("an unverified GitHub conflict report", dict(reviewed, mergeable="CONFLICTING"), train.HOLD_MERGE_CHECK),
             ("needs-alex, not approved", dict(reviewed, labels=["train", "needs-alex"]), train.HOLD_NEEDS_ALEX),
             ("needs-alex, an older head approved",
              dict(reviewed, labels=["train", "needs-alex", "alex-approved"], alexApprovedHead=OLDER),
@@ -114,7 +115,6 @@ class RuleTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(train.assess(pr)[:2], (train.HOLD, hold))
         drops = [
-            ("a conflict with main", dict(reviewed, mergeable="CONFLICTING"), {}),
             ("a head moved since it was added", reviewed, {"head_at_add": OLDER}),
             ("a workflow change", dict(reviewed, files=[".github/workflows/ci.yml"]), {}),
             ("a fork", dict(reviewed, fromFork=True), {}),
