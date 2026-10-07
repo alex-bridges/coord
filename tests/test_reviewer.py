@@ -1580,6 +1580,7 @@ class CodexRound16Tests(ReviewFlowTests):
 
 
 class CodexRound17Tests(ReviewFlowTests):
+    @unittest.skipUnless(sys.platform == "darwin", "reviewer run-tag cleanup uses macOS ps -E")
     def test_s1_a_run_tagged_process_is_killed_wherever_it_went(self):
         tag = "ab" * 8
         env = dict(os.environ, COORD_REVIEW_RUN=tag)
@@ -1593,6 +1594,8 @@ class CodexRound17Tests(ReviewFlowTests):
             self.assertEqual(child.wait(timeout=10), -9)
             self.assertIsNone(other.poll(), "another run's processes are left alone")
         finally:
+            child.kill()
+            child.wait()
             other.kill()
             other.wait()
 
