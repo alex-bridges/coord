@@ -497,10 +497,11 @@ def is_gate_run(run: Dict[str, Any], tip: str) -> bool:
 def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
     """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon.
 
-    Only a plain `failure` can be the PRs' fault. `timed_out` and `startup_failure` are
-    what a lost runner, a full disk or a hung machine look like, so they abandon the
-    batch (rebuild later, within the daily budget) instead of splitting it and
-    ejecting PRs one by one (substitute review of #989).
+    A plain `failure` retries then splits or ejects. Infrastructure conclusions
+    abandon the batch for a later rebuild instead of blaming ordinary PRs
+    (substitute review of #989). Step handles one narrower case separately:
+    `startup_failure` on a workflow-changing batch removes its workflow members
+    for manual gate review, so the same broken workflow is not rebuilt forever.
     """
     if run is None:
         return "dispatch"
