@@ -1313,6 +1313,25 @@ class NotRunGraphQLTests(unittest.TestCase):
         self.assertEqual(self.ci(fake)["verdict"], "success")
         self.assertEqual(fake.paths, [])
 
+    def test_null_ids_that_need_no_annotations_cost_no_call(self):
+        for conclusion, status in (("SUCCESS", "COMPLETED"), ("SKIPPED", "COMPLETED"),
+                                   ("CANCELLED", "COMPLETED"), (None, "IN_PROGRESS"),
+                                   (None, "QUEUED")):
+            with self.subTest(conclusion=conclusion, status=status):
+                context = dict(self.run_node(None, "CI verdict", conclusion, status=status),
+                               id="CR_64_bit_run")
+                fake = self.Fake(contexts=[context], annotations={})
+                self.ci(fake)
+                self.assertEqual(fake.paths, [])
+                self.assertIsNone(context["databaseId"])
+
+    def test_failed_null_id_with_zero_annotations_stays_red_without_a_call(self):
+        context = dict(self.run_node(None, LINUX, "FAILURE"),
+                       id="CR_64_bit_run", annotationsCount=0)
+        fake = self.Fake(contexts=[context], annotations={})
+        self.assertEqual(self.ci(fake)["failing"], [LINUX])
+        self.assertEqual(fake.paths, [])
+
     def test_a_red_head_without_a_refusal_lists_no_attempts(self):
         fake = self.Fake(contexts=[self.run_node(3, "Android", "FAILURE"), self.run_node(4, "AppGamma", "FAILURE")],
                          annotations={3: [REAL_FAILURE], 4: []})

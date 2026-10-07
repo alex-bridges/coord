@@ -154,7 +154,8 @@ def attach_first_annotations(gh: GitHub, sha: str, contexts: List[Dict[str, Any]
         budget[0] -= 1
         return True
 
-    missing = [c for c in contexts if c.get("__typename") == "CheckRun"
+    missing = [c for c in contexts if review.needs_first_annotation(c)
+               and c.get("annotationsCount") != 0
                and c.get("databaseId") is None and c.get("id")]
     if missing and spend():
         ids = {c["id"]: c for c in missing}
