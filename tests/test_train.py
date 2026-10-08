@@ -2069,6 +2069,77 @@ class WorkflowTokenStepTests(unittest.TestCase):
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes, lines)
         self.assertEqual(fake.posted("removed"), [], "a passing outage removes nobody; the next step rebuilds")
 
+    def test_workflow_startup_failure_removes_only_workflow_members_without_retry(self):
+        for attempt in (1, 2):
+            with self.subTest(attempt=attempt):
+                self.setUp()
+                head, node = self.approved_workflow_pr()
+                h2 = self.pr_branch(2, "c.txt", "ordinary change\n")
+                fake = FakeGitHub([node, ready_node(2, h2, "pr2")], self.main)
+                self.queue(fake, 1, head, 20)
+                fake.issue_comments[1][0]["body"] = compose_record("added", {
+                    "kind": "train-add", "pr": 1, "head": head, "agent": "worker@x", "fallback": "lead@y"})
+                self.queue(fake, 2, h2, 10)
+                self.approve(fake, 1, head)
+                merger = FakeAppGitHub([], self.main)
+                self.step(fake, merger).run()
+                name, tip = self.batch()
+                self.assertEqual([m["pr"] for m in self.members(name)], [1, 2])
+                self.run_on(fake, name, tip, conclusion="startup_failure", run_attempt=attempt)
+                fake.writes.clear()
+                merger.writes.clear()
+                fake.dispatched.clear()
+
+                self.step(fake, merger).run()
+
+                self.assertEqual(fake.posted("removed"), [1])
+                self.assertIn(("DELETE", "repos/{repo}/issues/1/labels/train", None), fake.writes)
+                self.assertNotIn(("DELETE", "repos/{repo}/issues/2/labels/train", None), fake.writes)
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes)
+                self.assertFalse(any("rerun" in path for _, path, _ in fake.writes))
+                self.assertEqual(fake.dispatched, [("merge-train.yml", "main", None)],
+                                 "wake the next train step without retrying this CI batch")
+                self.assertFalse(any(method == "PATCH" for method, _, _ in merger.writes))
+                notices = [body["body"] for method, path, body in fake.writes
+                           if method == "POST" and path.endswith("/issues/1/comments")
+                           and (marker.decode(body["body"]) or {}).get("event") == "removed"]
+                self.assertEqual(len(notices), 1)
+                self.assertIn("startup_failure", notices[0])
+                self.assertIn("run-url", notices[0])
+                self.assertEqual(marker.recipients(marker.decode(notices[0])),
+                                 ["worker@x", "lead@y", "conductor@*"])
+
+    def test_startup_failure_without_workflow_changes_removes_nobody(self):
+        head = self.pr_branch(1, "c.txt", "ordinary change\n")
+        fake = FakeGitHub([ready_node(1, head, "pr1")], self.main)
+        self.queue(fake, 1, head, 20)
+        self.step(fake).run()
+        name, tip = self.batch()
+        self.run_on(fake, name, tip, conclusion="startup_failure")
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertEqual(fake.posted("removed"), [])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertFalse(any("/labels/" in path for _, path, _ in fake.writes))
+
+    def test_workflow_timeout_or_cancellation_still_removes_nobody(self):
+        for conclusion in ("timed_out", "cancelled"):
+            with self.subTest(conclusion=conclusion):
+                self.setUp()
+                head, node = self.approved_workflow_pr()
+                fake = FakeGitHub([node], self.main)
+                self.queue(fake, 1, head, 20)
+                self.approve(fake, 1, head)
+                merger = FakeAppGitHub([], self.main)
+                self.step(fake, merger).run()
+                name, tip = self.batch()
+                self.run_on(fake, name, tip, conclusion=conclusion)
+                fake.writes.clear()
+                merger.writes.clear()
+                self.step(fake, merger).run()
+                self.assertEqual(fake.posted("removed"), [])
+                self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes)
+
     def test_a_truncated_file_list_is_completed_with_both_sides_of_a_rename(self):
         fake = FakeGitHub([], self.main)
         fake.rest_paginated = lambda path: [{"filename": "elsewhere/x.yml", "previous_filename": ".github/workflows/x.yml"}]

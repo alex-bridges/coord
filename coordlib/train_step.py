@@ -705,6 +705,16 @@ class Step:
             self.note(f"{name} ({numbers}): CI red on attempt {run.get('run_attempt')}; re-running the failed jobs once {url}")
             return
         if action == "abandon":
+            if run.get("conclusion") == "startup_failure" and self.changes_workflows(base, tip):
+                # GitHub accepted the dispatch but could not start this workflow. Rebuilding
+                # the same workflow batch repeats that failure until the daily budget expires.
+                reason = (f"ci.yml ended in startup_failure after dispatch: {url}; this PR changes "
+                          f"{train.WORKFLOW_DIR} and needs a manual gate review before it is re-added")
+                self.note(f"{name} ({numbers}): CI startup_failure; deleting the batch and removing workflow members")
+                self.record_outcome("abandoned", f"Merge train: `{name}` could not start CI; workflow members need manual review.")
+                self.delete_branch(name)
+                self.remove_workflow_members(base, [{"pr": m["pr"], "head": m["sha"]} for m in members], prs, reason)
+                return
             self.note(f"{name} ({numbers}): CI {run.get('conclusion')}; deleting the batch, the next step rebuilds")
             self.record_outcome("abandoned", f"Merge train: `{name}` ended with {run.get('conclusion')}; rebuilding later.")
             self.delete_branch(name)
@@ -965,13 +975,18 @@ class Step:
         self.delete_branch(name)
         if not re.search(r"\b(404|422)\b", str(error)):
             return  # possibly transient: the next step rebuilds and tries again
+        reason = (f"ci.yml, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
+                  f"{train.WORKFLOW_DIR} in a way that removes or breaks the gate, so this PR is merged by hand")
+        self.remove_workflow_members(main, member_heads, prs, reason)
+
+    def remove_workflow_members(self, main: str, member_heads: List[Dict[str, Any]],
+                                prs: Dict[int, Dict[str, Any]], reason: str) -> None:
+        """Remove only members whose own diff changes workflows; keep ordinary PRs queued."""
         for member in member_heads:
             number, head = member["pr"], member["head"]
             base = self.git.run("merge-base", main, head, check=False).stdout.strip()
             if base and not self.changes_workflows(base, head):
                 continue
-            reason = (f"ci.yml, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
-                      f"{train.WORKFLOW_DIR} in a way that removes or breaks the gate, so this PR is merged by hand")
             self.remove_label(number, train.TRAIN_LABEL)
             self.comment(number, f"**Removed from the merge train:** {reason}.", "removed", reason=reason,
                          to=self.recipients(prs.get(number)))
