@@ -540,7 +540,7 @@ def job_class(job: Dict[str, Any]) -> str:
     notes = [message.lower() for message in job.get("annotations") or []]
     if any(USER_CANCEL_SIGNAL in note for note in notes):
         return USER_CANCEL
-    if any(TIMEOUT_SIGNAL in note for note in notes):
+    if job.get("conclusion") == "timed_out" or any(TIMEOUT_SIGNAL in note for note in notes):
         return TIMEOUT
     if (job.get("runner_id") == 0 or not job.get("steps") or job.get("failed_step") == SETUP_STEP
             or any(signal in note for note in notes for signal in INFRA_SIGNALS)):
@@ -586,9 +586,10 @@ def run_action(run: Optional[Dict[str, Any]], batch_size: int, failure: Optional
     none was left to judge). An infrastructure failure or a timeout never splits a batch
     or ejects a PR: a timeout is re-run once and an infrastructure failure up to
     INFRA_RETRIES more times than MAX_ATTEMPTS, then the batch is abandoned for a later
-    rebuild. A real `failure` retries then splits or ejects, as always. Every other
-    conclusion abandons the batch instead of blaming ordinary PRs (substitute review of
-    #989). Step handles one narrower case separately: `startup_failure` on a
+    rebuild. A real failure retries then splits or ejects, as always, and now also when the
+    run ended `cancelled` or `timed_out`. With no job to judge, only a `failure` conclusion
+    takes that path; every other conclusion abandons the batch instead of blaming ordinary
+    PRs (substitute review of #989). Step handles one narrower case separately: `startup_failure` on a
     workflow-changing batch removes its workflow members for manual gate review, so the
     same broken workflow is not rebuilt forever.
     """
@@ -607,11 +608,14 @@ def run_action(run: Optional[Dict[str, Any]], batch_size: int, failure: Optional
             return "rerun" if attempt < MAX_ATTEMPTS else "timed-out"
         if failure == INFRA:
             return "rerun" if attempt < MAX_ATTEMPTS + INFRA_RETRIES else "infra"
-    if conclusion == "failure":
-        if attempt < MAX_ATTEMPTS:
-            return "rerun"
-        return "eject" if batch_size == 1 else "split"
-    return "abandon"  # startup_failure, skipped, neutral, stale; cancelled or timed_out with no sign of why
+        # A real failure is real whatever the run's conclusion: a run whose docs job also
+        # timed out ends `cancelled`, and abandoning it would rebuild the same red batch until
+        # the budget ran out. rerun-failed-jobs re-runs its cancelled jobs too.
+        if failure == REAL or conclusion == "failure":
+            if attempt < MAX_ATTEMPTS:
+                return "rerun"
+            return "eject" if batch_size == 1 else "split"
+    return "abandon"  # startup_failure, skipped, neutral, stale; cancelled or timed_out with no job to judge
 
 
 def batch_name(now: dt.datetime) -> str:

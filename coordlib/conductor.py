@@ -106,7 +106,7 @@ CONTROL_VARIABLE = "MK4_RUNNER_CONTROL"
 # waiting and no step started, the watcher dispatches one itself.
 TRAIN_ASLEEP_AFTER = dt.timedelta(minutes=20)
 CONTROL_QUEUED_AFTER = dt.timedelta(minutes=15)
-# A runner that fails POISON_JOBS jobs in under POISON_FAST each within POISON_WINDOW,
+# A runner that fails POISON_JOBS differently named jobs in under POISON_FAST each within POISON_WINDOW,
 # while another online runner could take them, is reported as poisoned (a stale cache, a
 # wrong toolchain). Escalated only: the jobs may have failed for real.
 POISON_WINDOW = dt.timedelta(hours=1)
@@ -390,18 +390,19 @@ def control_queued_reasons(jobs: List[Dict[str, Any]], label: str, state: Dict[s
 def poisoned_runners(jobs: List[Dict[str, Any]], runners: List[Dict[str, Any]], state: Dict[str, Any],
                      now: dt.datetime) -> List[Dict[str, str]]:
     """Runners that look poisoned, as {key, text} to escalate: within POISON_WINDOW one runner
-    failed POISON_JOBS or more distinct jobs that each ran under POISON_FAST, while another
-    online runner carries every label one of those jobs asked for (the work had somewhere
-    else to go). The key holds when it was first seen, so one episode is told once."""
+    failed POISON_JOBS or more distinctly named jobs that each ran under POISON_FAST (re-runs
+    of one job count once), while another online runner carries every label one of those
+    jobs asked for (the work had somewhere else to go). The key holds when it was first
+    seen, so one episode is told once."""
     flagged = state.setdefault("runnerPoisoned", {})
-    fast: Dict[str, Dict[Any, Dict[str, Any]]] = {}
+    fast: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for job in jobs:
         start, end = _time(job.get("started_at")), _time(job.get("completed_at"))
         runner = job.get("runner_name")
         if job.get("conclusion") != "failure" or not runner or start is None or end is None:
             continue
         if now - end <= POISON_WINDOW and end - start < POISON_FAST:
-            fast.setdefault(runner, {})[job.get("id")] = job
+            fast.setdefault(runner, {})[str(job.get("name"))] = job
     online = [r for r in runners if r.get("status") == "online"]
     out = []
     for runner, failed in sorted(fast.items()):
@@ -411,9 +412,9 @@ def poisoned_runners(jobs: List[Dict[str, Any]], runners: List[Dict[str, Any]], 
         if len(failed) < POISON_JOBS or not others:
             continue
         since = flagged.setdefault(runner, iso(now))
-        names = ", ".join(sorted({str(job.get("name")) for job in failed.values()})[:3])
+        names = ", ".join(sorted(failed)[:3])
         out.append({"key": f"runner-poisoned:{runner}:{since}",
-                    "text": (f"Runner {runner} may be poisoned: it failed {len(failed)} jobs in under "
+                    "text": (f"Runner {runner} may be poisoned: it failed {len(failed)} different jobs in under "
                              f"{int(POISON_FAST.total_seconds())} s each in the last hour ({names}), while "
                              f"{', '.join(others)} could have taken them. If its jobs fail for its own reasons (stale "
                              "caches, a wrong toolchain), take its routing labels off; the conductor does not.")})
@@ -831,10 +832,17 @@ class Watcher:
             control = (variables or {}).get(CONTROL_VARIABLE, "")
             if variables is not None:
                 reasons += routing_reasons(variables, runners, self.state, self.now)
-            jobs = self.recent_jobs(control)
-            if control:
-                reasons += control_queued_reasons(jobs, control, self.state, self.now)
-            self.alerts = poisoned_runners(jobs, runners, self.state, self.now)
+            # A failed read below skips its own check this tick, never the slow tick: that
+            # would repeat every slow read on each 5-minute tick until it succeeded.
+            try:
+                jobs = self.recent_jobs(control)
+            except GitHubError as error:
+                self.say(f"could not read recent Actions jobs ({_clip(str(error), 120)}); the control-queued and "
+                         "runner-poisoned checks wait for the next slow tick")
+            else:
+                if control:
+                    reasons += control_queued_reasons(jobs, control, self.state, self.now)
+                self.alerts = poisoned_runners(jobs, runners, self.state, self.now)
             self.wake_train(cli.train_queue(snap), train_runs)
         return reasons
 
@@ -879,7 +887,13 @@ class Watcher:
         """Dispatch a merge-train step when the train is asleep (train_asleep). An action, not
         a reason: nothing for a model to judge. Not in a dry run."""
         from . import cli
-        why = train_asleep(queue, cli.train_batches(self.gh), train_runs, self.state, self.now)
+        try:
+            batches = cli.train_batches(self.gh)
+        except GitHubError as error:
+            self.say(f"could not read the train/* branches ({_clip(str(error), 120)}); the train-asleep check waits "
+                     "for the next slow tick")
+            return
+        why = train_asleep(queue, batches, train_runs, self.state, self.now)
         if why is None:
             return
         if self.dry_run:

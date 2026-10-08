@@ -310,7 +310,9 @@ class ReasonTests(unittest.TestCase):
         self.assertEqual([alert["key"] for alert in found], [f"runner-poisoned:Eidolon-heavy:{snapshot.iso(NOW)}"])
         self.assertIn("Tycho", found[0]["text"])
         self.assertEqual(conductor.poisoned_runners(three, runners, state, at(5))[0]["key"], found[0]["key"], "one episode")
+        reruns = [dict(failure(n), name="Android") for n in (11, 12, 13)]
         for jobs, why in ((three[:2] + [three[0]], "the same job twice is one job"),
+                          (reruns, "one job re-run three times is one job"),
                           (three[:2] + [failure(3, seconds=95)], "a job that ran 95 s is not fast"),
                           (three[:2] + [failure(3, ended=-70)], "outside the hour"),
                           (three[:2] + [dict(failure(3), conclusion="cancelled")], "only failures")):
@@ -446,7 +448,10 @@ class FakeGitHub:
         if path == "repos/{repo}/actions/runs?per_page=100":
             return {"workflow_runs": self.recent_runs}
         if "/jobs?filter=all" in path:
-            return {"jobs": self.run_jobs.get(int(path.split("actions/runs/")[1].split("/")[0]), [])}
+            jobs = self.run_jobs.get(int(path.split("actions/runs/")[1].split("/")[0]), [])
+            if isinstance(jobs, Exception):
+                raise jobs
+            return {"jobs": jobs}
         if path == "repos/{repo}/git/matching-refs/heads/train":
             return [{"ref": f"refs/heads/{name}", "object": {"sha": tip}} for name, tip in self.batch_refs]
         raise AssertionError(f"unexpected call {method} {path}")
@@ -849,6 +854,57 @@ class WatcherTests(unittest.TestCase):
         escalations = [c for c in self.gh.issue_comments if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
         self.assertEqual(len(escalations), 1)
         self.assertIn("Runner Eidolon-heavy may be poisoned", escalations[0]["body"])
+
+    def test_one_job_rerun_three_times_on_one_runner_is_not_poisoning(self):
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
+                           runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
+        self.gh.recent_runs = [{"id": 601, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
+                                "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-50)),
+                                "updated_at": snapshot.iso(at(-5))}]
+        self.gh.run_jobs = {601: [
+            {"id": n, "name": "Android", "conclusion": "failure", "runner_name": "Eidolon-heavy", "run_attempt": n,
+             "labels": ["tycho-macos"], "started_at": snapshot.iso(at(-10 * n)),
+             "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))} for n in (1, 2, 3)]}
+        self.tick(0)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+
+    def test_a_failed_new_read_skips_its_check_not_the_slow_tick(self):
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos")]
+        self.gh.recent_runs = [{"id": 701, "status": "in_progress", "event": "workflow_dispatch",
+                                "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-30)),
+                                "updated_at": snapshot.iso(at(-1))}]
+        self.gh.run_jobs = {701: conductor.GitHubError("HTTP 404 GET actions/runs/701/jobs: Not Found")}
+        self.asleep()
+        lines = self.tick(0)
+        self.assertEqual(sum("could not read recent Actions jobs" in line for line in lines), 1, lines)
+        self.assertEqual(self.gh.dispatches, [("merge-train.yml", "main", None)], "the other checks still ran")
+        state = conductor.load_state(self.config)
+        self.assertEqual(state.get("lastSlow"), snapshot.iso(at(0)), "the slow tick counts as done")
+        self.assertIn("MK4_RUNNER_MACOS_LIGHT=xcode-27", state.get("routingMissing") or {}, "the routing check ran")
+        self.gh.calls.clear()
+        self.tick(5)
+        self.assertFalse(any("actions/runs?per_page=100" in path for _, path in self.gh.calls),
+                         "the next fast tick does not repeat the slow reads")
+        self.tick(15)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL])
+        self.assertIn("[routing]", self.runs[0]["prompt"], "its reason arrives on schedule")
+
+    def test_unreadable_train_branches_skip_only_the_asleep_check(self):
+        self.asleep()
+        original = self.gh.rest
+
+        def rest(path, method="GET", body=None):
+            if "matching-refs" in path:
+                raise conductor.GitHubError("HTTP 502 Bad Gateway")
+            return original(path, method, body)
+
+        self.gh.rest = rest
+        lines = self.tick(0)
+        self.assertTrue(any("could not read the train/* branches" in line for line in lines), lines)
+        self.assertEqual(self.gh.dispatches, [])
+        self.assertEqual(conductor.load_state(self.config).get("lastSlow"), snapshot.iso(at(0)))
 
     def test_dry_run_writes_nothing(self):
         self.message(-1)

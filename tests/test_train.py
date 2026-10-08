@@ -276,11 +276,17 @@ class PlanAndRunTests(unittest.TestCase):
                          ["rerun", "rerun", "rerun", "infra", "infra"])
         self.assertEqual(action("failure", 4, train.INFRA, 3), "infra", "never a split")
         self.assertEqual([action(c, 1, train.USER_CANCEL) for c in ("cancelled", "failure")], ["abandon", "abandon"])
-        # Real (or nothing left to judge): exactly as before.
+        # Real (or nothing left to judge) on a `failure` run: exactly as before.
         for failure in (train.REAL, None):
             self.assertEqual([action("failure", n, failure, 2) for n in (1, 2)], ["rerun", "split"])
             self.assertEqual(action("failure", 2, failure), "eject")
-            self.assertEqual([action(c, 1, failure) for c in ("cancelled", "timed_out")], ["abandon", "abandon"])
+        # A real failure is real whatever the run's conclusion (a docs timeout beside it ends
+        # the run `cancelled`): re-run first, then split or eject; never abandoned and rebuilt.
+        for conclusion in ("cancelled", "timed_out"):
+            self.assertEqual([action(conclusion, n, train.REAL, 2) for n in (1, 2)], ["rerun", "split"])
+            self.assertEqual(action(conclusion, 2, train.REAL), "eject")
+        # Only with no job to judge does a cancelled or timed-out run keep the old rule.
+        self.assertEqual([action(c, 1, None) for c in ("cancelled", "timed_out")], ["abandon", "abandon"])
         self.assertEqual(action("startup_failure", 1, train.INFRA), "abandon", "a run that never started is not retried")
 
     def test_plan_names_no_overtake_without_classes(self):
@@ -342,6 +348,10 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(train.classify([failed_job(started_at="2026-10-08T16:40:41Z", completed_at="2026-10-08T16:40:49Z")]),
                          train.REAL, "an 8-second exit 1 is real: duration is never a signal")
         self.assertEqual(train.classify([failed_job(conclusion="cancelled", annotations=TIMED_OUT)]), train.TIMEOUT)
+        self.assertEqual(train.classify([failed_job(conclusion="timed_out", annotations=())]), train.TIMEOUT,
+                         "GitHub's own `timed_out` conclusion is a timeout too")
+        self.assertEqual(train.classify([failed_job(conclusion="cancelled", annotations=("The operation was canceled.",))]),
+                         train.REAL, "a running job stopped with no other sign: real, so it is re-run before any split")
         self.assertEqual(train.classify([failed_job(conclusion="cancelled",
                                                     annotations=("The run was canceled by @alex-bridges.",))]),
                          train.USER_CANCEL)
@@ -1231,6 +1241,27 @@ class StepTests(unittest.TestCase):
         self.assertEqual(payload["to"], [train.CONDUCTOR])
         self.assertIn("exceeded the maximum execution time", text)
         self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_a_real_failure_in_a_cancelled_run_is_rerun_once_then_split(self):
+        # A real failure beside a docs job that hit its time limit: the run ends `cancelled`,
+        # but the batch is red for real and must not be rebuilt as it is until the budget runs out.
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        h2 = self.pr_branch(2, "d.txt", "d\n")
+        fake, name, tip = self.build_batch([(1, h1), (2, h2)])
+        fake.add_job(77, "CoreKit release gate")
+        fake.add_job(77, "Documentation and CI self-checks", conclusion="cancelled", annotations=TIMED_OUT)
+        fake.add_job(77, "CI verdict")
+        self.run_on(fake, name, tip, conclusion="cancelled", run_attempt=1)
+        self.step(fake).run()
+        self.assertIn(("POST", "repos/{repo}/actions/runs/77/rerun-failed-jobs", None), fake.writes)
+        self.untouched(fake)
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes, "not abandoned")
+        self.run_on(fake, name, tip, conclusion="cancelled", run_attempt=2)
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertFalse(any("rerun" in path for _, path, _ in fake.writes))
+        self.assertEqual(sorted(fake.posted("split")), [1, 2])
+        self.assertEqual(fake.posted("abandoned"), [])
 
     def test_an_ejection_reaches_the_adder_and_its_fallback(self):
         # Codex on #1157: advance() hands the PR dicts open_prs() returned straight to
