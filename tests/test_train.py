@@ -265,6 +265,24 @@ class PlanAndRunTests(unittest.TestCase):
             self.assertEqual(train.run_action({"status": "completed", "conclusion": infrastructure, "run_attempt": 2}, 1),
                              "abandon", "an outage is not the PR's fault")
 
+    def test_run_action_by_classification(self):
+        def action(conclusion, attempt, failure, size=1):
+            return train.run_action({"status": "completed", "conclusion": conclusion, "run_attempt": attempt}, size, failure)
+
+        # A timeout ends `cancelled`: re-run once, then abandoned with a receipt; never split or ejected.
+        self.assertEqual([action("cancelled", n, train.TIMEOUT, 2) for n in (1, 2, 3)], ["rerun", "timed-out", "timed-out"])
+        # Infrastructure: INFRA_RETRIES more re-runs than MAX_ATTEMPTS, then abandoned with a receipt.
+        self.assertEqual([action("failure", n, train.INFRA) for n in (1, 2, 3, 4, 5)],
+                         ["rerun", "rerun", "rerun", "infra", "infra"])
+        self.assertEqual(action("failure", 4, train.INFRA, 3), "infra", "never a split")
+        self.assertEqual([action(c, 1, train.USER_CANCEL) for c in ("cancelled", "failure")], ["abandon", "abandon"])
+        # Real (or nothing left to judge): exactly as before.
+        for failure in (train.REAL, None):
+            self.assertEqual([action("failure", n, failure, 2) for n in (1, 2)], ["rerun", "split"])
+            self.assertEqual(action("failure", 2, failure), "eject")
+            self.assertEqual([action(c, 1, failure) for c in ("cancelled", "timed_out")], ["abandon", "abandon"])
+        self.assertEqual(action("startup_failure", 1, train.INFRA), "abandon", "a run that never started is not retried")
+
     def test_plan_names_no_overtake_without_classes(self):
         chosen = train.plan([{"pr": 1}], {1: (train.READY, "")}, {1: []})
         self.assertEqual((chosen["batch"], chosen["overtakes"]), ([1], None))
@@ -275,6 +293,85 @@ class PlanAndRunTests(unittest.TestCase):
                "c1\tm0 p1\ttrain/A\tMerge pull request #10 from o/a\n")  # an EARLIER batch, already on main
         self.assertEqual(train.parse_batch(log, "train/B"), ("c1", [{"pr": 20, "sha": "p2"}, {"pr": 30, "sha": "p3"}]))
         self.assertEqual(train.parse_batch(log, "train/C"), (None, []))
+
+
+FIXTURE_RUNS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "ci-job-classes.json")
+BILLING = ("The job was not started because recent account payments have failed or your spending limit needs to "
+           "be increased. Please check the 'Billing & plans' section in your settings")
+TIMED_OUT = ("The job has exceeded the maximum execution time of 15m0s", "The operation was canceled.")
+
+
+def failed_job(name="Android", conclusion="failure", annotations=("Process completed with exit code 1.",), **fields):
+    """train.job_detail of a failed job: by default a real one (a runner, steps, an exit code)."""
+    job = {"id": 1, "name": name, "conclusion": conclusion, "runner_id": 21, "runner_name": "Tycho",
+           "steps": [{"name": "Set up job", "conclusion": "success"}, {"name": "Build", "conclusion": conclusion}]}
+    job.update(fields)
+    return train.job_detail(job, [{"message": message} for message in annotations])
+
+
+class ClassifyTests(unittest.TestCase):
+    def test_recorded_runs_classify_as_they_happened(self):
+        """Four real runs (fixtures/ci-job-classes.json), read through the step's own job read."""
+        with open(FIXTURE_RUNS) as handle:
+            runs = json.load(handle)["runs"]
+        seen = {}
+        for run_id, run in runs.items():
+            for attempt, jobs in run["attempts"].items():
+                with self.subTest(run=run_id, attempt=attempt):
+                    fake = FakeGitHub([], "m")
+                    fake.jobs[int(run_id)] = jobs
+                    fake.annotations = {int(job_id): notes for job_id, notes in run["annotations"].items()}
+                    step = train_step.Step(fake, train_step.Git("/nonexistent"), "dry-run", log=lambda line: None)
+                    failed = step.failed_jobs(int(run_id), details=True)
+                    seen[(run_id, attempt)] = train.classify(failed)
+                    self.assertEqual(seen[(run_id, attempt)], run["expected"][attempt], run["what"])
+                    self.assertNotIn(train.VERDICT_JOB, [job["name"] for job in failed], "never judged, never read")
+        self.assertEqual(set(seen.values()), {train.TIMEOUT, train.INFRA, train.REAL, None})
+        latest = lambda run_id, size=1: train.run_action(  # noqa: E731
+            {"status": "completed", "conclusion": runs[run_id]["conclusion"], "run_attempt": runs[run_id]["run_attempt"]},
+            size, seen[(run_id, str(runs[run_id]["run_attempt"]))])
+        self.assertEqual(latest("10000002"), "rerun", "the docs timeout of train/20261007-010141 is re-run once")
+        self.assertEqual(latest("10000003"), "rerun", "a job billing never started is retried")
+        self.assertEqual(latest("10000004", 2), "split", "Android's real failure on Eidolon still splits")
+        # 10000001: rerun-failed-jobs re-ran the CANCELLED (timed-out) docs job, which went green.
+        self.assertEqual(runs["10000001"]["attempts"]["2"][0]["conclusion"], "success")
+        self.assertEqual(latest("10000001"), "merge")
+
+    def test_each_signal(self):
+        self.assertEqual(train.classify([failed_job()]), train.REAL)
+        self.assertEqual(train.classify([failed_job(started_at="2026-10-08T16:40:41Z", completed_at="2026-10-08T16:40:49Z")]),
+                         train.REAL, "an 8-second exit 1 is real: duration is never a signal")
+        self.assertEqual(train.classify([failed_job(conclusion="cancelled", annotations=TIMED_OUT)]), train.TIMEOUT)
+        self.assertEqual(train.classify([failed_job(conclusion="cancelled",
+                                                    annotations=("The run was canceled by @alex-bridges.",))]),
+                         train.USER_CANCEL)
+        infrastructure = [
+            failed_job(runner_id=0),
+            failed_job(steps=[]),
+            failed_job(steps=[{"name": "Set up job", "conclusion": "failure"}]),
+            failed_job(runner_id=0, steps=[], annotations=(BILLING,)),
+            failed_job(annotations=("The runner has received a shutdown signal. This can happen when the runner "
+                                    "service is stopped, or a manually started runner is canceled.",)),
+            failed_job(annotations=("The self-hosted runner: Eidolon-heavy lost communication with the server.",)),
+        ]
+        for job in infrastructure:
+            with self.subTest(job=job):
+                self.assertEqual(train.classify([job]), train.INFRA)
+
+    def test_precedence_and_what_is_set_aside(self):
+        real, infra = failed_job("Android"), failed_job("Linux", runner_id=0, steps=[], annotations=(BILLING,))
+        timeout = failed_job("Docs", conclusion="cancelled", annotations=TIMED_OUT)
+        cancel = failed_job("Docs", conclusion="cancelled", annotations=("The run was canceled by @alex-bridges.",))
+        queued = failed_job("Release", conclusion="cancelled", runner_id=0, steps=[], annotations=())
+        verdict = failed_job(train.VERDICT_JOB)
+        self.assertEqual(train.classify([infra, real]), train.REAL, "any mix with a real failure is real")
+        self.assertEqual(train.classify([timeout, real]), train.REAL)
+        self.assertEqual(train.classify([cancel, queued]), train.USER_CANCEL,
+                         "a person's cancel also stops queued jobs, which look like infrastructure")
+        self.assertEqual(train.classify([timeout, infra]), train.TIMEOUT)
+        self.assertEqual(train.classify([infra, verdict]), train.INFRA, "the verdict job is set aside")
+        self.assertIsNone(train.classify([verdict, failed_job(train.WAKE_JOB, runner_id=0)]), "nothing left to judge")
+        self.assertIsNone(train.classify([]))
 
 
 L, H = train.LIGHT, train.HEAVY
@@ -441,6 +538,21 @@ class FakeGitHub:
         self.login = train_step.BOT_NAME  # who GitHub says posted what the step posts
         self.issue_states: Dict[int, str] = {}  # GET issues/N answers {"state": this}
         self.pull_bodies: Dict[int, str] = {}   # GET pulls/N answers {"body": this}
+        self.annotations: Dict[int, List[Dict[str, Any]]] = {}  # GET check-runs/N/annotations (N: a job id)
+        self.next_job = 5000
+
+    def add_job(self, run_id, name, conclusion="failure", annotations=("Process completed with exit code 1.",),
+                **fields):
+        """A job of run `run_id` as GitHub's jobs API lists it, and its check-run annotations.
+        By default a real failure: a runner, steps, a failing step, an exit code."""
+        self.next_job += 1
+        job = {"id": self.next_job, "name": name, "status": "completed", "conclusion": conclusion,
+               "runner_id": 21, "runner_name": "Tycho",
+               "steps": [{"name": "Set up job", "conclusion": "success"}, {"name": f"Run {name}", "conclusion": conclusion}]}
+        job.update(fields)
+        self.jobs.setdefault(run_id, []).append(job)
+        self.annotations[job["id"]] = [{"message": message} for message in annotations]
+        return job
 
     def graphql(self, query, variables=None):
         return {"repository": {"defaultBranchRef": {"name": "main", "target": {"oid": self.main}},
@@ -468,6 +580,9 @@ class FakeGitHub:
             if self.reread_error:
                 raise GitHubError(self.reread_error)
             return {"object": {"sha": self.reread_main}}
+        annotations = re.search(r"check-runs/(\d+)/annotations", path)
+        if method == "GET" and annotations:
+            return self.annotations.get(int(annotations.group(1)), [])
         if self.fail_writes and method in ("POST", "DELETE"):
             self.fail_writes -= 1
             from coordlib.gh import GitHubError
@@ -1031,7 +1146,7 @@ class StepTests(unittest.TestCase):
 
         fake.writes.clear()
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"}]
+        fake.add_job(77, "CoreKit release gate")
         self.step(fake).run()
         solo = [body for method, path, body in fake.writes
                 if method == "POST" and path.startswith("repos/{repo}/issues/") and path.endswith("/labels")]
@@ -1046,6 +1161,77 @@ class StepTests(unittest.TestCase):
         self.assertEqual(fake.posted("ejected"), [1])
         self.assertIn(("DELETE", "repos/{repo}/issues/1/labels/train", None), fake.writes)
 
+    def untouched(self, fake):
+        """Nobody split out, ejected or taken out of the train."""
+        self.assertEqual((fake.posted("split"), fake.posted("ejected"), fake.posted("removed")), ([], [], []))
+        self.assertFalse(any("/labels" in path for method, path, _ in fake.writes if method in ("POST", "DELETE")))
+
+    def receipt(self, fake, event):
+        found = [marker.decode(body["body"]) for method, path, body in fake.writes if method == "POST"
+                 and path.endswith("/comments") and (marker.decode(body["body"]) or {}).get("event") == event]
+        self.assertEqual(len(found), 1, fake.writes)
+        return found[0], marker.strip(next(body["body"] for method, path, body in fake.writes if method == "POST"
+                                           and (marker.decode(body["body"]) or {}).get("event") == event))
+
+    def test_infrastructure_failures_are_retried_then_abandoned_never_split_or_ejected(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        h2 = self.pr_branch(2, "d.txt", "d\n")
+        fake, name, tip = self.build_batch([(1, h1), (2, h2)])
+        fake.add_job(77, "CoreKit release gate", runner_id=0, runner_name="", steps=[], annotations=(BILLING,))
+        fake.add_job(77, "CI verdict")
+        for attempt in (2, 3):  # past MAX_ATTEMPTS, where a real failure splits
+            self.run_on(fake, name, tip, conclusion="failure", run_attempt=attempt)
+            fake.writes.clear()
+            self.step(fake).run()
+            self.assertIn(("POST", "repos/{repo}/actions/runs/77/rerun-failed-jobs", None), fake.writes)
+            self.untouched(fake)
+            reserved, _ = self.receipt(fake, "ci-requested")
+            self.assertEqual((reserved["request"]["action"], reserved["request"]["attempt"]), ("rerun", attempt + 1),
+                             "the daily budget counts each re-run")
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=train.MAX_ATTEMPTS + train.INFRA_RETRIES)
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertFalse(any("rerun" in path for _, path, _ in fake.writes))
+        self.untouched(fake)
+        payload, text = self.receipt(fake, "infra")
+        self.assertEqual((payload["to"], payload["failed"], payload["receipt"]["outcome"]),
+                         ([train.CONDUCTOR], ["CoreKit release gate"], "infra"))
+        self.assertIn("job was not started because", text)
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes, "rebuilt later")
+
+    def test_a_runner_lost_mid_job_never_ejects_a_lone_pr(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
+        fake.add_job(77, "Android", runner_name="Eidolon-heavy",
+                     annotations=("The runner has received a shutdown signal. This can happen when the runner service "
+                                  "is stopped, or a manually started runner is canceled.",))
+        self.step(fake).run()
+        self.assertIn(("POST", "repos/{repo}/actions/runs/77/rerun-failed-jobs", None), fake.writes)
+        self.untouched(fake)
+
+    def test_a_timeout_is_rerun_once_then_abandoned_never_ejected(self):
+        h1 = self.pr_branch(1, "c.txt", "c\n")
+        fake, name, tip = self.build_batch([(1, h1)])
+        # As train/20261007-010141 (run 10000002): the job and the run end `cancelled`.
+        fake.add_job(77, "Documentation and CI self-checks", conclusion="cancelled", annotations=TIMED_OUT,
+                     steps=[{"name": "Set up job", "conclusion": "success"},
+                            {"name": "Check the TLA+ models against their expected outcomes", "conclusion": "cancelled"}])
+        fake.add_job(77, "CI verdict")
+        self.run_on(fake, name, tip, conclusion="cancelled", run_attempt=1)
+        self.step(fake).run()
+        self.assertIn(("POST", "repos/{repo}/actions/runs/77/rerun-failed-jobs", None), fake.writes)
+        self.untouched(fake)
+        self.run_on(fake, name, tip, conclusion="cancelled", run_attempt=2)
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertFalse(any("rerun" in path for _, path, _ in fake.writes))
+        self.untouched(fake)
+        payload, text = self.receipt(fake, "timed-out")
+        self.assertEqual(payload["to"], [train.CONDUCTOR])
+        self.assertIn("exceeded the maximum execution time", text)
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
     def test_an_ejection_reaches_the_adder_and_its_fallback(self):
         # Codex on #1157: advance() hands the PR dicts open_prs() returned straight to
         # recipients(), which never read the train-add marker, so the notice went to the
@@ -1055,7 +1241,7 @@ class StepTests(unittest.TestCase):
         fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=50)), "body": compose_record(
             "added", {"kind": "train-add", "pr": 1, "head": h1, "agent": "worker@x", "fallback": "lead@y"})}]
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"}]
+        fake.add_job(77, "CoreKit release gate")
         self.step(fake).run()
         ejected = [marker.decode(body["body"]) for method, path, body in fake.writes
                    if method == "POST" and path.endswith("/comments")
@@ -1191,7 +1377,7 @@ class StepTests(unittest.TestCase):
         fake.main_runs = []
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.jobs[77] = [{"name": "Android", "conclusion": "failure"}]
+        fake.add_job(77, "Android")
         fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
         fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}]
         lines = self.step(fake).run()
@@ -1277,8 +1463,8 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.jobs[77] = [{"name": "CoreKit release gate", "conclusion": "failure"},
-                         {"name": "CI verdict", "conclusion": "failure"}]
+        fake.add_job(77, "CoreKit release gate")
+        fake.add_job(77, "CI verdict")
         fake.main_runs = [{"id": 900, "status": "completed", "conclusion": "failure", "html_url": "main-run"}]
         fake.jobs[900] = [{"name": "Android", "conclusion": "failure"}, {"name": "CI verdict", "conclusion": "failure"}]
         self.step(fake).run()
@@ -1311,8 +1497,8 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.jobs[77] = [{"name": "App-owned SwiftPM packages", "conclusion": "failure"},
-                         {"name": "CI verdict", "conclusion": "failure"}]
+        fake.add_job(77, "App-owned SwiftPM packages")
+        fake.add_job(77, "CI verdict")
         self.step(fake).run()
         self.assertIn(("merge-train.yml", "main", None), fake.dispatched)
         ejected = [body for method, path, body in fake.writes if method == "POST" and path.endswith("/comments")

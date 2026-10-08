@@ -220,6 +220,13 @@ class ReceiptAndReportTests(unittest.TestCase):
         self.assertEqual(report["coverage"]["completedRunsMissingOutcomes"], 1)
         self.assertEqual(report["totals"]["mergedPRs"], 0)
 
+    def test_timeout_and_infrastructure_receipts_are_terminal_outcomes(self):
+        for outcome in ("timed-out", "infra"):
+            with self.subTest(outcome=outcome):
+                report = metrics.report(FakeGitHub([run()], [event(outcome)], {1: [job(1, 0, 1)]}), now=NOW)
+                self.assertEqual(report["coverage"]["completedRunsMissingOutcomes"], 0)
+                self.assertTrue(report["runs"][0]["terminalReceipt"])
+
     def test_a_terminal_receipt_is_bound_to_its_exact_run(self):
         report = metrics.report(FakeGitHub([run(1), run(2)], [event("merged")],
                                           {1: [job(1, 0, 1)], 2: [job(2, 0, 1)]}), now=NOW)

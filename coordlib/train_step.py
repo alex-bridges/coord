@@ -50,9 +50,9 @@ DISPATCH_GRACE_MINUTES = 10
 # that bookkeeping is left (every job done, or only the verdict job still running).
 SETTLE_SECONDS = 120
 SETTLE_POLL_SECONDS = 10
-VERDICT_JOB = "CI verdict"
-WAKE_JOB = "Wake the merge train"
-FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
+VERDICT_JOB = train.VERDICT_JOB
+WAKE_JOB = train.WAKE_JOB
+FINAL_JOBS = train.FINAL_JOBS
 # A comment that asks Codex for a review: the mention at the start of a line, as people
 # and the train write it (a sentence quoting it mid-line is not a request).
 _CODEX_REQUEST = re.compile(r"(?m)^[ \t]*@codex[ \t]+review\b", re.IGNORECASE)
@@ -192,13 +192,14 @@ class Step:
                               "attempt": train_metrics.attempts(run) + 1 if run else 1})
         return True
 
-    def record_outcome(self, event: str, text: str) -> None:
-        """One durable terminal receipt for an abandoned/rebuilt batch before deletion."""
+    def record_outcome(self, event: str, text: str, **fields: Any) -> None:
+        """One durable terminal receipt for an abandoned/rebuilt batch before deletion.
+        `fields` go into its marker (`to` delivers it to an inbox)."""
         assert self._receipt is not None
         number, batch = self._receipt["members"][0]["pr"], self._receipt["batch"]
         try:
             if not self.already_posted(number, event, batch):
-                self.comment(number, text, event, batch=batch, run=(self._receipt.get("run") or {}).get("id"))
+                self.comment(number, text, event, batch=batch, run=(self._receipt.get("run") or {}).get("id"), **fields)
         except GitHubError as error:
             # A missing report outcome must not stop a safe rebuild. The run still
             # carries its immutable plan; the report explicitly exposes missing receipts.
@@ -260,10 +261,17 @@ class Step:
         runs = [r for r in self.runs_at(name, tip) if train.is_gate_run(r, tip)]
         return max(runs, key=lambda r: r["id"]) if runs else None
 
-    def failed_jobs(self, run_id: int) -> List[str]:
+    def failed_jobs(self, run_id: int, details: bool = False) -> List[Any]:
+        """The names of the latest attempt's failed jobs, or with `details` what
+        train.classify reads of each failed or cancelled job (train.job_detail), its
+        check-run annotations included. Annotations are read only for those jobs, and not
+        for the verdict and wake jobs, which classify sets aside."""
         pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/runs/{run_id}/jobs?filter=latest&per_page=100")
-        return [j["name"] for page in pages for j in page.get("jobs", [])
-                if j.get("conclusion") in ("failure", "timed_out", "startup_failure")]
+        jobs = [j for page in pages for j in page.get("jobs", [])]
+        if not details:
+            return [j["name"] for j in jobs if j.get("conclusion") in ("failure", "timed_out", "startup_failure")]
+        return [train.job_detail(j, self.gh.rest(f"repos/{{repo}}/check-runs/{j['id']}/annotations?per_page=100") or [])
+                for j in jobs if j.get("conclusion") in train.CLASSIFIED_JOB_CONCLUSIONS and j.get("name") not in FINAL_JOBS]
 
     def cancel_branch_runs(self, branch: str) -> bool:
         """Cancel every run of a merged PR's branch that has not completed. True when done.
@@ -698,7 +706,11 @@ class Step:
             self.note(f"{name} ({numbers}): main already contains {tip[:9]}; finishing the clean-up")
             self.finish(name, tip, members, prs, run)
             return
-        action = train.run_action(run, len(members))
+        failed_details: List[Dict[str, Any]] = []
+        if run is not None and run.get("status") == "completed" and run.get("conclusion") in ("failure", "cancelled", "timed_out"):
+            failed_details = self.failed_jobs(run["id"], details=True)
+        failure = train.classify(failed_details)
+        action = train.run_action(run, len(members), failure)
         if action == "dispatch":
             others = self.runs_at(name, tip)
             if others:
@@ -732,7 +744,23 @@ class Step:
                 self.record_outcome("abandoned", f"Merge train: retry refused for `{name}`; the batch will be rebuilt.")
                 self.delete_branch(name)
                 return
-            self.note(f"{name} ({numbers}): CI red on attempt {run.get('run_attempt')}; re-running the failed jobs once {url}")
+            why = {train.TIMEOUT: "a timeout", train.INFRA: "CI infrastructure"}.get(failure or "")
+            self.note(f"{name} ({numbers}): CI red on attempt {run.get('run_attempt')}"
+                      + (f", from {why} ({train.evidence(failed_details, failure)})" if why else "")
+                      + f"; re-running the failed jobs {url}")
+            return
+        if action in ("timed-out", "infra"):
+            # Never the PRs' fault: nobody is split out or ejected. The batch goes and is
+            # rebuilt; the receipt reaches the conductor, which tells Alex the first time.
+            evidence = train.evidence(failed_details, failure or "")
+            what = "timed out again" if action == "timed-out" else "failed on CI infrastructure again"
+            self.note(f"{name} ({numbers}): CI {what} on attempt {run.get('run_attempt')} ({evidence}); "
+                      "deleting the batch, the next step rebuilds")
+            self.record_outcome(action, (
+                f"Merge train: `{name}` {what} on attempt {run.get('run_attempt')} ({evidence}): {url}\n\n"
+                "That is not these PRs' fault: nobody is taken out of the train, and the batch is rebuilt."
+            ), to=[train.CONDUCTOR], failed=[job["name"] for job in failed_details][:10])
+            self.delete_branch(name)
             return
         if action == "abandon":
             if run.get("conclusion") == "startup_failure" and self.changes_workflows(base, tip):

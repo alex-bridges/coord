@@ -90,10 +90,28 @@ FAILED = ("failure", "timed_out", "startup_failure")
 # a moved head, Alex's approval) are the PR's own agent's to clear; the conductor reads
 # them at its next wake, and a PR held past STUCK_AFTER wakes it anyway.
 WAKING_HOLDS = frozenset({train.HOLD_CI_RED, train.HOLD_CONFLICT, train.HOLD_MERGE_CHECK, train.HOLD_PARTIAL_DATA})
-WAKING_TRAIN_EVENTS = frozenset({"ejected", "removed"})
+WAKING_TRAIN_EVENTS = frozenset({"ejected", "removed", "timed-out", "infra"})
+# Receipts of a batch abandoned for a timeout or for CI infrastructure (train.run_action):
+# they also go to Alex, the first time and then at most once per REMIND_AFTER.
+ESCALATING_TRAIN_EVENTS = frozenset({"timed-out", "infra"})
 # Conditions that persist: raised again REMIND_AFTER a successful run if still true.
-PERSISTENT_KINDS = frozenset({"runner-offline", "disk-low", "stuck"})
-REPAIR_KINDS = frozenset({"main-red", "train-workflow", "runner-offline", "disk-low"})
+PERSISTENT_KINDS = frozenset({"runner-offline", "disk-low", "stuck", "routing", "control-queued"})
+REPAIR_KINDS = frozenset({"main-red", "train-workflow", "runner-offline", "disk-low", "control-queued"})
+
+# The repository variables that route CI jobs to runner labels (.github/workflows). A
+# runner that carries none of their values is parked (the laptop by day), not offline.
+ROUTING_VARIABLES = ("MK4_RUNNER_MACOS", "MK4_RUNNER_MACOS_LIGHT", "MK4_RUNNER_CONTROL", "MK4_RUNNER_LINUX_ARM64")
+CONTROL_VARIABLE = "MK4_RUNNER_CONTROL"
+# GitHub's cron fired 5 of 96 scheduled train steps on 2026-10-07: past this with work
+# waiting and no step started, the watcher dispatches one itself.
+TRAIN_ASLEEP_AFTER = dt.timedelta(minutes=20)
+CONTROL_QUEUED_AFTER = dt.timedelta(minutes=15)
+# A runner that fails POISON_JOBS jobs in under POISON_FAST each within POISON_WINDOW,
+# while another online runner could take them, is reported as poisoned (a stale cache, a
+# wrong toolchain). Escalated only: the jobs may have failed for real.
+POISON_WINDOW = dt.timedelta(hours=1)
+POISON_FAST = dt.timedelta(seconds=90)
+POISON_JOBS = 3
 
 ISSUE_TITLE = "Conductor (coord): heartbeats, pauses, escalations and outages"
 ISSUE_BODY = (
@@ -227,8 +245,11 @@ def read_wakes(config: Config, limit: int = 200, name: str = "wakes.jsonl") -> L
 # MARK: - Reasons (pure: each takes what GitHub or the machine said and returns reasons)
 
 
-def reason(key: str, kind: str, summary: str, url: str = "", wake: bool = True) -> Dict[str, Any]:
-    return {"key": key, "kind": kind, "summary": summary, "url": url, "wake": wake, "repair": kind in REPAIR_KINDS}
+def reason(key: str, kind: str, summary: str, url: str = "", wake: bool = True, escalate: str = "") -> Dict[str, Any]:
+    """`escalate`: a key under which the reason also goes to Alex, once per REMIND_AFTER
+    (Watcher.escalate_once); "" for none."""
+    return {"key": key, "kind": kind, "summary": summary, "url": url, "wake": wake, "repair": kind in REPAIR_KINDS,
+            "escalate": escalate}
 
 
 def message_reasons(items: List[Dict[str, Any]], payloads: Dict[Any, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -237,15 +258,16 @@ def message_reasons(items: List[Dict[str, Any]], payloads: Dict[Any, Dict[str, A
     out = []
     for item in items:
         payload = payloads.get(item.get("id")) or {}
-        kind, wake = "message", item.get("reason") != "to all"
+        kind, wake, escalate = "message", item.get("reason") != "to all", ""
         if payload.get("kind") == "train":
             kind = "train"
             event = payload.get("event")
             wake = payload.get("hold") in WAKING_HOLDS if event == "held" else event in WAKING_TRAIN_EVENTS
+            escalate = f"train:{event}" if event in ESCALATING_TRAIN_EVENTS else ""
         where = f"#{item['on']}" if item.get("on") else ""
         out.append(reason(f"comment:{item.get('id')}", kind,
                           f"{item.get('from')} on {where} ({item.get('reason')}): {_clip(item.get('text') or '', 240)}",
-                          item.get("url") or "", wake))
+                          item.get("url") or "", wake, escalate))
     return out
 
 
@@ -279,16 +301,30 @@ def run_reasons(runs: List[Dict[str, Any]], kind: str, label: str) -> List[Dict[
                    f"ended {run.get('conclusion')}", run.get("html_url") or "")]
 
 
-def runner_reasons(runners: List[Dict[str, Any]], state: Dict[str, Any], now: dt.datetime) -> List[Dict[str, Any]]:
+def runner_labels(runner: Dict[str, Any]) -> set:
+    """A runner's labels (GitHub's `labels: [{name}]`), lower-cased: labels match case-insensitively."""
+    return {str(label.get("name") or "").lower() for label in runner.get("labels") or [] if isinstance(label, dict)}
+
+
+def routing_labels(variables: Optional[Dict[str, str]]) -> Optional[set]:
+    """The labels the routing variables send jobs to, or None when they could not be read or
+    none is set (then no runner counts as parked)."""
+    return {value.lower() for value in variables.values()} if variables else None
+
+
+def runner_reasons(runners: List[Dict[str, Any]], state: Dict[str, Any], now: dt.datetime,
+                   routed: Optional[set] = None) -> List[Dict[str, Any]]:
     """Self-hosted runners offline for RUNNER_OFFLINE_AFTER. ci-health.sh restarts stuck ones
-    on each box; the conductor hears only when that has not helped."""
+    on each box; the conductor hears only when that has not helped. A parked runner, one
+    that carries none of the `routed` labels (routing_labels; the laptop by day), is not
+    expected online and is skipped; with `routed` unknown (None) every runner counts."""
     offline = state.setdefault("runnerOffline", {})
     names = set()
     out = []
     for runner in runners:
         name = str(runner.get("name") or "")
         names.add(name)
-        if runner.get("status") == "online":
+        if runner.get("status") == "online" or (routed is not None and not runner_labels(runner) & routed):
             offline.pop(name, None)
             continue
         first = offline.setdefault(name, iso(now))
@@ -300,6 +336,116 @@ def runner_reasons(runners: List[Dict[str, Any]], state: Dict[str, Any], now: dt
         if name not in names:
             offline.pop(name)
     return out
+
+
+def routing_reasons(variables: Dict[str, str], runners: List[Dict[str, Any]], state: Dict[str, Any],
+                    now: dt.datetime) -> List[Dict[str, Any]]:
+    """Each set routing variable whose value no online runner carries as a label, for
+    RUNNER_OFFLINE_AFTER: jobs routed there queue forever, or run on GitHub's hosted runners
+    and spend the Actions budget (`xcode-27`, 2026-10-07). Only Alex changes variables and
+    runner registration."""
+    missing = state.setdefault("routingMissing", {})
+    online = set().union(*(runner_labels(r) for r in runners if r.get("status") == "online"))
+    seen = set()
+    out = []
+    for name in ROUTING_VARIABLES:
+        value = variables.get(name) or ""
+        if not value:
+            continue
+        key = f"{name}={value}"
+        seen.add(key)
+        if value.lower() in online:
+            missing.pop(key, None)
+            continue
+        first = missing.setdefault(key, iso(now))
+        if now - (_time(first) or now) >= RUNNER_OFFLINE_AFTER:
+            out.append(reason(f"routing:{key}:{first}", "routing",
+                              f"repository variable {name} routes jobs to the runner label `{value}`, which no online "
+                              f"runner has carried since {first}: those jobs queue, or go to GitHub-hosted runners. "
+                              "Only Alex changes repository variables and runner registration"))
+    for key in list(missing):
+        if key not in seen:
+            missing.pop(key)
+    return out
+
+
+def control_queued_reasons(jobs: List[Dict[str, Any]], label: str, state: Dict[str, Any],
+                           now: dt.datetime) -> List[Dict[str, Any]]:
+    """Jobs for the control runners (`label`, MK4_RUNNER_CONTROL) queued longer than
+    CONTROL_QUEUED_AFTER: the train's own steps, verdicts and wake-ups wait behind them."""
+    stale = [job for job in jobs if job.get("status") == "queued"
+             and label.lower() in {str(name).lower() for name in job.get("labels") or []}
+             and now - (_time(job.get("created_at")) or now) >= CONTROL_QUEUED_AFTER]
+    if not stale:
+        state.pop("controlQueuedSince", None)
+        return []
+    since = state.setdefault("controlQueuedSince", iso(now))
+    oldest = min(stale, key=lambda job: str(job.get("created_at") or ""))
+    return [reason(f"control-queued:{label}:{since}", "control-queued",
+                   f"{len(stale)} job(s) for the control runners (`{label}`) queued over "
+                   f"{int(CONTROL_QUEUED_AFTER.total_seconds() // 60)} minutes; the oldest, {oldest.get('name')}, "
+                   f"since {oldest.get('created_at')}", oldest.get("html_url") or "")]
+
+
+def poisoned_runners(jobs: List[Dict[str, Any]], runners: List[Dict[str, Any]], state: Dict[str, Any],
+                     now: dt.datetime) -> List[Dict[str, str]]:
+    """Runners that look poisoned, as {key, text} to escalate: within POISON_WINDOW one runner
+    failed POISON_JOBS or more distinct jobs that each ran under POISON_FAST, while another
+    online runner carries every label one of those jobs asked for (the work had somewhere
+    else to go). The key holds when it was first seen, so one episode is told once."""
+    flagged = state.setdefault("runnerPoisoned", {})
+    fast: Dict[str, Dict[Any, Dict[str, Any]]] = {}
+    for job in jobs:
+        start, end = _time(job.get("started_at")), _time(job.get("completed_at"))
+        runner = job.get("runner_name")
+        if job.get("conclusion") != "failure" or not runner or start is None or end is None:
+            continue
+        if now - end <= POISON_WINDOW and end - start < POISON_FAST:
+            fast.setdefault(runner, {})[job.get("id")] = job
+    online = [r for r in runners if r.get("status") == "online"]
+    out = []
+    for runner, failed in sorted(fast.items()):
+        asked = [{str(name).lower() for name in job.get("labels") or []} for job in failed.values()]
+        others = sorted({str(other.get("name")) for other in online if other.get("name") != runner
+                         and any(labels <= runner_labels(other) for labels in asked)})
+        if len(failed) < POISON_JOBS or not others:
+            continue
+        since = flagged.setdefault(runner, iso(now))
+        names = ", ".join(sorted({str(job.get("name")) for job in failed.values()})[:3])
+        out.append({"key": f"runner-poisoned:{runner}:{since}",
+                    "text": (f"Runner {runner} may be poisoned: it failed {len(failed)} jobs in under "
+                             f"{int(POISON_FAST.total_seconds())} s each in the last hour ({names}), while "
+                             f"{', '.join(others)} could have taken them. If its jobs fail for its own reasons (stale "
+                             "caches, a wrong toolchain), take its routing labels off; the conductor does not.")})
+    for runner in list(flagged):
+        if not any(item["key"].startswith(f"runner-poisoned:{runner}:") for item in out):
+            flagged.pop(runner)
+    return out
+
+
+def train_asleep(queue: List[Dict[str, Any]], batches: List[Dict[str, Any]], train_runs: List[Dict[str, Any]],
+                 state: Dict[str, Any], now: dt.datetime) -> Optional[str]:
+    """Why the merge train needs a step dispatched now, or None.
+
+    Asleep: there is work (a ready queued PR, or a `train/*` branch: a batch to advance, or
+    one whose CI dispatch was lost), no batch's CI is still running (its wake-train job
+    wakes the train), no merge-train run is waiting or running, and none has started, nor
+    has the watcher dispatched one, in TRAIN_ASLEEP_AFTER. `queue` and `batches` are
+    cli.train_queue and cli.train_batches; `train_runs` the newest merge-train.yml runs."""
+    ready = [entry["pr"] for entry in queue if entry.get("verdict") == train.READY]
+    if not ready and not batches:
+        return None
+    if any((batch.get("run") or {}).get("status") not in (None, "completed") for batch in batches):
+        return None
+    if any(run.get("status") != "completed" for run in train_runs):
+        return None
+    starts = [_time(run.get("run_started_at") or run.get("created_at")) for run in train_runs]
+    last = max([t for t in starts + [_time(state.get("trainWokenAt"))] if t is not None], default=None)
+    if last is not None and now - last < TRAIN_ASLEEP_AFTER:
+        return None
+    work = (f"{len(ready)} ready PR(s) queued" if ready else "") + (" and " if ready and batches else "") + (
+        "batch " + ", ".join(batch["branch"] for batch in batches) if batches else "")
+    return work + "; no merge-train step " + (f"since {iso(last)}" if last else "on record")
 
 
 def disk_reasons(free_gb: Optional[float], state: Dict[str, Any], config: Config, now: dt.datetime) -> List[Dict[str, Any]]:
@@ -352,6 +498,9 @@ def prune(state: Dict[str, Any], now: dt.datetime) -> None:
     handled = state.get("handled") or {}
     for key in [k for k, v in handled.items() if (now - (_time(v.get("at")) or now)) > HANDLED_KEEP]:
         handled.pop(key)
+    told = state.get("escalatedOnce") or {}
+    for key in [k for k, at in told.items() if (now - (_time(at) or now)) > HANDLED_KEEP]:
+        told.pop(key)
     state["wakes"] = [w for w in state.get("wakes") or [] if (_time(w) and now - _time(w) < dt.timedelta(days=1))]
 
 
@@ -539,6 +688,7 @@ class Watcher:
         self.state: Dict[str, Any] = {}
         self.dry_run = False
         self.issue_comments: Optional[List[Dict[str, Any]]] = None
+        self.alerts: List[Dict[str, str]] = []  # {key, text}: for Alex only, never a wake (poisoned_runners)
         self.app_gh_factory: Callable[[], Optional[GitHub]] = self.default_app_gh
         self.user_gh_factory: Callable[[], GitHub] = self.default_user_gh
 
@@ -672,11 +822,76 @@ class Watcher:
             reasons += stuck_reasons(snap, self.now)
             main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch=main&per_page=5") or {}
             reasons += run_reasons(main_runs.get("workflow_runs") or [], "main-red", "CI on main")
-            train_runs = self.gh.rest("repos/{repo}/actions/workflows/merge-train.yml/runs?per_page=5") or {}
-            reasons += run_reasons(train_runs.get("workflow_runs") or [], "train-workflow", "the merge-train workflow")
-            runners = self.gh.rest("repos/{repo}/actions/runners?per_page=100") or {}
-            reasons += runner_reasons(runners.get("runners") or [], self.state, self.now)
+            train_runs = (self.gh.rest("repos/{repo}/actions/workflows/merge-train.yml/runs?per_page=5") or {}
+                          ).get("workflow_runs") or []
+            reasons += run_reasons(train_runs, "train-workflow", "the merge-train workflow")
+            runners = (self.gh.rest("repos/{repo}/actions/runners?per_page=100") or {}).get("runners") or []
+            variables = self.routing_variables()
+            reasons += runner_reasons(runners, self.state, self.now, routing_labels(variables))
+            control = (variables or {}).get(CONTROL_VARIABLE, "")
+            if variables is not None:
+                reasons += routing_reasons(variables, runners, self.state, self.now)
+            jobs = self.recent_jobs(control)
+            if control:
+                reasons += control_queued_reasons(jobs, control, self.state, self.now)
+            self.alerts = poisoned_runners(jobs, runners, self.state, self.now)
+            self.wake_train(cli.train_queue(snap), train_runs)
         return reasons
+
+    def routing_variables(self) -> Optional[Dict[str, str]]:
+        """The ROUTING_VARIABLES that are set, or None when the repository's variables cannot
+        be read. GET actions/variables needs what the runners read already needs: Alex's
+        gh token (`repo` scope) has it; a fine-grained token needs "Variables: read". The
+        routing checks are skipped while it is missing, with one note."""
+        try:
+            listed = (self.gh.rest("repos/{repo}/actions/variables?per_page=100") or {}).get("variables") or []
+        except GitHubError as error:
+            if not self.state.get("variablesUnreadable"):
+                self.say(f"cannot read the repository variables ({_clip(str(error), 120)}); the runner routing "
+                         "checks are skipped until they can be read (the token needs Variables: read)")
+            self.state["variablesUnreadable"] = iso(self.now)
+            return None
+        self.state.pop("variablesUnreadable", None)
+        values = {str(v.get("name")): str(v.get("value") or "").strip() for v in listed if isinstance(v, dict)}
+        return {name: values[name] for name in ROUTING_VARIABLES if values.get(name)}
+
+    def recent_jobs(self, control: str) -> List[Dict[str, Any]]:
+        """The jobs control_queued_reasons and poisoned_runners read, from one listing of the
+        newest 100 runs and one jobs read per run picked: unfinished runs at least
+        CONTROL_QUEUED_AFTER old when a control label is set (pull-request CI runs aside,
+        which never target it), and runs updated within POISON_WINDOW that are running or
+        failed (every attempt's jobs)."""
+        listed = (self.gh.rest("repos/{repo}/actions/runs?per_page=100") or {}).get("workflow_runs") or []
+        jobs = []
+        for run in listed:
+            created, updated = _time(run.get("created_at")), _time(run.get("updated_at"))
+            waiting = (bool(control) and run.get("status") != "completed" and created is not None
+                       and self.now - created >= CONTROL_QUEUED_AFTER
+                       and not (run.get("event") == "pull_request" and str(run.get("path") or "").endswith("/ci.yml")))
+            recent = (updated is not None and self.now - updated <= POISON_WINDOW
+                      and (run.get("status") == "in_progress" or run.get("conclusion") == "failure"))
+            if waiting or recent:
+                listing = self.gh.rest(f"repos/{{repo}}/actions/runs/{run['id']}/jobs?filter=all&per_page=100") or {}
+                jobs += listing.get("jobs") or []
+        return jobs
+
+    def wake_train(self, queue: List[Dict[str, Any]], train_runs: List[Dict[str, Any]]) -> None:
+        """Dispatch a merge-train step when the train is asleep (train_asleep). An action, not
+        a reason: nothing for a model to judge. Not in a dry run."""
+        from . import cli
+        why = train_asleep(queue, cli.train_batches(self.gh), train_runs, self.state, self.now)
+        if why is None:
+            return
+        if self.dry_run:
+            self.say(f"the merge train is asleep ({why}); a tick would dispatch merge-train.yml")
+            return
+        try:
+            self.gh.dispatch_workflow("merge-train.yml", "main")
+        except GitHubError as error:
+            self.say(f"the merge train is asleep ({why}); merge-train.yml could not be dispatched: {_clip(str(error), 120)}")
+            return
+        self.state["trainWokenAt"] = iso(self.now)
+        self.say(f"the merge train was asleep ({why}): dispatched merge-train.yml")
 
     # MARK: The tick
 
@@ -745,6 +960,8 @@ class Watcher:
                  + (f", disk {free:.0f} GB" if free is not None else "") + (f", API {left} left" if left is not None else ""))
         for item in todo:
             self.say(f"  {'*' if item['wake'] else ' '} [{item['kind']}] {_clip(item['summary'], 140)}")
+        for alert in self.alerts:
+            self.say(f"  ! [runner-poisoned] {_clip(alert['text'], 140)}")
         if dry_run:
             from . import reviewer
             asked = [r for r in reviewer.requests(self.issue_comments or [])
@@ -757,6 +974,15 @@ class Watcher:
                                  "lastWake": self.state.get("lastWake")}
         if github_ok and exhausted:
             self.escalate(exhausted)
+        if github_ok:
+            # Straight to Alex, whether or not a run may wake: a batch abandoned for a timeout
+            # or CI infrastructure (its first receipt), a runner that looks poisoned.
+            for item in todo:
+                if item.get("escalate"):
+                    self.escalate_once(item["escalate"], f"The merge train abandoned a batch: {item['summary']}"
+                                       + (f" {item['url']}" if item["url"] else ""))
+            for alert in self.alerts:
+                self.escalate_once(alert["key"], alert["text"])
         down = outage.down(windows, self.config.agent, self.now)
         pause = lease.pause(self.records, self.now, self.gh.repo) if github_ok else None
         # A standby wakes only for its own machine; GitHub duties are the leader's.
@@ -975,6 +1201,15 @@ class Watcher:
         self.escalate_text(text)
         for item in reasons:
             self.state.setdefault("handled", {}).setdefault(item["key"], {})["escalated"] = True
+
+    def escalate_once(self, key: str, text: str) -> None:
+        """Escalate `text` unless `key` was escalated within REMIND_AFTER."""
+        told = self.state.setdefault("escalatedOnce", {})
+        last = _time(told.get(key))
+        if last is not None and self.now - last < REMIND_AFTER:
+            return
+        self.escalate_text(text)
+        told[key] = iso(self.now)
 
     def escalate_text(self, text: str) -> None:
         self.say(f"escalating to Alex: {_clip(text, 120)}")

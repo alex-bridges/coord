@@ -19,7 +19,7 @@ from . import snapshot, train
 from .gh import GitHub, GitHubError, redact
 
 MAX_TIMED_RUNS = 100
-TERMINAL_OUTCOMES = frozenset({"merged", "green-dry-run", "split", "ejected", "abandoned", "rebuilt"})
+TERMINAL_OUTCOMES = frozenset({"merged", "green-dry-run", "split", "ejected", "abandoned", "rebuilt", "timed-out", "infra"})
 
 
 class BudgetConfigurationError(ValueError):
