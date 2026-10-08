@@ -163,6 +163,34 @@ class MintTests(AppTestCase):
         os.chmod(path, 0o600)
         return path
 
+    def forbid_waits_in_cleanup(self, tokens, message):
+        """Fail with `message` if `tokens`' cross-kind cleanup sleeps: `_lock` polls with
+        time.sleep, so a cleanup that waits for a lock sleeps. Only a sleep on the cleanup's
+        own thread, while it runs, counts. `apptoken.time` is the time module itself, so a
+        process-wide ban also tripped on subprocess's reaping poll in the mint (Popen._wait
+        under communicate(timeout=…), for `security` and openssl when a child is slow to
+        exit): a loaded runner failed the test with no lock in sight. Returns the kinds the
+        cleanup ran for, so a test can show the witness was armed."""
+        sleep, cleanup = apptoken.time.sleep, tokens._forget_other_installations
+        inside, ran = set(), []
+
+        def no_wait(seconds):
+            if threading.get_ident() in inside:
+                self.fail(message)
+            sleep(seconds)
+
+        def watched(kind, replacement):
+            ran.append(kind)
+            inside.add(threading.get_ident())
+            try:
+                cleanup(kind, replacement)
+            finally:
+                inside.discard(threading.get_ident())
+
+        self.patch(apptoken.time, "sleep", no_wait)
+        self.patch(tokens, "_forget_other_installations", watched)
+        return ran
+
     def test_after_a_reinstall_both_kinds_converge_on_the_new_installation(self):
         # Codex on 2d13f6b1e (P2): the ops mint found the new installation, and read.json kept
         # the old one, which installation_id() (the budget principal) read first. The other
@@ -277,14 +305,11 @@ class MintTests(AppTestCase):
         self.server.installation = 999
         tokens = self.tokens()
         old_read = read_json(tokens.path("read"))
-
-        def no_wait(seconds):
-            self.fail("optional cross-kind cleanup must not wait for a lock")
-
-        self.patch(apptoken.time, "sleep", no_wait)
+        cleanups = self.forbid_waits_in_cleanup(tokens, "optional cross-kind cleanup must not wait for a lock")
         with self.tokens()._lock("read"):
             token = tokens.token("ops")
             self.assertEqual(tokens.token("ops"), token, "successful cleanup skips must not poison this process")
+        self.assertEqual(cleanups, ["ops", "ops"], "the mint and the cached lookup each met the busy lock")
         self.assertEqual(self.server.tokens[token], "ops")
         self.assertEqual(tokens._failures, {})
         self.assertEqual(read_json(tokens.path("ops"))["installation_id"], 999)
@@ -534,11 +559,7 @@ class MintTests(AppTestCase):
         tokens = self.tokens()
         with self.tokens()._lock("read"):
             token = tokens.token("ops")
-
-        def no_wait(seconds):
-            self.fail("optional proof pruning must not wait for a lock")
-
-        self.patch(apptoken.time, "sleep", no_wait)
+        cleanups = self.forbid_waits_in_cleanup(tokens, "optional proof pruning must not wait for a lock")
         self.keychain("tripwire")
         with self.tokens()._lock("ops"):
             self.assertEqual(tokens.token("ops"), token)
@@ -546,6 +567,7 @@ class MintTests(AppTestCase):
             self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
         self.assertEqual(tokens.token("ops"), token)
         self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")))
+        self.assertEqual(cleanups, ["ops", "ops"], "pruning met its busy own-kind lock, then ran")
 
     def test_unreadable_or_unremovable_other_cache_keeps_rejection_proof(self):
         self.seed_token("read")
