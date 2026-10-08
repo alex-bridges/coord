@@ -92,8 +92,9 @@ HOLD_UNANSWERED_FINDINGS = "unanswered-findings"
 HOLD_CI_RED = "ci-red"
 HOLD_HEAD_MOVED = "head-moved"  # the step's own checks, not eligibility: the head moved under a batch
 HOLD_CONFLICT = "conflict"      # the step's own checks: `git merge-tree` found a conflict
+HOLD_MERGE_CHECK = "merge-check"  # GitHub reports a conflict; the checkout must verify it
 HOLD_CLASSES = (HOLD_DRAFT, HOLD_PARTIAL_DATA, HOLD_NEEDS_ALEX, HOLD_NO_REVIEW, HOLD_UNANSWERED_FINDINGS,
-                HOLD_CI_RED, HOLD_HEAD_MOVED, HOLD_CONFLICT)
+                HOLD_CI_RED, HOLD_HEAD_MOVED, HOLD_CONFLICT, HOLD_MERGE_CHECK)
 # Holds only Alex can clear: an approval of the head, or (the train never merges a PR it
 # cannot read whole) a hand merge. Their notice @-mentions him, so it reaches his GitHub
 # notifications even when no agent is running.
@@ -123,6 +124,8 @@ HOLD_ACTIONS = {
     HOLD_CONFLICT: ("If it conflicts with main, merge main into it (or rebase) and add it again with "
                     "`Tools/coord/coord train add {pr}`. If it conflicts only with a PR ahead of it in the batch, "
                     "it waits for the next batch."),
+    HOLD_MERGE_CHECK: ("The train verifies this head against its fetched main with git before removing it for a "
+                       "conflict. It stays queued while that check is unavailable."),
 }
 
 LABELS = {
@@ -145,14 +148,17 @@ def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
 
 
 def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
-           all_files: Optional[Sequence[str]] = None, workflow_token: bool = False) -> Tuple[str, str, str]:
+           all_files: Optional[Sequence[str]] = None, workflow_token: bool = False,
+           *, merge_verified: bool = False) -> Tuple[str, str, str]:
     """(verdict, hold class, reason): `eligibility` plus, for a HOLD, which of
     HOLD_CLASSES it is ("" for READY and DROP).
 
     `workflow_token`: the step holds the inisa-sidechain app's installation token, which
     may push workflow files (merge-train.yml mints it). Without it a PR that changes
     `.github/workflows/` is dropped, since the Actions token cannot move main onto it;
-    with it, such a PR waits for Alex's approval of its head, like ALEX_ONLY_PATHS."""
+    with it, such a PR waits for Alex's approval of its head, like ALEX_ONLY_PATHS.
+    `merge_verified` is used only by Step after git confirms the exact head merges
+    cleanly with its pinned main. Read-only views never override GitHub's metadata."""
     files = list(all_files) if all_files is not None else pr.get("files", [])
     labels = set(pr.get("labels", []))
     if pr.get("base") != "main":
@@ -175,8 +181,6 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     if guarded and not approved_at_head:
         return HOLD, HOLD_NEEDS_ALEX, (f"it changes {guarded[0]}, which governs the unattended conductor; "
                                        "Alex approves its head (`coord train approve`)")
-    if pr.get("mergeable") == "CONFLICTING":
-        return DROP, "", "it conflicts with main; merge main into it (or rebase) and add it again"
     if pr.get("isDraft"):
         return HOLD, HOLD_DRAFT, "it is a draft"
     if pr.get("incomplete"):
@@ -224,6 +228,8 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     failing = (pr.get("ci") or {}).get("failing") or []
     if failing:
         return HOLD, HOLD_CI_RED, "CI is red at its head: " + ", ".join(failing[:3])
+    if pr.get("mergeable") == "CONFLICTING" and not merge_verified:
+        return HOLD, HOLD_MERGE_CHECK, "GitHub reports a conflict with main; awaiting the train's git verification"
     return READY, "", "ready"
 
 

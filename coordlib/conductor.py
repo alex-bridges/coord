@@ -89,7 +89,7 @@ FAILED = ("failure", "timed_out", "startup_failure")
 # Train notices worth a wake. The rest (waiting for Codex, unanswered findings, a draft,
 # a moved head, Alex's approval) are the PR's own agent's to clear; the conductor reads
 # them at its next wake, and a PR held past STUCK_AFTER wakes it anyway.
-WAKING_HOLDS = frozenset({train.HOLD_CI_RED, train.HOLD_CONFLICT, train.HOLD_PARTIAL_DATA})
+WAKING_HOLDS = frozenset({train.HOLD_CI_RED, train.HOLD_CONFLICT, train.HOLD_MERGE_CHECK, train.HOLD_PARTIAL_DATA})
 WAKING_TRAIN_EVENTS = frozenset({"ejected", "removed"})
 # Conditions that persist: raised again REMIND_AFTER a successful run if still true.
 PERSISTENT_KINDS = frozenset({"runner-offline", "disk-low", "stuck"})

@@ -93,9 +93,19 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.eligibility(pr, head_at_add="b" * 40)[0], train.DROP)
         self.assertEqual(train.eligibility(dict(pr, base="release"))[0], train.DROP)
         self.assertEqual(train.eligibility(dict(pr, fromFork=True))[0], train.DROP)
-        self.assertEqual(train.eligibility(dict(pr, mergeable="CONFLICTING"))[0], train.DROP)
         # A truncated file list is completed by the caller; the full list decides.
         self.assertEqual(train.eligibility(pr, all_files=["x", ".github/workflows/a.yml"])[0], train.DROP)
+
+    def test_a_reported_conflict_waits_for_git_and_never_overrides_other_gates(self):
+        pr = dict(self.summary(), mergeable="CONFLICTING")
+        self.assertEqual(train.assess(pr)[:2], (train.HOLD, train.HOLD_MERGE_CHECK))
+        self.assertEqual(train.eligibility(pr)[0], train.HOLD, "read-only callers cannot confirm a conflict")
+        self.assertEqual(train.assess(pr, merge_verified=True), (train.READY, "", "ready"))
+        self.assertEqual(train.assess(dict(pr, codex={}), merge_verified=True)[:2],
+                         (train.HOLD, train.HOLD_NO_REVIEW))
+        self.assertEqual(train.assess(dict(pr, labels=["train", "needs-alex"]), merge_verified=True)[:2],
+                         (train.HOLD, train.HOLD_NEEDS_ALEX))
+        self.assertEqual(train.eligibility(dict(pr, mergeable="UNKNOWN")), (train.READY, "ready"))
 
     def test_holds(self):
         pr = self.summary()
@@ -613,6 +623,126 @@ class StepTests(unittest.TestCase):
         self.assertEqual([m["pr"] for m in self.members(name)], [1])
         self.assertTrue(any("#2 held: it does not merge cleanly on top of #1" in line for line in lines), lines)
         self.assertEqual(fake.posted("removed"), [], "a conflict with a batch-mate is not the PR's fault")
+
+    def test_stacked_heads_with_stale_conflict_metadata_build_and_finish(self):
+        heads = [self.pr_branch(1, "c.txt", "first\n")]
+        for number in (2, 3):
+            sh(self.work, "checkout", "-q", "-b", f"pr{number}", heads[-1])
+            self.write(f"stack-{number}.txt", "stacked\n")
+            heads.append(self.commit(f"stacked pr{number}"))
+            sh(self.work, "push", "-q", "origin", f"HEAD:refs/pull/{number}/head")
+        sh(self.work, "checkout", "-q", "main")
+        nodes = [ready_node(n, h, f"pr{n}") for n, h in enumerate(heads, 1)]
+        for node in nodes[1:]:
+            node["mergeable"] = "CONFLICTING"
+        fake = FakeGitHub(nodes, self.main)
+        for number, head in enumerate(heads, 1):
+            self.queue(fake, number, head, 40 - number)
+        self.step(fake).run()
+        name = sh(self.origin, "for-each-ref", "--format=%(refname:strip=2)", "refs/heads/train/")
+        tip = sh(self.origin, "rev-parse", name)
+        self.assertEqual([m["sha"] for m in self.members(name)], heads)
+        self.assertEqual(fake.posted("removed"), [])
+        self.assertFalse(any(method == "DELETE" and "/labels/" in path for method, path, _ in fake.writes))
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.writes.clear()
+        self.step(fake).run()  # final fresh GitHub read still reports the stale conflicts
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        self.assertEqual(sorted(fake.posted("merged")), [1, 2, 3])
+        self.assertEqual(fake.posted("removed"), [])
+
+    def test_a_reported_conflict_is_removed_only_when_git_confirms_it(self):
+        head = self.pr_branch(1, "a.txt", "line 1\nPR version\nline 3\n")
+        self.write("a.txt", "line 1\nmain version\nline 3\n")
+        self.main = self.commit("main changed the same line")
+        sh(self.work, "push", "-q", "origin", "main")
+        node = ready_node(1, head, "pr1")
+        node["mergeable"] = "CONFLICTING"
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        lines = self.step(fake).run()
+        self.assertEqual(fake.posted("removed"), [1])
+        self.assertTrue(any(f"git confirms this head conflicts with main {self.main[:9]}" in line for line in lines))
+        self.assertEqual(fake.dispatched, [])
+
+    def test_unavailable_conflict_verification_keeps_the_pr_queued(self):
+        for failure in ("fetch", "merge-error", "merge-os-error"):
+            with self.subTest(failure=failure):
+                self.setUp()
+                head = self.pr_branch(1, "c.txt", "clean\n")
+                node = ready_node(1, head, "pr1")
+                node["mergeable"] = "CONFLICTING"
+                fake = FakeGitHub([node], self.main)
+                self.queue(fake, 1, head, 20)
+                step = self.step(fake)
+                step.git.out("fetch", "-q", "origin", "+refs/pull/1/head:refs/coord/pr/1")
+                original = step.git.run
+
+                def unavailable(*args, **kwargs):
+                    if failure == "fetch" and args[0] == "fetch" and any("refs/pull/1/head" in a for a in args):
+                        raise train_step.GitError("synthetic fetch unavailable; an old local ref still exists")
+                    if args[0] == "merge-tree":
+                        if failure == "merge-error":
+                            return subprocess.CompletedProcess(args, 128, "", "synthetic missing object")
+                        if failure == "merge-os-error":
+                            raise OSError("synthetic git unavailable")
+                    return original(*args, **kwargs)
+
+                step.git.run = unavailable
+                step.run()
+                self.assertEqual(fake.posted("removed"), [])
+                self.assertEqual(fake.posted("held"), [1])
+                self.assertFalse(any(method == "DELETE" and "/labels/" in path for method, path, _ in fake.writes))
+                self.assertEqual(fake.dispatched, [])
+
+    def test_a_head_that_moves_during_conflict_verification_stays_queued(self):
+        head = self.pr_branch(1, "c.txt", "first\n")
+        node = ready_node(1, head, "pr1")
+        node["mergeable"] = "CONFLICTING"
+        fake = FakeGitHub([node], self.main)
+        self.queue(fake, 1, head, 20)
+        sh(self.work, "checkout", "-q", "pr1")
+        self.write("c.txt", "later push\n")
+        moved = self.commit("new head while GitHub still reports the old one")
+        sh(self.work, "push", "-q", "origin", "HEAD:refs/pull/1/head")
+        lines = self.step(fake).run()
+        self.assertTrue(any(f"{head[:9]} to {moved[:9]} during conflict verification" in line for line in lines))
+        self.assertEqual(fake.posted("removed"), [])
+        self.assertEqual(fake.posted("held"), [1])
+        self.assertEqual(fake.dispatched, [])
+
+    def test_final_conflict_check_fetch_failure_never_moves_main_or_removes_the_pr(self):
+        head = self.pr_branch(1, "c.txt", "clean\n")
+        fake, name, tip = self.build_batch([(1, head)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes[0]["mergeable"] = "CONFLICTING"
+        fake.writes.clear()
+        step = self.step(fake)
+        original = step.git.run
+
+        def failed_fetch(*args, **kwargs):
+            if args[0] == "fetch" and any("refs/pull/1/head" in a for a in args):
+                raise train_step.GitError("synthetic fetch unavailable at final readiness")
+            return original(*args, **kwargs)
+
+        step.git.run = failed_fetch
+        step.run()
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+        self.assertFalse(any(method == "DELETE" and "/labels/" in path for method, path, _ in fake.writes))
+        self.assertEqual(fake.posted("removed"), [])
+        self.assertEqual(fake.posted("held"), [1])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_a_new_stale_conflict_report_cannot_discard_a_green_batch(self):
+        head = self.pr_branch(1, "c.txt", "clean\n")
+        fake, name, tip = self.build_batch([(1, head)])
+        self.run_on(fake, name, tip, conclusion="success")
+        fake.nodes[0]["mergeable"] = "CONFLICTING"
+        fake.writes.clear()
+        self.step(fake).run()
+        self.assertIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}), fake.writes)
+        self.assertEqual(fake.posted("merged"), [1])
+        self.assertEqual(fake.posted("removed"), [])
 
     def test_the_clone_is_partial_and_a_content_merge_fetches_what_it_needs(self):
         self.assertEqual(sh(self.clone, "config", "remote.origin.promisor"), "true")

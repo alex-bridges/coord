@@ -34,7 +34,7 @@ import subprocess
 import time
 import urllib.parse
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import marker, review, snapshot, train, train_metrics
 from .gh import AppAuthError, GitHub, GitHubError, NotFound
@@ -483,6 +483,36 @@ class Step:
         diff = self.changed_paths(main, pr["number"], pr["head"]) if pr.get("head") else None
         return paths + [path for path in diff or [] if path not in paths]
 
+    def assess(self, pr: Dict[str, Any], main: str,
+               head_at_add: Optional[str] = None) -> Tuple[str, str, str]:
+        """Verify a reported conflict against pinned git inputs before removing a PR.
+
+        GitHub recomputes mergeability asynchronously. A clean local merge overrides
+        only that metadata; every other eligibility rule and the batch merge still apply.
+        """
+        files = self.gate_files(pr, main)
+        verdict = train.assess(pr, head_at_add, files, workflow_token=self.workflow_token)
+        if verdict[1] != train.HOLD_MERGE_CHECK:
+            return verdict
+        number, head = pr["number"], pr["head"]
+        try:
+            # Fetch must succeed even if a previous step left this ref behind.
+            self.git.out("fetch", "--quiet", "origin", f"+refs/pull/{number}/head:refs/coord/pr/{number}")
+            fetched = self.git.out("rev-parse", f"refs/coord/pr/{number}")
+            if fetched != head:
+                return train.HOLD, train.HOLD_HEAD_MOVED, (
+                    f"its head moved from {head[:9]} to {fetched[:9]} during conflict verification")
+            merged = self.git.run("merge-tree", "--write-tree", "--no-messages", main, head, check=False)
+        except (GitError, OSError) as error:
+            return train.HOLD, train.HOLD_MERGE_CHECK, f"git could not verify the reported conflict: {error}"
+        if merged.returncode == 1:
+            return train.DROP, "", (f"git confirms this head conflicts with main {main[:9]}; "
+                                     "merge main into it (or rebase) and add it again")
+        if merged.returncode != 0:
+            return train.HOLD, train.HOLD_MERGE_CHECK, (
+                f"git could not verify the reported conflict (merge-tree exited {merged.returncode})")
+        return train.assess(pr, head_at_add, files, workflow_token=self.workflow_token, merge_verified=True)
+
     def lane_classes(self, main: str, ready: List[Dict[str, Any]]) -> Dict[int, str]:
         """LIGHT or HEAVY for each ready PR (train.LaneClassifier), judged by the lane
         selector at `main`. Empty for fewer than two: one ready PR is the batch whatever
@@ -784,8 +814,7 @@ class Step:
                 problem = "was taken out of the train"
             else:
                 self.train_added(pr)  # refresh the recorded-review and approval heads for the final check
-                verdict, hold, reason = train.assess(pr, all_files=self.gate_files(pr, main),
-                                                     workflow_token=self.workflow_token)
+                verdict, hold, reason = self.assess(pr, main)
                 if verdict != train.READY:
                     problem = f"is no longer ready ({reason})"
             if problem:
@@ -851,8 +880,7 @@ class Step:
         for pr in queued:
             added = self.train_added(pr)
             entries.append({"pr": pr["number"], "at": added.get("at") or "9999"})
-            verdict, holds[pr["number"]], reason = train.assess(pr, added.get("head"), self.gate_files(pr, main),
-                                                                workflow_token=self.workflow_token)
+            verdict, holds[pr["number"]], reason = self.assess(pr, main, added.get("head"))
             verdicts[pr["number"]] = (verdict, reason)
         entries.sort(key=lambda e: (e["at"], e["pr"]))
         classes = self.lane_classes(main, [prs[n] for n in verdicts if verdicts[n][0] == train.READY])
