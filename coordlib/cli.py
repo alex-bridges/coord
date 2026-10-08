@@ -810,56 +810,60 @@ def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
-def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
-    snap = get_snapshot(gh, args.max_age)
-    prs = {p["number"]: p for p in snap["prs"]}
-    low = getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None)
+def train_batches(gh: GitHub) -> List[Dict[str, Any]]:
+    """Each `train/*` branch with its tip and the newest gate run the train dispatched at
+    that tip (`train status`, and the conductor's train-asleep check)."""
     # No trailing slash: the cloud proxy rejects `…/heads/train/` ("Request path could not
     # be canonicalized", probe 4). Without it GitHub also matches `training…`, so keep
-    # only refs under refs/heads/train/. With the budget low the batch is not read at all.
-    try:
-        refs = [] if low else gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
-    except AppAuthError as error:
-        mark_app_unavailable(gh, error)
-        low = gh.app_unavailable
-        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
-        refs = []
-    except GitHubError as error:
-        if not mark_exhausted(gh, error):
-            raise
-        low = gh.budget_low
-        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
-        refs = []
+    # only refs under refs/heads/train/.
+    refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
-    try:
-        for ref in refs:
-            name = ref["ref"][len("refs/heads/"):]
-            tip = (ref.get("object") or {}).get("sha", "")
-            pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
-                                      f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
-            runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
-            run = max(runs, key=lambda r: r["id"]) if runs else None
-            batches.append({"branch": name, "tip": tip, "run": None if run is None else {
-                "status": run.get("status"), "conclusion": run.get("conclusion"),
-                "attempt": run.get("run_attempt"), "url": run.get("html_url")}})
-    except AppAuthError as error:  # the read token failed after the refs (on any page of the runs)
-        mark_app_unavailable(gh, error)
-        low = gh.app_unavailable
-        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
-        batches = []
-    except GitHubError as error:  # the budget ran out on a page of the runs
-        if not mark_exhausted(gh, error):
-            raise
-        low = gh.budget_low
-        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
-        batches = []
+    for ref in refs:
+        name = ref["ref"][len("refs/heads/"):]
+        tip = (ref.get("object") or {}).get("sha", "")
+        pages = gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs"
+                                  f"?branch={urllib.parse.quote(name, safe='')}&per_page=10")
+        runs = [r for page in pages for r in page.get("workflow_runs", []) if train.is_gate_run(r, tip)]
+        run = max(runs, key=lambda r: r["id"]) if runs else None
+        batches.append({"branch": name, "tip": tip, "run": None if run is None else {
+            "status": run.get("status"), "conclusion": run.get("conclusion"),
+            "attempt": run.get("run_attempt"), "url": run.get("html_url")}})
+    return batches
+
+
+def train_queue(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The snapshot's train queue, each entry with its verdict and reason as coord's views
+    judge them (train.VIEWS_ASSUME_WORKFLOW_TOKEN)."""
+    prs = {p["number"]: p for p in snap["prs"]}
     queue = []
     for entry in snap["train"]:
         pr = prs.get(entry["pr"])
         verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
                            if pr else (train.DROP, "not open"))
         queue.append(dict(entry, verdict=verdict, reason=reason))
+    return queue
+
+
+def cmd_train_status(args: argparse.Namespace, gh: GitHub) -> int:
+    snap = get_snapshot(gh, args.max_age)
+    low = getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None)
+    # With the budget low the batch is not read at all.
+    batches = []
+    try:
+        batches = [] if low else train_batches(gh)
+    except AppAuthError as error:  # the read token failed (on the refs, or any page of the runs)
+        mark_app_unavailable(gh, error)
+        low = gh.app_unavailable
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        batches = []
+    except GitHubError as error:  # the budget ran out (on the refs, or a page of the runs)
+        if not mark_exhausted(gh, error):
+            raise
+        low = gh.budget_low
+        print(f"coord: {low}; the queue is from the cached snapshot", file=sys.stderr)
+        batches = []
+    queue = train_queue(snap)
     if args.json:
         print(json.dumps({"schema": 1, "status": "stale" if low else "ok", "reason": low or None,
                           "generatedAt": snap.get("generatedAt"), "stale": snap.get("stale"),

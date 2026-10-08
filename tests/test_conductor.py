@@ -33,6 +33,11 @@ def record(comment_id: int, minutes: float, payload, text: str = ""):
             "payload": payload, "author": {"login": "o", "type": "User"}}
 
 
+def runner(name: str, status: str, *labels: str):
+    """A self-hosted runner as GET actions/runners lists it."""
+    return {"name": name, "status": status, "labels": [{"name": label} for label in labels]}
+
+
 class WeeklyResetTests(unittest.TestCase):
     def test_noon_new_york_is_16z_in_summer_and_17z_in_winter(self):
         self.assertEqual(outage.next_weekly_reset(NOW, "Thu 12:00 America/New_York"),
@@ -239,6 +244,107 @@ class ReasonTests(unittest.TestCase):
         self.assertEqual(conductor.pending([disk], state, at(60)), ([], []))
         self.assertEqual(conductor.pending([disk], state, at(25 * 60))[0], [disk], "a persisting condition comes back")
 
+    def test_timeout_and_infrastructure_receipts_wake_and_go_to_alex(self):
+        items = [{"id": n, "reason": "to conductor@*", "from": "train@actions", "on": 9, "text": "t", "url": f"u{n}"}
+                 for n in (1, 2, 3)]
+        payloads = {1: {"kind": "train", "event": "timed-out"}, 2: {"kind": "train", "event": "infra"},
+                    3: {"kind": "train", "event": "ejected"}}
+        found = {r["key"]: (r["wake"], r["escalate"]) for r in conductor.message_reasons(items, payloads)}
+        self.assertEqual(found, {"comment:1": (True, "train:timed-out"), "comment:2": (True, "train:infra"),
+                                 "comment:3": (True, "")})
+
+    def test_a_parked_runner_is_never_offline(self):
+        state = {}
+        routed = conductor.routing_labels({"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "Tycho-Light"})
+        parked = runner("Eidolon-heavy", "offline", "self-hosted", "macOS", "eidolon")
+        routed_offline = runner("Tycho-2", "offline", "self-hosted", "tycho-light")
+        conductor.runner_reasons([parked, routed_offline], state, NOW, routed)
+        found = conductor.runner_reasons([parked, routed_offline], state, at(11), routed)
+        self.assertEqual([r["summary"].split()[1] for r in found], ["Tycho-2"], "labels match case-insensitively")
+        unknown = {}
+        conductor.runner_reasons([parked], unknown, NOW, None)
+        self.assertEqual(len(conductor.runner_reasons([parked], unknown, at(11), None)), 1, "routing unknown: as before")
+        self.assertIsNone(conductor.routing_labels({}), "no routing variable set: nothing is parked")
+
+    def test_a_routing_label_no_online_runner_carries(self):
+        state = {}
+        variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27",
+                     "MK4_RUNNER_LINUX_ARM64": "tycho-linux"}
+        runners = [runner("Tycho", "online", "self-hosted", "Tycho-macOS"), runner("Tycho-linux", "offline", "tycho-linux")]
+        self.assertEqual(conductor.routing_reasons(variables, runners, state, NOW), [], "not before ten minutes")
+        found = conductor.routing_reasons(variables, runners, state, at(11))
+        self.assertEqual(sorted(r["key"].split(":")[1] for r in found),
+                         ["MK4_RUNNER_LINUX_ARM64=tycho-linux", "MK4_RUNNER_MACOS_LIGHT=xcode-27"],
+                         "an offline runner's labels do not count")
+        self.assertTrue(all(r["kind"] == "routing" and not r["repair"] for r in found))
+        variables["MK4_RUNNER_MACOS_LIGHT"] = "tycho-macos"
+        conductor.routing_reasons(variables, runners, state, at(12))
+        self.assertEqual(list(state["routingMissing"]), ["MK4_RUNNER_LINUX_ARM64=tycho-linux"], "fixed: forgotten")
+
+    def test_control_jobs_queued_over_fifteen_minutes(self):
+        state = {}
+        queued = {"name": "CI verdict", "status": "queued", "labels": ["self-hosted", "inisa-control"],
+                  "created_at": snapshot.iso(at(-16)), "html_url": "j/1"}
+        self.assertEqual(conductor.control_queued_reasons([dict(queued, created_at=snapshot.iso(at(-14)))],
+                                                          "inisa-control", state, NOW), [])
+        self.assertEqual(conductor.control_queued_reasons([dict(queued, status="in_progress"),
+                                                           dict(queued, labels=["tycho-light"])],
+                                                          "inisa-control", state, NOW), [])
+        found = conductor.control_queued_reasons([queued], "inisa-control", state, NOW)
+        self.assertEqual([(r["kind"], r["url"], r["repair"]) for r in found], [("control-queued", "j/1", True)])
+        self.assertEqual(conductor.control_queued_reasons([queued], "inisa-control", state, at(5))[0]["key"], found[0]["key"])
+        conductor.control_queued_reasons([], "inisa-control", state, at(6))
+        self.assertNotIn("controlQueuedSince", state)
+
+    def test_a_runner_failing_fast_while_another_could_take_its_jobs(self):
+        def failure(job_id, seconds=41, ended=-10, runner_name="Eidolon-heavy", labels=("tycho-macos",), run_id=None):
+            """A failed job; each in its own run unless `run_id` says otherwise."""
+            return {"id": job_id, "run_id": run_id or 600 + job_id, "name": f"job {job_id}", "conclusion": "failure",
+                    "runner_name": runner_name, "labels": list(labels),
+                    "started_at": snapshot.iso(at(ended) - dt.timedelta(seconds=seconds)),
+                    "completed_at": snapshot.iso(at(ended))}
+
+        runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
+                   runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
+        three = [failure(1), failure(2), failure(3)]
+        state = {}
+        found = conductor.poisoned_runners(three, runners, state, NOW)
+        self.assertEqual([alert["key"] for alert in found], [f"runner-poisoned:Eidolon-heavy:{snapshot.iso(NOW)}"])
+        self.assertIn("Tycho", found[0]["text"])
+        self.assertEqual(conductor.poisoned_runners(three, runners, state, at(5))[0]["key"], found[0]["key"], "one episode")
+        across_runs = [dict(failure(n), name="Android") for n in (11, 12, 13)]
+        self.assertEqual(len(conductor.poisoned_runners(across_runs, runners, {}, NOW)), 1,
+                         "one job failing fast in three runs (Android on the laptop, 2026-10-08) counts three times")
+        reruns = [dict(failure(n, run_id=601), name="Android") for n in (11, 12, 13)]
+        for jobs, why in ((three[:2] + [three[0]], "the same job twice is one job"),
+                          (reruns, "one job re-run three times within its run is one job"),
+                          (three[:2] + [failure(3, seconds=95)], "a job that ran 95 s is not fast"),
+                          (three[:2] + [failure(3, ended=-70)], "outside the hour"),
+                          (three[:2] + [dict(failure(3), conclusion="cancelled")], "only failures")):
+            with self.subTest(why):
+                self.assertEqual(conductor.poisoned_runners(jobs, runners, {}, NOW), [])
+        self.assertEqual(conductor.poisoned_runners(three, runners[1:], {}, NOW), [], "nowhere else to go")
+        self.assertEqual(conductor.poisoned_runners(three, [dict(runners[0], status="offline")] + runners[1:], {}, NOW), [])
+        conductor.poisoned_runners([], runners, state, at(70))
+        self.assertEqual(state["runnerPoisoned"], {}, "recovered: a later episode is a new one")
+
+    def test_when_the_train_is_asleep(self):
+        ready = [{"pr": 7, "verdict": train.READY}]
+        held = [{"pr": 8, "verdict": train.HOLD}]
+        old = [{"status": "completed", "run_started_at": snapshot.iso(at(-25))}]
+        batch = {"branch": "train/1", "tip": "t", "run": {"status": "completed"}}
+        self.assertIn("1 ready PR(s)", conductor.train_asleep(ready + held, [], old, {}, NOW))
+        self.assertIn("train/1", conductor.train_asleep(held, [batch], old, {}, NOW))
+        self.assertIn("train/1", conductor.train_asleep([], [dict(batch, run=None)], [], {}, NOW), "a lost dispatch")
+        for queue, batches, runs, state, why in (
+                (held, [], old, {}, "nothing ready"),
+                (ready, [], [{"status": "completed", "run_started_at": snapshot.iso(at(-19))}], {}, "a recent step"),
+                (ready, [], old + [{"status": "queued", "created_at": snapshot.iso(at(-40))}], {}, "a step waits to start"),
+                (ready, [dict(batch, run={"status": "in_progress"})], old, {}, "its CI wakes the train"),
+                (ready, [], old, {"trainWokenAt": snapshot.iso(at(-5))}, "the watcher just woke it")):
+            with self.subTest(why):
+                self.assertIsNone(conductor.train_asleep(queue, batches, runs, state, NOW))
+
     def test_stuck_train_entries(self):
         pr = {"number": 7, "head": "a" * 40, "url": "u", "isDraft": True, "labels": ["train"]}
         snap = {"prs": [pr], "train": [{"pr": 7, "addedAt": snapshot.iso(at(-13 * 60)), "headAtAdd": "a" * 40}]}
@@ -294,6 +400,12 @@ class FakeGitHub:
         self.calls = []
         self.dispatches = []
         self.dispatch_error = None
+        self.variables = {}          # GET actions/variables; None answers 403
+        self.train_runs = []         # merge-train.yml runs, newest first
+        self.recent_runs = []        # GET actions/runs (every workflow)
+        self.run_jobs = {}           # run id -> its jobs
+        self.batch_refs = []         # train/* branches: (name, tip)
+        self.batch_runs = {}         # train/* branch -> its ci.yml runs
 
     def transport(self):
         return "fake"
@@ -328,12 +440,25 @@ class FakeGitHub:
                     comment["body"] = body["body"]
                     return comment
             raise conductor.GitHubError("HTTP 404")
-        if "ci.yml/runs" in path:
+        if "ci.yml/runs?branch=main" in path:
             return {"workflow_runs": self.main_runs}
         if "merge-train.yml/runs" in path:
-            return {"workflow_runs": []}
+            return {"workflow_runs": self.train_runs}
         if path.endswith("actions/runners?per_page=100"):
             return {"runners": self.runners}
+        if path.startswith("repos/{repo}/actions/variables"):
+            if self.variables is None:
+                raise conductor.GitHubError("HTTP 403: Resource not accessible by personal access token")
+            return {"variables": [{"name": name, "value": value} for name, value in self.variables.items()]}
+        if path == "repos/{repo}/actions/runs?per_page=100":
+            return {"workflow_runs": self.recent_runs}
+        if "/jobs?filter=all" in path:
+            jobs = self.run_jobs.get(int(path.split("actions/runs/")[1].split("/")[0]), [])
+            if isinstance(jobs, Exception):
+                raise jobs
+            return {"jobs": jobs}
+        if path == "repos/{repo}/git/matching-refs/heads/train":
+            return [{"ref": f"refs/heads/{name}", "object": {"sha": tip}} for name, tip in self.batch_refs]
         raise AssertionError(f"unexpected call {method} {path}")
 
     def dispatch_workflow(self, workflow, ref, inputs=None):
@@ -352,6 +477,9 @@ class FakeGitHub:
             return [c for c in self.repo_comments if not since or (c.get("updated_at") or c["created_at"]) >= since]
         if path.startswith("repos/{repo}/pulls/comments"):
             return []
+        if "ci.yml/runs?branch=train" in path:  # a batch's gate runs (cli.train_batches), never main's
+            branch = path.split("branch=", 1)[1].split("&", 1)[0].replace("%2F", "/")
+            return [{"workflow_runs": self.batch_runs.get(branch, [])}]
         raise AssertionError(f"unexpected paginated call {path}")
 
     def records(self, kind, event=None):
@@ -614,6 +742,173 @@ class WatcherTests(unittest.TestCase):
             stop.set()
             thread.join()
         self.assertEqual([b["leader"] for b in self.gh.records("conductor", "beat")], [False])
+
+    def receipt(self, minutes, event):
+        self.gh.post(12, f"Merge train: `train/x` {event} again on attempt 4", {
+            "kind": "train", "v": 1, "agent": "train@actions", "event": event, "pr": 12, "batch": "train/x",
+            "to": ["conductor@*"]}, minutes)
+
+    def test_timeout_and_infrastructure_receipts_wake_and_reach_alex_the_first_time(self):
+        self.tick(0)
+        self.receipt(1, "infra")
+        self.tick(5)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("`train/x` infra again on attempt 4", self.runs[0]["prompt"])
+        escalations = self.gh.records("conductor", "escalate")
+        self.assertEqual(len(escalations), 1)
+        self.assertIn("notify-alex.yml", [workflow for workflow, _, _ in self.gh.dispatches])
+        self.receipt(6, "infra")
+        self.receipt(7, "timed-out")
+        self.tick(10)
+        self.assertEqual(len(self.runs), 2, "each receipt still wakes the conductor")
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2, "Alex hears once per kind: the timeout")
+        self.receipt(25 * 60, "infra")
+        self.tick(25 * 60 + 5)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 3, "and again a day later")
+
+    def asleep(self):
+        """A batch whose CI finished and no merge-train step for an hour: the train is asleep."""
+        tip = "f" * 40
+        self.gh.batch_refs = [("train/20261008-010101", tip)]
+        self.gh.batch_runs = {"train/20261008-010101": [
+            {"id": 3, "head_sha": tip, "event": "workflow_dispatch", "actor": {"login": "github-actions[bot]"},
+             "status": "completed", "conclusion": "success", "run_attempt": 1, "html_url": "r/3"}]}
+        self.gh.train_runs = [{"id": 40, "status": "completed", "conclusion": "success",
+                               "run_started_at": snapshot.iso(at(-60)), "created_at": snapshot.iso(at(-60))}]
+
+    def test_an_asleep_train_is_dispatched_once(self):
+        self.asleep()
+        lines = self.tick(0)
+        self.assertEqual(self.gh.dispatches, [("merge-train.yml", "main", None)])
+        self.assertEqual(self.runs, [], "an action, not a wake")
+        self.assertTrue(any("dispatched merge-train.yml" in line for line in lines), lines)
+        self.tick(16)
+        self.assertEqual(len(self.gh.dispatches), 1, "not again within twenty minutes")
+        self.gh.train_runs.insert(0, {"id": 41, "status": "completed", "run_started_at": snapshot.iso(at(25))})
+        self.tick(32)
+        self.assertEqual(len(self.gh.dispatches), 1, "a step that started recently")
+        self.gh.batch_runs["train/20261008-010101"][0].update(status="in_progress", conclusion=None)
+        self.tick(70)
+        self.assertEqual(len(self.gh.dispatches), 1, "a batch's running CI wakes the train itself")
+
+    def test_a_dry_run_never_wakes_the_train(self):
+        self.asleep()
+        lines = self.tick(0, dry_run=True)
+        self.assertEqual(self.gh.dispatches, [])
+        self.assertTrue(any("would dispatch merge-train.yml" in line for line in lines), lines)
+
+    def test_a_parked_runner_raises_nothing(self):
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
+                           runner("Eidolon-heavy", "offline", "self-hosted", "macOS", "eidolon")]
+        for minutes in (0, 15, 30):
+            self.tick(minutes)
+        self.assertEqual(self.runs, [])
+
+    def test_a_routing_label_on_no_online_runner_wakes_the_conductor(self):
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos")]
+        self.tick(0)
+        self.assertEqual(self.runs, [])
+        self.tick(15)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL])
+        self.assertIn("[routing] repository variable MK4_RUNNER_MACOS_LIGHT routes jobs to the runner label `xcode-27`",
+                      self.runs[0]["prompt"])
+
+    def test_unreadable_variables_skip_the_routing_checks_with_one_note(self):
+        self.gh.variables = None
+        self.gh.runners = [runner("Eidolon-heavy", "offline", "self-hosted", "eidolon")]
+        first = self.tick(0)
+        self.assertEqual(sum("cannot read the repository variables" in line for line in first), 1)
+        later = self.tick(15)
+        self.assertFalse(any("cannot read the repository variables" in line for line in later))
+        self.assertEqual([r["model"] for r in self.runs], [conductor.REPAIR_MODEL], "unknown routing: offline counts")
+        self.assertIn("[runner-offline]", self.runs[0]["prompt"])
+
+    def test_control_jobs_queued_wake_the_repair_model(self):
+        self.gh.variables = {"MK4_RUNNER_CONTROL": "inisa-control"}
+        self.gh.runners = [runner("Tycho-control-1", "online", "self-hosted", "inisa-control")]
+        control = {"id": 1, "name": "CI verdict", "status": "queued", "labels": ["self-hosted", "inisa-control"],
+                   "created_at": snapshot.iso(at(-20)), "html_url": "j/1"}
+        self.gh.recent_runs = [
+            {"id": 501, "status": "in_progress", "event": "workflow_dispatch", "path": ".github/workflows/ci.yml",
+             "created_at": snapshot.iso(at(-30)), "updated_at": snapshot.iso(at(-20))},
+            {"id": 502, "status": "queued", "event": "pull_request", "path": ".github/workflows/ci.yml",
+             "created_at": snapshot.iso(at(-30)), "updated_at": snapshot.iso(at(-30))}]
+        self.gh.run_jobs = {501: [control], 502: [dict(control, id=2)]}
+        self.tick(0)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.REPAIR_MODEL])
+        self.assertIn("[control-queued] 1 job(s) for the control runners (`inisa-control`)", self.runs[0]["prompt"])
+        self.assertNotIn(("GET", "repos/{repo}/actions/runs/502/jobs?filter=all&per_page=100"), self.gh.calls,
+                         "pull-request CI never targets the control runners")
+
+    def fast_android_failures(self, runs):
+        """Android failing in 41 s on Eidolon-heavy, once per (run id, attempt) in `runs`, while
+        Tycho, online, carries the same label."""
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
+                           runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
+        self.gh.recent_runs = [{"id": run_id, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
+                                "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-50)),
+                                "updated_at": snapshot.iso(at(-5))} for run_id in sorted({run_id for run_id, _ in runs})]
+        self.gh.run_jobs = {}
+        for n, (run_id, attempt) in enumerate(runs, 1):
+            self.gh.run_jobs.setdefault(run_id, []).append(
+                {"id": n, "run_id": run_id, "run_attempt": attempt, "name": "Android / Android arm64 tests + APK + ELF closure",
+                 "conclusion": "failure", "runner_name": "Eidolon-heavy", "labels": ["tycho-macos"],
+                 "started_at": snapshot.iso(at(-10 * n)), "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))})
+
+    def test_a_poisoned_runner_goes_to_alex_once_and_wakes_nobody(self):
+        # As on 2026-10-08: the same job failing fast on the laptop in three different batches.
+        self.fast_android_failures([(601, 1), (602, 1), (603, 1)])
+        self.tick(0)
+        self.tick(15)
+        self.assertEqual(self.runs, [])
+        escalations = [c for c in self.gh.issue_comments if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
+        self.assertEqual(len(escalations), 1)
+        self.assertIn("Runner Eidolon-heavy may be poisoned: it failed 3 jobs", escalations[0]["body"])
+
+    def test_one_job_rerun_three_times_on_one_runner_is_not_poisoning(self):
+        self.fast_android_failures([(601, 1), (601, 2), (601, 3)])
+        self.tick(0)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+
+    def test_a_failed_new_read_skips_its_check_not_the_slow_tick(self):
+        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27"}
+        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos")]
+        self.gh.recent_runs = [{"id": 701, "status": "in_progress", "event": "workflow_dispatch",
+                                "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-30)),
+                                "updated_at": snapshot.iso(at(-1))}]
+        self.gh.run_jobs = {701: conductor.GitHubError("HTTP 404 GET actions/runs/701/jobs: Not Found")}
+        self.asleep()
+        lines = self.tick(0)
+        self.assertEqual(sum("could not read recent Actions jobs" in line for line in lines), 1, lines)
+        self.assertEqual(self.gh.dispatches, [("merge-train.yml", "main", None)], "the other checks still ran")
+        state = conductor.load_state(self.config)
+        self.assertEqual(state.get("lastSlow"), snapshot.iso(at(0)), "the slow tick counts as done")
+        self.assertIn("MK4_RUNNER_MACOS_LIGHT=xcode-27", state.get("routingMissing") or {}, "the routing check ran")
+        self.gh.calls.clear()
+        self.tick(5)
+        self.assertFalse(any("actions/runs?per_page=100" in path for _, path in self.gh.calls),
+                         "the next fast tick does not repeat the slow reads")
+        self.tick(15)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL])
+        self.assertIn("[routing]", self.runs[0]["prompt"], "its reason arrives on schedule")
+
+    def test_unreadable_train_branches_skip_only_the_asleep_check(self):
+        self.asleep()
+        original = self.gh.rest
+
+        def rest(path, method="GET", body=None):
+            if "matching-refs" in path:
+                raise conductor.GitHubError("HTTP 502 Bad Gateway")
+            return original(path, method, body)
+
+        self.gh.rest = rest
+        lines = self.tick(0)
+        self.assertTrue(any("could not read the train/* branches" in line for line in lines), lines)
+        self.assertEqual(self.gh.dispatches, [])
+        self.assertEqual(conductor.load_state(self.config).get("lastSlow"), snapshot.iso(at(0)))
 
     def test_dry_run_writes_nothing(self):
         self.message(-1)

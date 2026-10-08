@@ -1,0 +1,657 @@
+{
+ "note": "Jobs and check-run annotations of four real Actions runs of example-owner/example-repo, fetched 2026-10-08 with `gh api repos/example-owner/example-repo/actions/runs/<id>/jobs?filter=all` and `gh api repos/example-owner/example-repo/check-runs/<job id>/annotations`, trimmed to the fields train.job_detail reads. Per attempt: every job that ended in a conclusion classify reads (train.CLASSIFIED_JOB_CONCLUSIONS), and for 10000001 attempt 2 also the re-run of the job that timed out.",
+ "runs": {
+  "10000001": {
+   "annotations": {
+    "111295026485": [
+     {
+      "message": "The job has exceeded the maximum execution time of 15m0s"
+     },
+     {
+      "message": "The operation was canceled."
+     }
+    ],
+    "111297670129": [
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ]
+   },
+   "attempts": {
+    "1": [
+     {
+      "conclusion": "cancelled",
+      "id": 111295026485,
+      "name": "Documentation and CI self-checks",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify workspace cleanup preserves build caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify lane selection, the verdict and the branch caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify shared control style ownership guard"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the issue-groom snapshot, policy engine and writer"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the coord tool and merge-train logic"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify render specialization checker regressions"
+       },
+       {
+        "conclusion": "success",
+        "name": "Validate documentation headers"
+       },
+       {
+        "conclusion": "success",
+        "name": "Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "cancelled",
+        "name": "Check the TLA+ models against their expected outcomes"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Validate recorded render provenance"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Report documentation freshness (advisory)"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     },
+     {
+      "conclusion": "failure",
+      "id": 111297670129,
+      "name": "CI verdict",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Require every selected lane to be green"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     }
+    ],
+    "2": [
+     {
+      "conclusion": "success",
+      "id": 111297952100,
+      "name": "Documentation and CI self-checks",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify workspace cleanup preserves build caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify lane selection, the verdict and the branch caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify shared control style ownership guard"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the issue-groom snapshot, policy engine and writer"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the coord tool and merge-train logic"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify render specialization checker regressions"
+       },
+       {
+        "conclusion": "success",
+        "name": "Validate documentation headers"
+       },
+       {
+        "conclusion": "success",
+        "name": "Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check the TLA+ models against their expected outcomes"
+       },
+       {
+        "conclusion": "success",
+        "name": "Validate recorded render provenance"
+       },
+       {
+        "conclusion": "success",
+        "name": "Report documentation freshness (advisory)"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     }
+    ]
+   },
+   "conclusion": "success",
+   "expected": {
+    "1": "timeout",
+    "2": null
+   },
+   "run_attempt": 2,
+   "what": "a PR run whose docs job timed out (`cancelled`); its re-run of the failed jobs re-ran that cancelled job and went green",
+   "workflow": ".github/workflows/ci.yml"
+  },
+  "10000002": {
+   "annotations": {
+    "112582365162": [
+     {
+      "message": "The job has exceeded the maximum execution time of 15m0s"
+     },
+     {
+      "message": "The operation was canceled."
+     }
+    ],
+    "112667166864": [
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ]
+   },
+   "attempts": {
+    "1": [
+     {
+      "conclusion": "cancelled",
+      "id": 112582365162,
+      "name": "Documentation and CI self-checks",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify workspace cleanup preserves build caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify lane selection, the verdict and the branch caches"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify shared control style ownership guard"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the cloud-dispatch prompt composer"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the issue-groom snapshot, policy engine and writer"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify the coord tool and merge-train logic"
+       },
+       {
+        "conclusion": "success",
+        "name": "Verify render specialization checker regressions"
+       },
+       {
+        "conclusion": "success",
+        "name": "Validate documentation headers"
+       },
+       {
+        "conclusion": "success",
+        "name": "Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "cancelled",
+        "name": "Check the TLA+ models against their expected outcomes"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Validate recorded render provenance"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Report documentation freshness (advisory)"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Install JDK 21 for the TLA+ models"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     },
+     {
+      "conclusion": "failure",
+      "id": 112667166864,
+      "name": "CI verdict",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Require every selected lane to be green"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     }
+    ]
+   },
+   "conclusion": "cancelled",
+   "expected": {
+    "1": "timeout"
+   },
+   "run_attempt": 1,
+   "what": "train batch train/20261007-010141: the docs job hit timeout-minutes (15m) running the TLA+ models; the job and the run ended `cancelled`",
+   "workflow": ".github/workflows/ci.yml"
+  },
+  "10000003": {
+   "annotations": {
+    "113248897898": [
+     {
+      "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the 'Billing & plans' section in your settings"
+     }
+    ]
+   },
+   "attempts": {
+    "1": [
+     {
+      "conclusion": "failure",
+      "id": 113248897898,
+      "name": "Merge train step",
+      "runner_id": 0,
+      "runner_name": "",
+      "steps": []
+     }
+    ]
+   },
+   "conclusion": "failure",
+   "expected": {
+    "1": "infra"
+   },
+   "run_attempt": 1,
+   "what": "a scheduled merge-train step GitHub never started: billing refused it (runner_id 0, no steps)",
+   "workflow": ".github/workflows/merge-train.yml"
+  },
+  "10000004": {
+   "annotations": {
+    "113413502585": [
+     {
+      "message": "Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
+     },
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ],
+    "113426094594": [
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ],
+    "113426338548": [
+     {
+      "message": "Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/"
+     },
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ],
+    "113426653808": [
+     {
+      "message": "Process completed with exit code 1."
+     }
+    ]
+   },
+   "attempts": {
+    "1": [
+     {
+      "conclusion": "failure",
+      "id": 113413502585,
+      "name": "Android / Android arm64 tests + APK + ELF closure",
+      "runner_id": 26,
+      "runner_name": "Eidolon-heavy",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "success",
+        "name": "Read and verify Android pins"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test Android stereo interleave contract"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install JDK 17"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install pinned Swift"
+       },
+       {
+        "conclusion": "success",
+        "name": "Provision macOS Android toolchain"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install pinned Android components"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install and configure official Swift Android SDK"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test ELF auditor architecture contract"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test the stale-build retry guard"
+       },
+       {
+        "conclusion": "success",
+        "name": "Cross-build portable tests for Android arm64"
+       },
+       {
+        "conclusion": "success",
+        "name": "Upload stale-build retry logs"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Cross-build and audit debug APK"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     },
+     {
+      "conclusion": "failure",
+      "id": 113426094594,
+      "name": "CI verdict",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Require every selected lane to be green"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     }
+    ],
+    "2": [
+     {
+      "conclusion": "failure",
+      "id": 113426338548,
+      "name": "Android / Android arm64 tests + APK + ELF closure",
+      "runner_id": 26,
+      "runner_name": "Eidolon-heavy",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "success",
+        "name": "Read and verify Android pins"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test Android stereo interleave contract"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install JDK 17"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install pinned Swift"
+       },
+       {
+        "conclusion": "success",
+        "name": "Provision macOS Android toolchain"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install pinned Android components"
+       },
+       {
+        "conclusion": "skipped",
+        "name": "Install and configure official Swift Android SDK"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test ELF auditor architecture contract"
+       },
+       {
+        "conclusion": "success",
+        "name": "Test the stale-build retry guard"
+       },
+       {
+        "conclusion": "success",
+        "name": "Cross-build portable tests for Android arm64"
+       },
+       {
+        "conclusion": "success",
+        "name": "Upload stale-build retry logs"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Cross-build and audit debug APK"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     },
+     {
+      "conclusion": "failure",
+      "id": 113426653808,
+      "name": "CI verdict",
+      "runner_id": 23,
+      "runner_name": "Tycho-2",
+      "steps": [
+       {
+        "conclusion": "success",
+        "name": "Set up job"
+       },
+       {
+        "conclusion": "success",
+        "name": "Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Run ./.github/actions/reset-workspace"
+       },
+       {
+        "conclusion": "failure",
+        "name": "Require every selected lane to be green"
+       },
+       {
+        "conclusion": "success",
+        "name": "Post Check out repository"
+       },
+       {
+        "conclusion": "success",
+        "name": "Complete job"
+       }
+      ]
+     }
+    ]
+   },
+   "conclusion": "failure",
+   "expected": {
+    "1": "real",
+    "2": "real"
+   },
+   "run_attempt": 2,
+   "what": "train batch train/20261008-161113: Android failed for real on Eidolon-heavy (stale caches), 41 s on its re-run; must stay real",
+   "workflow": ".github/workflows/ci.yml"
+  }
+ }
+}

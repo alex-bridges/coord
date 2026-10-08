@@ -71,7 +71,9 @@ VIEWS_ASSUME_WORKFLOW_TOKEN = True
 # the head like a needs-alex PR, whoever queued them.
 # Everything the tick imports is under Tools/coord/, and CLAUDE.md is loaded into every run
 # (substitute review of #1043), so all of it is guarded, this list included.
-ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md")
+# Tools/ci-runner/ is the laptop runner's on/off tool, which runs with Alex's token.
+ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md",
+                   "Tools/ci-runner/")
 MAX_ATTEMPTS = 2
 # Each light/heavy pool admits at most twelve attempts per 24 hours by default.
 # The former twelve-run bound assumed ~1 h per heavy run; counting retries makes
@@ -503,14 +505,93 @@ def is_gate_run(run: Dict[str, Any], tip: str) -> bool:
             and ((run.get("actor") or {}).get("login") == GATE_ACTOR))
 
 
-def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
-    """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split, abandon.
+# ci.yml's aggregate jobs: red whenever any lane is, so they say nothing about why.
+VERDICT_JOB = "CI verdict"
+WAKE_JOB = "Wake the merge train"
+FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
 
-    A plain `failure` retries then splits or ejects. Infrastructure conclusions
-    abandon the batch for a later rebuild instead of blaming ordinary PRs
-    (substitute review of #989). Step handles one narrower case separately:
-    `startup_failure` on a workflow-changing batch removes its workflow members
-    for manual gate review, so the same broken workflow is not rebuilt forever.
+# Why a red batch run failed (classify), judged by the signals GitHub leaves on each job,
+# never by how long it ran: an 8-second exit 1 is a real failure.
+REAL, TIMEOUT, INFRA, USER_CANCEL = "real", "timeout", "infra", "user-cancel"
+# The job conclusions classify reads. A job that hits `timeout-minutes` ends `cancelled`,
+# not `timed_out`, and takes its run to `cancelled` with it.
+CLASSIFIED_JOB_CONCLUSIONS = ("failure", "timed_out", "startup_failure", "cancelled")
+USER_CANCEL_SIGNAL = "canceled by @"  # "The run was canceled by @alex-bridges."
+TIMEOUT_SIGNAL = "exceeded the maximum execution time"
+# A job the runner never ran or lost: refused by billing, the runner shut down or vanished.
+INFRA_SIGNALS = ("job was not started because", "received a shutdown signal", "lost communication")
+SETUP_STEP = "Set up job"
+# Reruns an infrastructure failure gets beyond MAX_ATTEMPTS before the batch is abandoned.
+INFRA_RETRIES = 2
+
+
+def job_detail(job: Dict[str, Any], annotations: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """What classify reads of one job (GitHub's jobs API) and its check-run annotations."""
+    steps = job.get("steps") or []
+    failed = next((step.get("name") for step in steps
+                   if step.get("conclusion") in ("failure", "cancelled", "timed_out")), None)
+    return {"id": job.get("id"), "name": job.get("name"), "conclusion": job.get("conclusion"),
+            "runner_id": job.get("runner_id"), "runner_name": job.get("runner_name"), "steps": len(steps),
+            "failed_step": failed, "annotations": [str(a.get("message") or "") for a in annotations]}
+
+
+def job_class(job: Dict[str, Any]) -> str:
+    """REAL, TIMEOUT, INFRA or USER_CANCEL for one failed or cancelled job (job_detail)."""
+    notes = [message.lower() for message in job.get("annotations") or []]
+    if any(USER_CANCEL_SIGNAL in note for note in notes):
+        return USER_CANCEL
+    if job.get("conclusion") == "timed_out" or any(TIMEOUT_SIGNAL in note for note in notes):
+        return TIMEOUT
+    if (job.get("runner_id") == 0 or not job.get("steps") or job.get("failed_step") == SETUP_STEP
+            or any(signal in note for note in notes for signal in INFRA_SIGNALS)):
+        return INFRA
+    return REAL
+
+
+def classify(jobs: Sequence[Dict[str, Any]]) -> Optional[str]:
+    """Why a red run failed, from its failed and cancelled jobs (job_detail), or None when
+    no job is left to judge once the verdict and wake jobs are set aside (a run that never
+    started a job, or whose only red job is the verdict): run_action then goes by the
+    run's conclusion alone, as it did before jobs were read.
+
+    Precedence: a person's cancel of any job decides the run (cancelling a run also stops
+    its queued jobs, which look like infrastructure); then any real failure, so a mix of
+    real and infrastructure counts as real; then a timeout; and only a run whose every
+    judged job is infrastructure counts as infrastructure.
+    """
+    classes = {job_class(job) for job in jobs if job.get("name") not in FINAL_JOBS}
+    for kind in (USER_CANCEL, REAL, TIMEOUT, INFRA):
+        if kind in classes:
+            return kind
+    return None
+
+
+def evidence(jobs: Sequence[Dict[str, Any]], kind: str) -> str:
+    """The jobs classify judged `kind`, each with its runner and why, for notes and receipts."""
+    parts = []
+    for job in jobs:
+        if job.get("name") in FINAL_JOBS or job_class(job) != kind:
+            continue
+        notes = [note for note in job.get("annotations") or [] if note]
+        why = notes[0] if notes else (f"failed in {job['failed_step']}" if job.get("failed_step") else "no step ran")
+        parts.append(f"{job.get('name')} on {job.get('runner_name') or 'no runner'}: {why[:160]}")
+    return "; ".join(parts[:3]) + (f"; and {len(parts) - 3} more" if len(parts) > 3 else "")
+
+
+def run_action(run: Optional[Dict[str, Any]], batch_size: int, failure: Optional[str] = None) -> str:
+    """What to do with the batch's CI run: dispatch, wait, merge, rerun, eject, split,
+    abandon, or abandon with a receipt naming why (`timed-out`, `infra`).
+
+    `failure` is classify's verdict on a red run's jobs (None when they were not read or
+    none was left to judge). An infrastructure failure or a timeout never splits a batch
+    or ejects a PR: a timeout is re-run once and an infrastructure failure up to
+    INFRA_RETRIES more times than MAX_ATTEMPTS, then the batch is abandoned for a later
+    rebuild. A real failure retries then splits or ejects, as always, and now also when the
+    run ended `cancelled` or `timed_out`. With no job to judge, only a `failure` conclusion
+    takes that path; every other conclusion abandons the batch instead of blaming ordinary
+    PRs (substitute review of #989). Step handles one narrower case separately: `startup_failure` on a
+    workflow-changing batch removes its workflow members for manual gate review, so the
+    same broken workflow is not rebuilt forever.
     """
     if run is None:
         return "dispatch"
@@ -519,11 +600,22 @@ def run_action(run: Optional[Dict[str, Any]], batch_size: int) -> str:
     conclusion = run.get("conclusion")
     if conclusion == "success":
         return "merge"
-    if conclusion == "failure":
-        if (run.get("run_attempt") or 1) < MAX_ATTEMPTS:
-            return "rerun"
-        return "eject" if batch_size == 1 else "split"
-    return "abandon"  # timed_out, startup_failure, cancelled, skipped, neutral, stale
+    attempt = run.get("run_attempt") or 1
+    if conclusion in ("failure", "cancelled", "timed_out"):
+        if failure == USER_CANCEL:
+            return "abandon"
+        if failure == TIMEOUT:
+            return "rerun" if attempt < MAX_ATTEMPTS else "timed-out"
+        if failure == INFRA:
+            return "rerun" if attempt < MAX_ATTEMPTS + INFRA_RETRIES else "infra"
+        # A real failure is real whatever the run's conclusion: a run whose docs job also
+        # timed out ends `cancelled`, and abandoning it would rebuild the same red batch until
+        # the budget ran out. rerun-failed-jobs re-runs its cancelled jobs too.
+        if failure == REAL or conclusion == "failure":
+            if attempt < MAX_ATTEMPTS:
+                return "rerun"
+            return "eject" if batch_size == 1 else "split"
+    return "abandon"  # startup_failure, skipped, neutral, stale; cancelled or timed_out with no job to judge
 
 
 def batch_name(now: dt.datetime) -> str:
