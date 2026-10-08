@@ -166,7 +166,7 @@ class MintTests(AppTestCase):
     def test_after_a_reinstall_both_kinds_converge_on_the_new_installation(self):
         # Codex on 2d13f6b1e (P2): the ops mint found the new installation, and read.json kept
         # the old one, which installation_id() (the budget principal) read first. The other
-        # kind's entry of the old installation, and its hold, go when a mint finds a new one.
+        # kind's old token goes. A hold names no installation and must expire on its own.
         old_read = self.seed_token("read")  # the old installation, still unexpired
         self.seed_token("ops", expires_in=-10)
         held = self.hold("read")
@@ -175,12 +175,12 @@ class MintTests(AppTestCase):
         tokens.token("ops")
         self.assertEqual(self.server.discoveries, 1, "the old installation answered 404, the new one was found")
         self.assertFalse(os.path.exists(os.path.join(self.token_dir, "read.json")), "the old installation's token")
-        self.assertFalse(os.path.exists(held), "and its hold")
+        self.assertTrue(os.path.exists(held), "the hold cannot be attributed to the old token")
         self.assertEqual(read_json(os.path.join(self.token_dir, "ops.json"))["installation_id"], 999)
         self.assertEqual(tokens.installation_id(), 999)
         self.assertEqual(self.tokens().installation_id(), 999, "a new process keys the budget on the new one")
         self.assertEqual(budget.app_principal(self.tokens().installation_id()), budget.app_principal(999))
-        new_read = self.tokens().token("read")
+        new_read = self.tokens(clock=lambda: time.time() + apptoken.FAILURE_HOLD_SECONDS + 1).token("read")
         self.assertNotEqual(new_read, old_read)
         self.assertEqual(read_json(os.path.join(self.token_dir, "read.json"))["installation_id"], 999)
         self.assertEqual(self.server.discoveries, 1, "found once")
@@ -207,6 +207,450 @@ class MintTests(AppTestCase):
         self.tokens().token("read")
         self.assertFalse(os.path.exists(os.path.join(self.token_dir, "ops.json")))
         self.assertTrue(os.path.exists(held), "another config's hold is not ours to clear")
+
+    def test_reinstall_cleanup_keeps_a_replacement_minted_before_its_lock(self):
+        self.seed_token("read")
+        held = self.hold("read")
+        tokens = self.tokens()
+        path = tokens.path("read")
+        replacement = dict(read_json(path), installation_id=999, token="new-installation-token")
+        old_seen, resume = threading.Event(), threading.Event()
+        original_lock = tokens._lock
+        errors = []
+
+        def paused_lock(kind, **kwargs):
+            if kind == "read" and threading.current_thread() is worker and not old_seen.is_set():
+                old_seen.set()
+                if not resume.wait(5):
+                    raise AssertionError("replacement writer never resumed cleanup")
+            return original_lock(kind, **kwargs)
+
+        def clean():
+            try:
+                tokens._forget_other_installations("ops", {"installation_id": 999,
+                                                           "rejected_installation_ids": [INSTALLATION]})
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(tokens, "_lock", paused_lock)
+        worker = threading.Thread(target=clean, daemon=True)
+        try:
+            with tokens._lock("read"):
+                worker.start()
+                self.assertTrue(old_seen.wait(5), "cleanup never reached the other-kind lock")
+                # A cooperating mint commits the new token before cleanup takes
+                # its lock. Cleanup must read the current entry under that lock.
+                tokens._store("read", replacement)
+            resume.set()  # allow the recheck only after the replacement writer unlocks
+        finally:
+            resume.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "cleanup deadlocked on the other kind")
+        self.assertEqual(errors, [])
+        self.assertEqual(read_json(path), replacement, "the fresh token must not be unlinked")
+        self.assertTrue(os.path.exists(held), "the replacement's hold is not obsolete cleanup")
+
+    def test_reinstall_cleanup_releases_its_mint_lock_before_taking_the_other_kind(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        cleanup = tokens._forget_other_installations
+        checked = []
+        self.patch(apptoken, "LOCK_TIMEOUT_SECONDS", 0.2)
+
+        def check(kind, installation):
+            # A second descriptor cannot acquire the same flock while token()'s
+            # original descriptor still owns it. This bounds the deadlock witness.
+            with tokens._lock(kind):
+                checked.append(kind)
+            cleanup(kind, installation)
+
+        self.patch(tokens, "_forget_other_installations", check)
+        self.assertTrue(tokens.token("ops"))
+        self.assertEqual(checked, ["ops"])
+        self.assertFalse(os.path.exists(tokens.path("read")))
+
+    def test_a_busy_other_kind_does_not_delay_or_fail_a_successful_mint(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        old_read = read_json(tokens.path("read"))
+
+        def no_wait(seconds):
+            self.fail("optional cross-kind cleanup must not wait for a lock")
+
+        self.patch(apptoken.time, "sleep", no_wait)
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+            self.assertEqual(tokens.token("ops"), token, "successful cleanup skips must not poison this process")
+        self.assertEqual(self.server.tokens[token], "ops")
+        self.assertEqual(tokens._failures, {})
+        self.assertEqual(read_json(tokens.path("ops"))["installation_id"], 999)
+        self.assertEqual(read_json(tokens.path("read")), old_read, "busy cleanup leaves the other kind alone")
+
+    def test_an_unavailable_cleanup_lock_does_not_fail_a_successful_mint(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        lock = tokens._lock
+
+        def unavailable(kind, **kwargs):
+            if kind == "read":
+                raise AppAuthError("synthetic cleanup lock cannot be opened")
+            return lock(kind, **kwargs)
+
+        self.patch(tokens, "_lock", unavailable)
+        token = tokens.token("ops")
+        self.assertEqual(self.server.tokens[token], "ops")
+        self.assertEqual(tokens._failures, {})
+
+    def test_a_cached_replacement_retries_cleanup_after_the_other_kind_unlocks(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            replacement = tokens.token("ops")
+        self.assertTrue(os.path.exists(tokens.path("read")), "the first cleanup was busy")
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), replacement, "a new process reuses the cache")
+        self.assertFalse(os.path.exists(tokens.path("read")), "the cached replacement retries cleanup")
+        self.assertEqual(self.tokens().installation_id(), 999)
+        self.assertEqual(len(self.server.requests), requests, "cleanup uses persisted rejection evidence")
+        self.assertEqual(len(self.security_calls()), key_reads, "cached cleanup never reads Keychain")
+
+    def test_an_older_mint_cannot_delete_a_later_installations_token(self):
+        for old_kind in apptoken.KINDS:
+            with self.subTest(old_kind=old_kind):
+                other = next(kind for kind in apptoken.KINDS if kind != old_kind)
+                self.keychain("key")
+                self.server.installation = INSTALLATION
+                for kind in apptoken.KINDS:
+                    self.seed_token(kind, expires_in=-10)
+                # Deliberately equal timestamps: clock or id ordering is not proof
+                # that an installation is obsolete.
+                now = time.time()
+                old_tokens, new_tokens = self.tokens(clock=lambda: now), self.tokens(clock=lambda: now)
+                old_store = old_tokens._store
+                old_stored, resume = threading.Event(), threading.Event()
+                results, errors = [], []
+
+                def pause_after_store(kind, entry):
+                    old_store(kind, entry)
+                    old_stored.set()
+                    if not resume.wait(5):
+                        raise AssertionError("replacement mint never resumed the old mint")
+
+                def old_mint():
+                    try:
+                        results.append(old_tokens.token(old_kind))
+                    except Exception as error:  # noqa: BLE001 - surface worker failures
+                        errors.append(error)
+
+                self.patch(old_tokens, "_store", pause_after_store)
+                worker = threading.Thread(target=old_mint, daemon=True)
+                try:
+                    worker.start()
+                    self.assertTrue(old_stored.wait(5), "old mint never stored its token")
+                    self.server.installation = 999
+                    replacement = new_tokens.token(other)  # 404, rediscover, mint; old kind's lock is busy
+                    with open(new_tokens.path(other), "rb") as handle:
+                        replacement_bytes = handle.read()
+                finally:
+                    resume.set()
+                    worker.join(5)
+                self.assertFalse(worker.is_alive(), "old mint did not finish")
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 1)
+                self.assertTrue(os.path.exists(new_tokens.path(other)), "old cleanup deleted the replacement")
+                with open(new_tokens.path(other), "rb") as handle:
+                    self.assertEqual(handle.read(), replacement_bytes)
+                self.assertEqual(read_json(old_tokens.path(old_kind))["minted_at"],
+                                 read_json(new_tokens.path(other))["minted_at"])
+                requests, key_reads = len(self.server.requests), len(self.security_calls())
+                self.keychain("tripwire")
+                self.assertEqual(self.tokens().token(other), replacement)
+                self.assertFalse(os.path.exists(old_tokens.path(old_kind)), "retry removes the proven old id")
+                self.assertEqual(len(self.server.requests), requests)
+                self.assertEqual(len(self.security_calls()), key_reads)
+
+    def test_fresh_discovery_does_not_treat_a_different_cache_id_as_rejected(self):
+        # A successful discovery says which installation was current for that
+        # request, not whether a concurrent different-id cache is older or newer.
+        tokens = self.tokens()
+        discover = tokens._discover
+
+        def discover_before_concurrent_store(jwt):
+            installation = discover(jwt)
+            self.seed_token("read")
+            path = tokens.path("read")
+            concurrent = dict(read_json(path), installation_id=777)
+            tokens._store("read", concurrent)
+            return installation
+
+        self.patch(tokens, "_discover", discover_before_concurrent_store)
+        token = tokens.token("ops")
+        self.assertEqual(self.server.tokens[token], "ops")
+        self.assertEqual(read_json(tokens.path("read"))["installation_id"], 777)
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), token)
+        self.assertEqual(read_json(tokens.path("read"))["installation_id"], 777)
+        self.assertEqual(len(self.server.requests), requests)
+        self.assertEqual(len(self.security_calls()), key_reads)
+
+    def test_rejected_id_cleanup_does_not_remove_a_third_installation(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")  # learns that INSTALLATION was rejected
+            third = dict(read_json(tokens.path("read")), installation_id=777)
+            tokens._store("read", third)
+        self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), token)
+        self.assertEqual(read_json(tokens.path("read")), third, "only the rejected id is obsolete")
+        self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")), "completed proof retires")
+
+    def test_refresh_preserves_rejection_evidence_for_a_later_cached_retry(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            first = tokens.token("ops")
+            entry = read_json(tokens.path("ops"))
+            self.assertEqual(entry["rejected_installation_ids"], [INSTALLATION])
+            tokens._store("ops", dict(entry, expires_at="2000-01-01T00:00:00Z"))
+            refreshed = tokens.token("ops")  # this process already knows installation 999
+            self.assertNotEqual(first, refreshed)
+            self.assertEqual(self.server.discoveries, 1, "refresh needed no new 404/discovery")
+            self.assertTrue(os.path.exists(tokens.path("read")), "cleanup is still busy")
+        self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), refreshed)
+        self.assertFalse(os.path.exists(tokens.path("read")))
+        self.assertEqual(len(self.server.requests), requests)
+        self.assertEqual(len(self.security_calls()), key_reads)
+
+    def test_rejection_proof_survives_consecutive_reinstalls_then_retires_after_cleanup(self):
+        self.seed_token("read", expires_in=7200)
+        self.seed_token("ops", expires_in=-10)
+        clock = [time.time()]
+        tokens = self.tokens(clock=lambda: clock[0])
+        self.server.expires_in = 600
+        self.server.installation = 999
+        with self.tokens()._lock("read"):
+            tokens.token("ops")
+            clock[0] += 301  # replacement now needs a normal refresh
+            self.server.installation = 777
+            replacement = tokens.token("ops")
+            self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [999, INSTALLATION])
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), replacement)
+        self.assertFalse(os.path.exists(tokens.path("read")), "the first rejected id remains known")
+        self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")), "no unbounded history")
+        self.assertEqual(len(self.server.requests), requests)
+        self.assertEqual(len(self.security_calls()), key_reads)
+        self.keychain("key")
+        clock[0] += 301
+        tokens.token("ops")
+        self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")), "refresh cannot resurrect proof")
+
+    def test_malformed_rejection_metadata_never_authorizes_deletion(self):
+        for malformed in (None, True, INSTALLATION, str(INSTALLATION), {"id": INSTALLATION},
+                          [True, False, 0, -1, str(INSTALLATION), None, [], {}]):
+            with self.subTest(proof=malformed):
+                self.seed_token("read")
+                token = self.seed_token("ops")
+                tokens = self.tokens()
+                entry = dict(read_json(tokens.path("ops")), installation_id=999,
+                             rejected_installation_ids=malformed)
+                tokens._store("ops", entry)
+                original = read_json(tokens.path("read"))
+                self.keychain("tripwire")
+                self.assertEqual(tokens.token("ops"), token)
+                self.assertEqual(read_json(tokens.path("read")), original)
+        for invalid_id in (0, -1):
+            with self.subTest(invalid_id=invalid_id):
+                original = dict(read_json(tokens.path("read")), installation_id=invalid_id)
+                tokens._store("read", original)
+                tokens._store("ops", dict(entry, rejected_installation_ids=[invalid_id]))
+                self.assertEqual(tokens.token("ops"), token)
+                self.assertEqual(read_json(tokens.path("read")), original, "non-positive ids are not proof")
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.security_calls(), [])
+
+    def test_rejection_pruning_waits_for_an_absent_cache_inflight_mint(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+            os.unlink(tokens.path("read"))
+            self.assertEqual(self.tokens().token("ops"), token)
+            self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+            self.seed_token("read")  # an old in-flight mint publishes before its lock is released
+        self.keychain("tripwire")
+        self.assertEqual(self.tokens().token("ops"), token)
+        self.assertFalse(os.path.exists(tokens.path("read")))
+        self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")))
+
+    def test_rejection_pruning_cannot_overwrite_a_replaced_own_entry(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+        replacement = dict(read_json(tokens.path("ops")), token="later-own-token")
+        lock = tokens._lock
+
+        def replace_before_prune(kind, **kwargs):
+            if kind == "ops":
+                with lock(kind):
+                    tokens._store(kind, replacement)
+            return lock(kind, **kwargs)
+
+        self.patch(tokens, "_lock", replace_before_prune)
+        self.keychain("tripwire")
+        self.assertEqual(tokens.token("ops"), token)
+        self.assertFalse(os.path.exists(tokens.path("read")))
+        self.assertEqual(read_json(tokens.path("ops")), replacement, "pruning cannot replace a newer token")
+
+    def test_rejection_pruning_never_waits_on_its_own_kind_lock(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+
+        def no_wait(seconds):
+            self.fail("optional proof pruning must not wait for a lock")
+
+        self.patch(apptoken.time, "sleep", no_wait)
+        self.keychain("tripwire")
+        with self.tokens()._lock("ops"):
+            self.assertEqual(tokens.token("ops"), token)
+            self.assertFalse(os.path.exists(tokens.path("read")))
+            self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+        self.assertEqual(tokens.token("ops"), token)
+        self.assertNotIn("rejected_installation_ids", read_json(tokens.path("ops")))
+
+    def test_unreadable_or_unremovable_other_cache_keeps_rejection_proof(self):
+        self.seed_token("read")
+        self.seed_token("ops", expires_in=-10)
+        self.server.installation = 999
+        tokens = self.tokens()
+        with self.tokens()._lock("read"):
+            token = tokens.token("ops")
+        original_read, original_unlink = apptoken._read_json, apptoken.os.unlink
+        self.patch(apptoken, "_read_json", lambda path: None if path == tokens.path("read") else original_read(path))
+        self.keychain("tripwire")
+        self.assertEqual(tokens.token("ops"), token)
+        self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+        self.patch(apptoken, "_read_json", original_read)
+
+        def cannot_unlink(path, *args, **kwargs):
+            if path == tokens.path("read"):
+                raise PermissionError("synthetic token cannot be removed")
+            return original_unlink(path, *args, **kwargs)
+
+        self.patch(apptoken.os, "unlink", cannot_unlink)
+        self.assertEqual(tokens.token("ops"), token)
+        self.assertEqual(read_json(tokens.path("ops"))["rejected_installation_ids"], [INSTALLATION])
+        self.assertTrue(os.path.exists(tokens.path("read")))
+
+    def test_reinstall_cleanup_preserves_a_new_failure_hold_beside_an_old_token(self):
+        self.seed_token("read", expires_in=-10)
+        self.server.installation = 999
+        self.server.refuse_kinds = {"read"}
+        tokens = self.tokens()
+        path = tokens.path("read")
+        old_seen, resume = threading.Event(), threading.Event()
+        original_lock = tokens._lock
+        errors = []
+
+        def paused_lock(kind, **kwargs):
+            if kind == "read" and threading.current_thread() is worker and not old_seen.is_set():
+                old_seen.set()
+                if not resume.wait(5):
+                    raise AssertionError("failed mint never resumed cleanup")
+            return original_lock(kind, **kwargs)
+
+        def clean():
+            try:
+                tokens._forget_other_installations("ops", {"installation_id": 999,
+                                                           "rejected_installation_ids": [INSTALLATION]})
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(tokens, "_lock", paused_lock)
+        worker = threading.Thread(target=clean, daemon=True)
+        try:
+            with tokens._lock("read"):
+                worker.start()
+                self.assertTrue(old_seen.wait(5), "cleanup never reached the other-kind lock")
+                with self.assertRaises(AppAuthError):
+                    tokens._mint_remembering_failure("read")
+                with open(tokens.failed_path("read"), "rb") as handle:
+                    fresh_hold = handle.read()
+            resume.set()  # cleanup must acquire the lock after the failed mint releases it
+        finally:
+            resume.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive(), "cleanup deadlocked")
+        self.assertEqual(errors, [])
+        self.assertFalse(os.path.exists(path), "the obsolete token is still removed")
+        with open(tokens.failed_path("read"), "rb") as handle:
+            self.assertEqual(handle.read(), fresh_hold, "a fresh failure hold must survive byte-for-byte")
+        requests, key_reads = len(self.server.requests), len(self.security_calls())
+        with self.assertRaisesRegex(AppAuthError, "a mint failed"):
+            self.tokens().token("read")
+        self.assertEqual(len(self.server.requests), requests, "backoff prevents another mint")
+        self.assertEqual(len(self.security_calls()), key_reads, "backoff prevents another Keychain read")
+
+    def test_both_kinds_can_finish_a_reinstall_together(self):
+        for kind in apptoken.KINDS:
+            self.seed_token(kind, expires_in=-10)
+        self.server.installation = 999
+        stored = threading.Barrier(2)
+        original_store = apptoken.AppTokens._store
+        results, errors = {}, []
+
+        def store_together(source, kind, entry):
+            original_store(source, kind, entry)
+            stored.wait(5)  # both own their distinct mint locks at this point
+
+        def mint(kind):
+            try:
+                results[kind] = self.tokens().token(kind)
+            except Exception as error:  # noqa: BLE001 - report thread failures to unittest
+                errors.append(error)
+
+        self.patch(apptoken.AppTokens, "_store", store_together)
+        workers = [threading.Thread(target=mint, args=(kind,), daemon=True) for kind in apptoken.KINDS]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(10)
+        self.assertFalse(any(worker.is_alive() for worker in workers), "cross-kind cleanup deadlocked")
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), set(apptoken.KINDS))
+        self.assertEqual(self.server.mints, 2)
+        for kind, token in results.items():
+            entry = read_json(os.path.join(self.token_dir, f"{kind}.json"))
+            self.assertEqual((entry["token"], entry["installation_id"]), (token, 999))
 
     def test_a_cached_token_whose_permissions_differ_is_never_used(self):
         wrong = {"read": dict(apptoken.READ_PERMISSIONS, issues="write"), "ops": apptoken.READ_PERMISSIONS}
