@@ -297,9 +297,11 @@ class ReasonTests(unittest.TestCase):
         self.assertNotIn("controlQueuedSince", state)
 
     def test_a_runner_failing_fast_while_another_could_take_its_jobs(self):
-        def failure(job_id, seconds=41, ended=-10, runner_name="Eidolon-heavy", labels=("tycho-macos",)):
-            return {"id": job_id, "name": f"job {job_id}", "conclusion": "failure", "runner_name": runner_name,
-                    "labels": list(labels), "started_at": snapshot.iso(at(ended) - dt.timedelta(seconds=seconds)),
+        def failure(job_id, seconds=41, ended=-10, runner_name="Eidolon-heavy", labels=("tycho-macos",), run_id=None):
+            """A failed job; each in its own run unless `run_id` says otherwise."""
+            return {"id": job_id, "run_id": run_id or 600 + job_id, "name": f"job {job_id}", "conclusion": "failure",
+                    "runner_name": runner_name, "labels": list(labels),
+                    "started_at": snapshot.iso(at(ended) - dt.timedelta(seconds=seconds)),
                     "completed_at": snapshot.iso(at(ended))}
 
         runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
@@ -310,9 +312,12 @@ class ReasonTests(unittest.TestCase):
         self.assertEqual([alert["key"] for alert in found], [f"runner-poisoned:Eidolon-heavy:{snapshot.iso(NOW)}"])
         self.assertIn("Tycho", found[0]["text"])
         self.assertEqual(conductor.poisoned_runners(three, runners, state, at(5))[0]["key"], found[0]["key"], "one episode")
-        reruns = [dict(failure(n), name="Android") for n in (11, 12, 13)]
+        across_runs = [dict(failure(n), name="Android") for n in (11, 12, 13)]
+        self.assertEqual(len(conductor.poisoned_runners(across_runs, runners, {}, NOW)), 1,
+                         "one job failing fast in three runs (Android on the laptop, 2026-10-08) counts three times")
+        reruns = [dict(failure(n, run_id=601), name="Android") for n in (11, 12, 13)]
         for jobs, why in ((three[:2] + [three[0]], "the same job twice is one job"),
-                          (reruns, "one job re-run three times is one job"),
+                          (reruns, "one job re-run three times within its run is one job"),
                           (three[:2] + [failure(3, seconds=95)], "a job that ran 95 s is not fast"),
                           (three[:2] + [failure(3, ended=-70)], "outside the hour"),
                           (three[:2] + [dict(failure(3), conclusion="cancelled")], "only failures")):
@@ -837,35 +842,34 @@ class WatcherTests(unittest.TestCase):
         self.assertNotIn(("GET", "repos/{repo}/actions/runs/502/jobs?filter=all&per_page=100"), self.gh.calls,
                          "pull-request CI never targets the control runners")
 
-    def test_a_poisoned_runner_goes_to_alex_once_and_wakes_nobody(self):
+    def fast_android_failures(self, runs):
+        """Android failing in 41 s on Eidolon-heavy, once per (run id, attempt) in `runs`, while
+        Tycho, online, carries the same label."""
         self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
         self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
                            runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
-        self.gh.recent_runs = [{"id": 601, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
+        self.gh.recent_runs = [{"id": run_id, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
                                 "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-50)),
-                                "updated_at": snapshot.iso(at(-5))}]
-        self.gh.run_jobs = {601: [
-            {"id": n, "name": f"Android {n}", "conclusion": "failure", "runner_name": "Eidolon-heavy",
-             "labels": ["tycho-macos"], "started_at": snapshot.iso(at(-10 * n)),
-             "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))} for n in (1, 2, 3)]}
+                                "updated_at": snapshot.iso(at(-5))} for run_id in sorted({run_id for run_id, _ in runs})]
+        self.gh.run_jobs = {}
+        for n, (run_id, attempt) in enumerate(runs, 1):
+            self.gh.run_jobs.setdefault(run_id, []).append(
+                {"id": n, "run_id": run_id, "run_attempt": attempt, "name": "Android / Android arm64 tests + APK + ELF closure",
+                 "conclusion": "failure", "runner_name": "Eidolon-heavy", "labels": ["tycho-macos"],
+                 "started_at": snapshot.iso(at(-10 * n)), "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))})
+
+    def test_a_poisoned_runner_goes_to_alex_once_and_wakes_nobody(self):
+        # As on 2026-10-08: the same job failing fast on the laptop in three different batches.
+        self.fast_android_failures([(601, 1), (602, 1), (603, 1)])
         self.tick(0)
         self.tick(15)
         self.assertEqual(self.runs, [])
         escalations = [c for c in self.gh.issue_comments if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
         self.assertEqual(len(escalations), 1)
-        self.assertIn("Runner Eidolon-heavy may be poisoned", escalations[0]["body"])
+        self.assertIn("Runner Eidolon-heavy may be poisoned: it failed 3 jobs", escalations[0]["body"])
 
     def test_one_job_rerun_three_times_on_one_runner_is_not_poisoning(self):
-        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
-        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
-                           runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
-        self.gh.recent_runs = [{"id": 601, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
-                                "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-50)),
-                                "updated_at": snapshot.iso(at(-5))}]
-        self.gh.run_jobs = {601: [
-            {"id": n, "name": "Android", "conclusion": "failure", "runner_name": "Eidolon-heavy", "run_attempt": n,
-             "labels": ["tycho-macos"], "started_at": snapshot.iso(at(-10 * n)),
-             "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))} for n in (1, 2, 3)]}
+        self.fast_android_failures([(601, 1), (601, 2), (601, 3)])
         self.tick(0)
         self.assertEqual(self.gh.records("conductor", "escalate"), [])
 

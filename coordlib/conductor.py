@@ -106,7 +106,7 @@ CONTROL_VARIABLE = "MK4_RUNNER_CONTROL"
 # waiting and no step started, the watcher dispatches one itself.
 TRAIN_ASLEEP_AFTER = dt.timedelta(minutes=20)
 CONTROL_QUEUED_AFTER = dt.timedelta(minutes=15)
-# A runner that fails POISON_JOBS differently named jobs in under POISON_FAST each within POISON_WINDOW,
+# A runner that fails POISON_JOBS jobs (distinct run and job name) in under POISON_FAST each within POISON_WINDOW,
 # while another online runner could take them, is reported as poisoned (a stale cache, a
 # wrong toolchain). Escalated only: the jobs may have failed for real.
 POISON_WINDOW = dt.timedelta(hours=1)
@@ -390,19 +390,20 @@ def control_queued_reasons(jobs: List[Dict[str, Any]], label: str, state: Dict[s
 def poisoned_runners(jobs: List[Dict[str, Any]], runners: List[Dict[str, Any]], state: Dict[str, Any],
                      now: dt.datetime) -> List[Dict[str, str]]:
     """Runners that look poisoned, as {key, text} to escalate: within POISON_WINDOW one runner
-    failed POISON_JOBS or more distinctly named jobs that each ran under POISON_FAST (re-runs
-    of one job count once), while another online runner carries every label one of those
-    jobs asked for (the work had somewhere else to go). The key holds when it was first
-    seen, so one episode is told once."""
+    failed POISON_JOBS or more distinct jobs, each a (run, job name) pair, that each ran under
+    POISON_FAST, while another online runner carries every label one of those jobs asked
+    for (the work had somewhere else to go). Re-runs of a job within its run count once;
+    the same job failing in different runs or batches (Android on the laptop, 2026-10-08)
+    counts once per run. The key holds when it was first seen, so one episode is told once."""
     flagged = state.setdefault("runnerPoisoned", {})
-    fast: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    fast: Dict[str, Dict[Tuple[Any, str], Dict[str, Any]]] = {}
     for job in jobs:
         start, end = _time(job.get("started_at")), _time(job.get("completed_at"))
         runner = job.get("runner_name")
         if job.get("conclusion") != "failure" or not runner or start is None or end is None:
             continue
         if now - end <= POISON_WINDOW and end - start < POISON_FAST:
-            fast.setdefault(runner, {})[str(job.get("name"))] = job
+            fast.setdefault(runner, {})[(job.get("run_id"), str(job.get("name")))] = job
     online = [r for r in runners if r.get("status") == "online"]
     out = []
     for runner, failed in sorted(fast.items()):
@@ -412,9 +413,9 @@ def poisoned_runners(jobs: List[Dict[str, Any]], runners: List[Dict[str, Any]], 
         if len(failed) < POISON_JOBS or not others:
             continue
         since = flagged.setdefault(runner, iso(now))
-        names = ", ".join(sorted(failed)[:3])
+        names = ", ".join(sorted({name for _, name in failed})[:3])
         out.append({"key": f"runner-poisoned:{runner}:{since}",
-                    "text": (f"Runner {runner} may be poisoned: it failed {len(failed)} different jobs in under "
+                    "text": (f"Runner {runner} may be poisoned: it failed {len(failed)} jobs in under "
                              f"{int(POISON_FAST.total_seconds())} s each in the last hour ({names}), while "
                              f"{', '.join(others)} could have taken them. If its jobs fail for its own reasons (stale "
                              "caches, a wrong toolchain), take its routing labels off; the conductor does not.")})
