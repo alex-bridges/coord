@@ -1025,8 +1025,8 @@ class Watcher:
                                    f"and is holding {len(wakeable)} reasons. Raise CONDUCTOR_MAX_WAKES_PER_DAY or look at "
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
-            if down and leader and github_ok and can_read and not pause:
-                self.handoff_outage(wakeable, down["end"])
+            if (down or not wake) and leader and github_ok and can_read and not pause:
+                self.handoff_pending(wakeable, down)
         elif wakeable:
             woke = True
             self.state.pop("capEscalated", None)
@@ -1035,9 +1035,9 @@ class Watcher:
             result = self.wake(todo if leader else wakeable, leader, hosts, extra, ended)
             extra["lastWake"] = self.state.get("lastWake")
             if result.get("limit") and github_ok:
-                self.post_outage(result["limit"])
-                if leader:
-                    self.handoff_outage(wakeable, result["limit"]["until"])
+                down = self.post_outage(result["limit"])
+                if leader and down:
+                    self.handoff_pending(wakeable, down)
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
         if leader and github_ok:
@@ -1099,6 +1099,13 @@ class Watcher:
             # not only the watcher log nobody but this host can see.
             extra["reviewer"] = {"waiting": len(waiting),
                                  "appAvailable": jobs.app is not None and getattr(jobs.app, "app", None) is not None}
+        if (down or not wake) and not pause and not unread and user_ok:
+            # Match Reviews.step's continuation contract: finished posts and known-error
+            # replies need no model and still proceed. Only a waiting run needs a backup.
+            self.handoff_pending([
+                reason(f"review:{r['id']}", "review", f"Requested {r['model']} review of #{r['pr']}", r["url"])
+                for r in waiting if not any(r.get(k) for k in ("unsent", "posting", "finished", "error"))
+            ], down)
         jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1186,28 +1193,36 @@ class Watcher:
 
     # MARK: Records
 
-    def post_outage(self, limit: Dict[str, Any]) -> None:
+    def post_outage(self, limit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """One comment per episode: a limit found again within the hour after the last one
         this host posted ran out (an hourly probe of an unknown reset) edits that comment's
-        `until` instead of posting another."""
+        `until` instead of posting another, unless recovery has already closed the episode."""
         until = limit["until"]
         body = {"body": marker.compose(outage_text(until, limit["reason"], self.config.agent), {
             "kind": "outage", "v": 1, "event": "start", "agent": self.config.agent, "harness": "claude",
             "until": iso(until), "reason": limit["reason"]})}
         last = self.state.get("outageComment") or {}
         last_until = _time(last.get("until"))
+        last_record = next((c for c in self.records if c["id"] == last.get("id")), None)
+        last_start = _time((last_record or {}).get("createdAt"))
+        last_window = outage.down(outage.windows(self.records), self.config.agent, last_start) if last_start else None
+        posted = None
         if (isinstance(last.get("id"), int) and last.get("issue") == self.issue and last_until is not None
-                and self.now - last_until <= outage.PROBE_AFTER):
+                and self.now - last_until <= outage.PROBE_AFTER and last_window and not last_window.get("closed")):
             try:
-                self.gh.rest(f"repos/{{repo}}/issues/comments/{last['id']}", method="PATCH", body=body)
-                self.state["outageComment"] = {"id": last["id"], "issue": self.issue, "until": iso(until)}
+                posted = self.gh.rest(f"repos/{{repo}}/issues/comments/{last['id']}", method="PATCH", body=body)
                 self.say(f"usage limit again: the outage now runs until {iso(until)}")
-                return
             except GitHubError:
                 pass  # deleted: post a new one
-        self.say(f"usage limit: posting a claude outage until {iso(until)}")
-        posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
+        if posted is None:
+            self.say(f"usage limit: posting a claude outage until {iso(until)}")
+            posted = self.gh.rest(f"repos/{{repo}}/issues/{self.issue}/comments", method="POST", body=body)
         self.state["outageComment"] = {"id": posted.get("id"), "issue": self.issue, "until": iso(until)}
+        # Use the same episode identity now and on the next tick. A PATCH retains its
+        # createdAt, and a start during an open outage retains that window's first start.
+        self.records = [c for c in self.records if c["id"] != posted.get("id")] + coord_comments([posted])
+        posted_at = _time(posted.get("created_at")) or self.now
+        return outage.down(outage.windows(self.records), self.config.agent, max(self.now, posted_at))
 
     def post_outage_end(self, window: Dict[str, Any]) -> None:
         self.say("first good run after the outage: posting its end")
@@ -1230,16 +1245,18 @@ class Watcher:
         self.escalate_text(text)
         told[key] = iso(self.now)
 
-    def handoff_outage(self, reasons: List[Dict[str, Any]], until: dt.datetime) -> None:
+    def handoff_pending(self, reasons: List[Dict[str, Any]], down: Optional[Dict[str, Any]]) -> None:
         """Tell the backup operator about new work; leave model work and mail pending."""
         told = self.state.setdefault("escalatedOnce", {})
-        keys = {r["key"]: f"claude-outage:{iso(until)}:{r['key']}" for r in reasons}
+        episode = f"claude-outage:{iso(down['start'])}" if down else "no-wake"
+        keys = {r["key"]: f"{episode}:{r['key']}" for r in reasons}
         waiting = [r for r in reasons if (_time(told.get(keys[r["key"]])) is None
                    or self.now - _time(told[keys[r["key"]]]) >= REMIND_AFTER)]
         if not waiting:
             return
-        text = (f"Claude is unavailable until {iso(until)}. {len(waiting)} pending conductor "
-                "reason(s) need a human or an active Codex session to take over repair duties. "
+        blocked = f"Claude is unavailable until {iso(down['end'])}" if down else "Model wakes are disabled (--no-wake)"
+        text = (f"{blocked}. {len(waiting)} pending conductor "
+                "reason(s) need a human or an active Codex session to take over repairs or reviews. "
                 "The model-free watcher still maintains its heartbeat and wakes the merge train. "
                 "These reasons and the inbox cursor remain pending for recovery.\n\n"
                 + "\n".join(f"- [{r['kind']}] {_clip(r['summary'], 300)}"

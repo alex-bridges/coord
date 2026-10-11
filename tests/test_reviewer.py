@@ -291,16 +291,63 @@ class ReviewFlowTests(unittest.TestCase):
         self.tick(15)
         self.assertNotIn("reviewer", self.gh.records("conductor", "beat")[-1], "answered: no backlog left to show")
 
-    def test_a_usage_limit_posts_the_outage_and_keeps_the_request(self):
+    def test_no_wake_review_handoff_preserves_the_request_and_obeys_pause(self):
+        self.tick(0)
+        request = self.ask(1)
+        cursor = cli.cache.load_cursor(self.gh.repo, self.config.agent)
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
+                                    "until": snapshot.iso(at(10))}, 2)
+        self.tick(5, wake=False)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+        self.tick(15, wake=False)
+        self.tick(20, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.assertEqual(self.reviews(), [])
+        state = conductor.load_state(self.config)
+        self.assertEqual((state["reviews"][str(request["id"])]["status"],
+                          state["reviews"][str(request["id"])]["attempts"]), ("pending", 0))
+        self.assertEqual(cli.cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+        self.assertEqual(state.get("handled"), {})
+        self.replies = [review_reply()]
+        self.tick(25)
+        self.assertEqual(len(self.reviews()), 1)
+        self.assertEqual(len(self.app.markers("review")), 1)
+
+    def test_no_wake_posts_finished_reviews_without_a_backup_handoff(self):
         self.tick(0)
         self.ask(1)
+        self.replies = [review_reply()]
+        self.app.fail_posts = 1
+        self.tick(5)
+        self.assertEqual(len(self.reviews()), 1)
+        self.assertEqual(self.app.markers("review"), [])
+        self.tick(10, wake=False)
+        self.assertEqual(len(self.reviews()), 1)
+        self.assertEqual(len(self.app.markers("review")), 1)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+
+    def test_a_usage_limit_posts_the_outage_and_keeps_the_request(self):
+        self.tick(0)
+        request = self.ask(1)
+        cursor = cli.cache.load_cursor(self.gh.repo, self.config.agent)
         self.replies = [claude_result("You've hit your limit · resets in 2h", code=1, is_error=True)]
         self.tick(5)
         self.assertEqual(len(self.gh.records("outage", "start")), 1)
         self.assertEqual(self.app.markers("review"), [])
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
+                                    "until": snapshot.iso(at(20))}, 10)
+        self.tick(15)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
         lines = self.tick(30)
         self.assertEqual(len(self.reviews()), 1)
         self.assertTrue(any("Claude is down" in line for line in lines))
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.tick(35)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        state = conductor.load_state(self.config)
+        self.assertEqual((state["reviews"][str(request["id"])]["status"],
+                          state["reviews"][str(request["id"])]["attempts"]), ("pending", 0))
+        self.assertEqual(cli.cache.load_cursor(self.gh.repo, self.config.agent), cursor)
         self.replies = [review_reply()]
         self.tick(130)
         self.assertEqual(len(self.reviews()), 2)

@@ -635,6 +635,100 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(len(self.runs), 1)
         self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
 
+    def test_outage_deadline_updates_keep_the_episode_but_a_later_episode_alerts(self):
+        self.tick(0)
+        self.message(1)
+        self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(120))}, 2)
+        self.tick(5)
+        self.gh.post(900, "reset moved", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(240))}, 6)
+        self.tick(10)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1, "same episode, same reason")
+        self.gh.post(900, "next outage", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(400))}, 250)
+        self.tick(255)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2, "a later episode alerts immediately")
+        self.assertEqual(self.runs, [])
+
+    def test_refused_probe_edits_the_episode_without_repeating_its_handoff(self):
+        self.tick(0)
+        self.message(1)
+        cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+        self.replies = [claude_result("You've hit your limit · resets in 1h", code=1, is_error=True)] * 2
+        self.tick(5)
+        self.tick(70)  # the reset was unknown: a refused probe PATCHes the original comment
+        self.tick(75)
+        self.assertEqual(len(self.runs), 2)
+        self.assertEqual(len(self.gh.records("outage", "start")), 1)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+        self.assertEqual(conductor.load_state(self.config).get("handled"), {})
+
+    def test_a_refusal_after_recovery_starts_and_hands_off_a_new_episode(self):
+        self.tick(0)
+        self.message(1)
+        self.replies = [claude_result("You've hit your limit · resets in 2h", code=1, is_error=True)]
+        self.tick(5)
+        self.tick(130)  # the successful wake closes the first episode
+        self.message(131)
+        self.replies = [claude_result("You've hit your limit · resets in 2h", code=1, is_error=True)]
+        self.tick(135)
+        self.assertEqual(len(self.gh.records("outage", "start")), 2)
+        self.assertEqual(len(self.gh.records("outage", "end")), 1)
+        down = outage.down(outage.windows(conductor.coord_comments(self.gh.issue_comments)), self.config.agent, at(135))
+        self.assertIsNotNone(down)
+        self.assertEqual(down["start"], at(135))
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        self.tick(140)
+        self.assertEqual(len(self.runs), 3, "the new outage suppresses further wakes")
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+
+    def test_no_wake_leader_hands_off_messages_and_red_ci_daily_then_recovers(self):
+        self.tick(0)
+        self.message(1)
+        self.gh.main_runs = [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "event": "push",
+                              "head_sha": "abc", "html_url": "r/7"}]
+        cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+        state = conductor.load_state(self.config)
+        prior = {f"comment:{self.gh.repo_comments[-1]['id']}": {"attempts": 1, "at": snapshot.iso(at(2))}}
+        state["handled"] = prior
+        conductor.save_state(self.config, state)
+        self.tick(20, wake=False)
+        self.tick(25, wake=False)
+        self.tick(24 * 60 + 19, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.tick(24 * 60 + 20, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        alerts = [c["body"] for c in self.gh.issue_comments
+                  if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
+        self.assertIn("--no-wake", alerts[0])
+        self.assertIn("the train looks stuck", alerts[0])
+        self.assertIn("r/7", alerts[0])
+        self.assertEqual(self.runs, [])
+        self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+        self.assertEqual(conductor.load_state(self.config).get("handled"), prior)
+        self.tick(24 * 60 + 40)  # a slow tick also rechecks CI
+        self.assertEqual([r["model"] for r in self.runs], [conductor.REPAIR_MODEL])
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+        self.assertIn("r/7", self.runs[0]["prompt"])
+        self.tick(24 * 60 + 45)
+        self.assertEqual(len(self.runs), 1, "normal recovery consumes the pending work once")
+
+    def test_operator_pause_holds_no_wake_handoffs_with_or_without_an_outage(self):
+        self.tick(0)
+        self.message(1)
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
+                                    "until": snapshot.iso(at(60))}, 2)
+        self.tick(5, wake=False)
+        self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(120))}, 6)
+        self.tick(10, wake=False)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+        self.tick(65, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.assertEqual(self.runs, [])
+
     def test_outage_standby_does_not_handoff_the_leaders_work(self):
         self.gh.post(900, "leader", {"kind": "conductor", "v": 1, "event": "beat",
                      "agent": "conductor@Old:c", "beat": snapshot.iso(at(-1))}, -600)
@@ -642,6 +736,7 @@ class WatcherTests(unittest.TestCase):
                      "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(120))}, -1)
         self.message(-1)
         self.tick(0)
+        self.tick(5, wake=False)
         self.assertEqual(self.runs, [])
         self.assertEqual(self.gh.records("conductor", "escalate"), [])
 
