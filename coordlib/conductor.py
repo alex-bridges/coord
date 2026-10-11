@@ -1053,7 +1053,9 @@ class Watcher:
                                    f"and is holding {len(wakeable)} reasons. Raise CONDUCTOR_MAX_WAKES_PER_DAY or look at "
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
-            if (down or not wake) and github_ok and can_read and not pause:
+            # Fresh GitHub work is read-gated above; known local reasons need only
+            # the write floor already established by github_ok.
+            if (down or not wake) and github_ok and not pause:
                 self.handoff_pending(wakeable, down)
         elif wakeable:
             woke = True

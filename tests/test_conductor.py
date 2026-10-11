@@ -762,6 +762,37 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.runs, [])
         self.assertEqual(conductor.load_state(self.config).get("handled"), {})
 
+    def test_local_disk_handoff_uses_write_floor_without_reading_github_work(self):
+        self.gh.post(900, "leader", {"kind": "conductor", "v": 1, "event": "beat",
+                     "agent": "conductor@Old:c", "beat": snapshot.iso(at(0))}, -600)
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
+                                    "until": snapshot.iso(at(5))}, -1)
+        self.message(1)
+        with mock.patch.object(conductor.budget, "hard_floor", return_value=300), \
+                mock.patch.object(conductor.budget, "read_floor", return_value=1500), \
+                mock.patch.object(conductor.Watcher, "budget_left") as remaining:
+            remaining.return_value = 300
+            self.tick(0, wake=False, free_gb=5)
+            self.assertEqual(self.gh.records("conductor", "escalate"), [], "pause still suppresses local alerts")
+            cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+            remaining.return_value = 1499
+            self.tick(5, wake=False, free_gb=5)
+            alerts = self.gh.records("conductor", "escalate")
+            self.assertEqual(len(alerts), 1, "writes can hand off known local work below the read floor")
+            remaining.return_value = 300
+            self.tick(10, wake=False, free_gb=5)
+            self.assertEqual(len(self.gh.records("conductor", "escalate")), 1, "local alert remains deduplicated")
+            calls = list(self.gh.calls)
+            remaining.return_value = 299
+            self.tick(15, wake=False, free_gb=5)
+            self.assertEqual(self.gh.calls, calls, "the hard floor still prevents control reads and writes")
+        self.assertFalse(any("issues/comments?since" in path for _, path in self.gh.calls))
+        cli.get_snapshot.assert_not_called()
+        self.assertFalse(any(workflow == "merge-train.yml" for workflow, _, _ in self.gh.dispatches))
+        self.assertEqual(self.runs, [])
+        self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+        self.assertEqual(conductor.load_state(self.config).get("handled"), {})
+
     def assert_week_of_pending_mail(self, outage_mode):
         self.tick(0)
         self.message(1)
