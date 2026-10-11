@@ -129,6 +129,40 @@ class ConductorInstallTests(unittest.TestCase):
         candidate = self.assert_installed(self.run_install("--no-wake", "--interval", "45"), True)
         self.assertEqual(candidate["StartInterval"], 45)
 
+    def test_installed_path_runs_checkout_update_with_git_from_a_separate_directory(self):
+        git_bin = self.root / "custom git bin"
+        git_bin.mkdir()
+        (self.bin / "git").unlink()
+        (git_bin / "git").symlink_to(self.fake_tool)
+        self.env["PATH"] = os.pathsep.join((str(git_bin), str(self.bin)))
+
+        candidate = self.assert_installed(self.run_install("--no-wake"), True)
+        runtime_env = dict(self.env, **candidate["EnvironmentVariables"])
+        self.assertEqual(shutil.which("git", path=runtime_env["PATH"]), str(git_bin / "git"))
+        event_count = len(self.read_events())
+        # The installer's dry-run skips self-update. Exercise the real update
+        # path separately with the persisted environment and only our fake Git.
+        update = textwrap.dedent("""\
+            import sys
+            sys.path.insert(0, sys.argv[1])
+            from coordlib.conductor import Config, Watcher
+            config = Config(home=sys.argv[2], state_dir=sys.argv[3], claude='unused',
+                            agent='conductor@FakeHost:conductor', host='FakeHost')
+            Watcher(config, gh=None).update_checkout()
+            """)
+        result = subprocess.run(
+            [candidate["ProgramArguments"][0], "-c", update, str(INSTALLER.parents[1]),
+             str(self.checkout), str(self.root / "state")],
+            cwd=candidate["WorkingDirectory"], env=runtime_env,
+            text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([event["args"] for event in self.read_events()[event_count:]], [
+            ["-C", str(self.checkout), "status", "--porcelain"],
+            ["-C", str(self.checkout), "symbolic-ref", "-q", "HEAD"],
+            ["-C", str(self.checkout), "fetch", "-q", "origin", "main"],
+            ["-C", str(self.checkout), "checkout", "-q", "--detach", "FETCH_HEAD"],
+        ])
+
     def test_refresh_preserves_no_wake_and_operator_environment(self):
         self.existing()
         before = self.read_plist()["EnvironmentVariables"]

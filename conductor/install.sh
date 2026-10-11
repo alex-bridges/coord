@@ -47,6 +47,7 @@ fi
 for tool in git python3 gh; do
   command -v "$tool" >/dev/null || { echo "install.sh: $tool is not on PATH" >&2; exit 1; }
 done
+GIT="$(command -v git)"
 PY="$(command -v python3)"
 WAKE_MODE="$("$PY" - "$PLIST" "$WAKE_MODE" <<'PY'
 import pathlib
@@ -75,8 +76,9 @@ fi
 
 HOST="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
 AGENT="conductor@$HOST:conductor"
-# launchd starts jobs with a bare PATH. Model-free installations need no Claude path.
-JOB_PATH="$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd starts jobs with a bare PATH; retain every required tool's directory.
+# Git may live separately from gh/Python and is needed for the watcher's self-update.
+JOB_PATH="$(dirname "$GIT"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [ "$WAKE_MODE" = wake ]; then
   JOB_PATH="$(dirname "$(command -v claude)"):$JOB_PATH"
 fi
