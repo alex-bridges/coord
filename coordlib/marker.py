@@ -79,7 +79,7 @@ _FIELDS: Dict[str, Callable[[Any], bool]] = {
     # `request`, a comment id, stays untyped: train records use that name for an object.)
     "verdict": _nonempty_text, "model": _text, "revokes": _text,
     "countsForTrain": lambda value: type(value) is bool,
-    "reviewRuns": _texts,
+    "reviewRuns": _texts, "handoffKeys": _texts,
 }
 _REQUIRED = {
     "claim": ("issue",), "release": ("issue",), "msg": ("to",),

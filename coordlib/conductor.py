@@ -62,8 +62,8 @@ REMIND_AFTER = dt.timedelta(hours=24)
 BEAT_DURING_RUN = dt.timedelta(minutes=5)
 MAX_ATTEMPTS = 3
 HANDLED_KEEP = dt.timedelta(days=14)
-# The inbox is read back at most this far: the cursor only moves when a run succeeds, and
-# a long quiet stretch must not make every tick page through days of comments.
+# Steady-state reads are capped; messages already seen stay in pendingInbox until handled.
+# A new leader reads from the adopted delivery cursor once to recover the old host's backlog.
 MAX_LOOKBACK = dt.timedelta(hours=48)
 
 # Enforced, not requested: the unattended run cannot do these whatever its prompt says.
@@ -498,7 +498,8 @@ def mark(state: Dict[str, Any], reasons: List[Dict[str, Any]], now: dt.datetime,
 
 def prune(state: Dict[str, Any], now: dt.datetime) -> None:
     handled = state.get("handled") or {}
-    for key in [k for k, v in handled.items() if (now - (_time(v.get("at")) or now)) > HANDLED_KEEP]:
+    for key in [k for k, v in handled.items() if k not in (state.get("pendingInbox") or {})
+                and (now - (_time(v.get("at")) or now)) > HANDLED_KEEP]:
         handled.pop(key)
     told = state.get("escalatedOnce") or {}
     for key in [k for k, at in told.items() if (now - (_time(at) or now)) > HANDLED_KEEP]:
@@ -778,6 +779,18 @@ class Watcher:
         for host in hosts:  # this host's own beat too: a run it sent mid-review before dying
             runs.extend(r for r in host.get("reviewRuns") or [] if r not in runs)
 
+    def adopt_handoffs(self) -> None:
+        """Owner-authored escalation receipts carry daily deduplication across hosts."""
+        told = self.state.setdefault("escalatedOnce", {})
+        for record in lease._records(self.records, "escalate", self.gh.repo):
+            posted = _time(record.get("createdAt"))
+            if posted is None or not dt.timedelta(0) <= self.now - posted < REMIND_AFTER:
+                continue
+            for key in record["payload"].get("handoffKeys") or []:
+                previous = _time(told.get(key))
+                if previous is None or previous < posted:
+                    told[key] = iso(posted)
+
     def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> None:
         """A new leader starts reading where the last leader had read to. Only beats posted
         as leader count: a standby's cursor says nothing about the conductor's inbox. On a
@@ -788,7 +801,7 @@ class Watcher:
         mine = cache.load_cursor(self.gh.repo, self.config.agent)
         newest = max((h["seenThrough"] for h in hosts if h.get("wasLeader") and h["agent"] != self.config.agent
                       and _time(h.get("seenThrough"))), key=lambda v: _time(v), default=None)
-        takeover = not self.state.get("wasLeader")
+        takeover = not self.state.get("wasLeader") or self.state.get("inboxRescan")
         if newest and (mine is None or takeover or (_time(mine) or self.now) < (_time(newest) or self.now)):
             cache.store_cursor(self.gh.repo, self.config.agent, newest, [])
             self.say(f"adopted the conductor's inbox cursor {newest}")
@@ -801,7 +814,8 @@ class Watcher:
         reasons: List[Dict[str, Any]] = []
         me = self.config.agent
         cursor = cache.load_cursor(self.gh.repo, me) or iso(self.now)
-        since = max((_time(cursor) or self.now) - cli.CURSOR_OVERLAP, self.now - MAX_LOOKBACK)
+        unread_since = (_time(cursor) or self.now) - cli.CURSOR_OVERLAP
+        since = unread_since if self.state.get("inboxRescan") else max(unread_since, self.now - MAX_LOOKBACK)
         snap = cli.get_snapshot(self.gh, 60 if slow else SLOW_EVERY.total_seconds())
         issue_comments = self.gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={iso(since)}&per_page=100")
         review_comments = self.gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={iso(since)}&per_page=100")
@@ -819,7 +833,18 @@ class Watcher:
                 f"repos/{{repo}}/issues/comments?since={iso(self.now - reviewer.FRESH)}&per_page=100")
             reviewer.Reviews(self, None).rescan(older)
             self.state.pop("reviewRescan", None)
-        reasons += message_reasons(items, payloads)
+        saved = self.state.setdefault("pendingInbox", {})
+        for item, message in zip(items, message_reasons(items, payloads)):
+            saved[message["key"]] = dict(message, at=item["at"], id=item["id"])
+        seen = set(cache.load_seen_ids(self.gh.repo, me))
+        handled = self.state.get("handled") or {}
+        # A successful run removes its entries; an operator's inbox read can also consume
+        # them. Notification, cooldown, broadcast-only ticks and outages do neither.
+        self.state["pendingInbox"] = {key: item for key, item in saved.items()
+                                      if (_time(item.get("at")) or unread_since) > unread_since
+                                      and item.get("id") not in seen and not (handled.get(key) or {}).get("done")}
+        reasons += list(self.state["pendingInbox"].values())
+        self.state.pop("inboxRescan", None)
         if slow:
             reasons += stuck_reasons(snap, self.now)
             main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch=main&per_page=5") or {}
@@ -943,6 +968,7 @@ class Watcher:
                 self.read_records(create=not dry_run, refresh=slow)
                 leader, hosts = self.role()
                 windows = outage.windows(self.records)
+                self.adopt_handoffs()
                 github_ok = True
             except GitHubError as error:
                 self.say(f"GitHub unreachable ({_clip(str(error), 120)}); local checks only")
@@ -953,6 +979,8 @@ class Watcher:
             # history nobody asked it to answer.
             cache.store_cursor(self.gh.repo, self.config.agent, iso(self.now), [])
             self.say("no inbox cursor: starting from now")
+        if leader and not self.state.get("wasLeader"):
+            self.state["inboxRescan"] = True  # retained through a low budget or failed read
         if leader and can_read:
             self.adopt_cursor(hosts)
             self.adopt_review_runs(hosts)
@@ -1025,7 +1053,7 @@ class Watcher:
                                    f"and is holding {len(wakeable)} reasons. Raise CONDUCTOR_MAX_WAKES_PER_DAY or look at "
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
-            if (down or not wake) and leader and github_ok and can_read and not pause:
+            if (down or not wake) and github_ok and can_read and not pause:
                 self.handoff_pending(wakeable, down)
         elif wakeable:
             woke = True
@@ -1036,7 +1064,7 @@ class Watcher:
             extra["lastWake"] = self.state.get("lastWake")
             if result.get("limit") and github_ok:
                 down = self.post_outage(result["limit"])
-                if leader and down:
+                if down:
                     self.handoff_pending(wakeable, down)
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
@@ -1134,6 +1162,8 @@ class Watcher:
                               f"The triage run escalated to you: {result['summary']}", extra)
         if result["ok"]:
             mark(self.state, reasons, self.now, done=True)
+            for item in reasons:
+                self.state.get("pendingInbox", {}).pop(item["key"], None)
             if leader:
                 # The model's own `coord inbox` normally does this; make sure a run that
                 # forgot does not see the same week of mail next time.
@@ -1263,14 +1293,17 @@ class Watcher:
                             + (f" {r['url']}" if r["url"] else "") for r in waiting[:10]))
         if len(waiting) > 10:
             text += f"\n- {len(waiting) - 10} additional reasons: inspect `coord conductor tick --dry-run`."
-        self.escalate_text(text)
+        self.escalate_text(text, handoff_keys=[keys[item["key"]] for item in waiting])
         for item in waiting:
             told[keys[item["key"]]] = iso(self.now)
 
-    def escalate_text(self, text: str) -> None:
+    def escalate_text(self, text: str, handoff_keys: Optional[List[str]] = None) -> None:
         self.say(f"escalating to Alex: {_clip(text, 120)}")
+        payload = {"kind": "conductor", "v": 1, "event": "escalate", "agent": self.config.agent}
+        if handoff_keys:
+            payload["handoffKeys"] = handoff_keys
         posted = post_record(self.gh, self.issue, text,
-                             {"kind": "conductor", "v": 1, "event": "escalate", "agent": self.config.agent})
+                             payload)
         link = (posted or {}).get("html_url") or ""
         if not notify_alex(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
             self.say("could not dispatch Notify Alex; the escalation is on the board only")

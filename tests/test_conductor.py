@@ -518,10 +518,10 @@ class WatcherTests(unittest.TestCase):
         self.runs.append({"model": cmd[cmd.index("--model") + 1], "prompt": cmd[2], "agent": env["COORD_AGENT"]})
         return self.replies.pop(0) if self.replies else claude_result("SUMMARY: done")
 
-    def tick(self, minutes, config=None, **kwargs):
+    def tick(self, minutes, config=None, free_gb=100.0, **kwargs):
         self.gh.clock_minutes = minutes
         watcher = conductor.Watcher(config or self.config, self.gh, now=at(minutes), runner=self.runner,
-                                    disk=lambda path: 100.0)
+                                    disk=lambda path: free_gb)
         return watcher.tick(**kwargs)
 
     def message(self, minutes, to="conductor@*", text="the train looks stuck"):
@@ -739,6 +739,161 @@ class WatcherTests(unittest.TestCase):
         self.tick(5, wake=False)
         self.assertEqual(self.runs, [])
         self.assertEqual(self.gh.records("conductor", "escalate"), [])
+
+    def test_no_wake_standby_hands_off_only_its_local_disk_and_obeys_pause(self):
+        self.gh.post(900, "leader", {"kind": "conductor", "v": 1, "event": "beat",
+                     "agent": "conductor@Old:c", "beat": snapshot.iso(at(0))}, -600)
+        self.gh.post(900, "paused", {"kind": "conductor", "v": 1, "event": "pause", "agent": "claude@E:x",
+                                    "until": snapshot.iso(at(5))}, -1)
+        self.tick(0, wake=False, free_gb=5)
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+        self.message(1)
+        self.gh.main_runs = [{"id": 7, "status": "completed", "conclusion": "failure", "name": "CI", "event": "push",
+                              "head_sha": "abc", "html_url": "r/7"}]
+        self.tick(5, wake=False, free_gb=5)
+        self.tick(10, wake=False, free_gb=5)
+        alerts = [c["body"] for c in self.gh.issue_comments
+                  if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Tycho: 5 GB free", alerts[0])
+        self.assertNotIn("the train looks stuck", alerts[0])
+        self.assertNotIn("r/7", alerts[0])
+        self.assertFalse(any("issues/comments?since" in path for _, path in self.gh.calls), "standby never reads GitHub work")
+        self.assertEqual(self.runs, [])
+        self.assertEqual(conductor.load_state(self.config).get("handled"), {})
+
+    def assert_week_of_pending_mail(self, outage_mode):
+        self.tick(0)
+        self.message(1)
+        message_key = f"comment:{self.gh.repo_comments[-1]['id']}"
+        self.message(2, to="all", text="broadcast context remains pending")
+        if outage_mode:
+            self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                         "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(7 * 24 * 60 + 20))}, 3)
+        cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+        state = conductor.load_state(self.config)
+        prior = {message_key: {"attempts": 1, "at": snapshot.iso(at(2))}}
+        state["handled"] = prior
+        conductor.save_state(self.config, state)
+        for minutes in (5, 49 * 60, 7 * 24 * 60 + 10):
+            lines = self.tick(minutes, wake=outage_mode)
+            self.assertTrue(any("the train looks stuck" in line for line in lines))
+            self.assertTrue(any("broadcast context remains pending" in line for line in lines))
+            self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+            self.assertEqual(conductor.load_state(self.config).get("handled"), prior)
+            self.assertEqual(self.runs, [])
+        self.tick(7 * 24 * 60 + 25)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+        self.assertIn("broadcast context remains pending", self.runs[0]["prompt"])
+        self.assertEqual(conductor.load_state(self.config).get("pendingInbox"), {})
+        self.tick(7 * 24 * 60 + 30)
+        self.assertEqual(len(self.runs), 1)
+
+    def test_no_wake_pending_mail_survives_a_week_without_spending_attempts(self):
+        self.assert_week_of_pending_mail(outage_mode=False)
+
+    def test_outage_pending_mail_survives_a_week_without_spending_attempts(self):
+        self.assert_week_of_pending_mail(outage_mode=True)
+
+    def test_takeover_recovers_old_mail_but_not_the_old_hosts_disk(self):
+        self.tick(0)
+        self.message(1)
+        self.tick(5, wake=False, free_gb=5)
+        backup = make_config(os.path.join(self.tmp.name, "backup"), agent="conductor@Backup:conductor")
+        self.tick(7 * 24 * 60 + 10, config=backup, wake=False)
+        self.assertEqual(cache.load_cursor(self.gh.repo, backup.agent), snapshot.iso(at(0)))
+        self.tick(7 * 24 * 60 + 15, config=backup)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+        self.assertNotIn("disk-low", self.runs[0]["prompt"])
+
+    def assert_shared_handoff_after_takeover(self, outage_mode):
+        self.tick(0)
+        self.message(1)
+        if outage_mode:
+            self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                         "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(3 * 24 * 60))}, 2)
+        self.tick(5, wake=False)
+        backup = make_config(os.path.join(self.tmp.name, "backup"), agent="conductor@Backup:conductor")
+        self.tick(25, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1, "the new leader imports the first handoff")
+        self.message(26, text="new work for the backup")
+        self.tick(30, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        self.tick(24 * 60 + 4, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        self.tick(24 * 60 + 5, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 3, "the original reason gets its daily reminder")
+        self.assertEqual(len(self.gh.dispatches), 3)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(conductor.load_state(backup).get("handled"), {})
+        self.assertEqual(cache.load_cursor(self.gh.repo, backup.agent), snapshot.iso(at(0)))
+
+    def test_no_wake_handoff_receipts_follow_the_leader(self):
+        self.assert_shared_handoff_after_takeover(outage_mode=False)
+
+    def test_outage_handoff_receipts_follow_the_leader(self):
+        self.assert_shared_handoff_after_takeover(outage_mode=True)
+
+    def test_untrusted_future_and_malformed_handoff_receipts_cannot_hide_work(self):
+        self.tick(0)
+        self.message(1)
+        key = f"no-wake:comment:{self.gh.repo_comments[-1]['id']}"
+        payload = {"kind": "conductor", "v": 1, "event": "escalate", "agent": "conductor@Other:c", "handoffKeys": [key]}
+        forged = self.gh.post(900, "forged", payload, 2)
+        forged["user"] = {"login": "mallory", "type": "User"}
+        self.gh.post(900, "future", payload, 30)
+        self.gh.post(900, "malformed", dict(payload, handoffKeys=key), 2)
+        self.tick(5, wake=False)
+        self.assertEqual(len(self.gh.dispatches), 1)
+        self.assertIn("the train looks stuck", self.gh.issue_comments[-1]["body"])
+
+    def test_takeover_retries_its_old_cursor_read_after_a_failed_query(self):
+        self.tick(0)
+        self.message(1)
+        self.tick(5, wake=False)
+        backup = make_config(os.path.join(self.tmp.name, "backup"), agent="conductor@Backup:conductor")
+        self.snap.side_effect = conductor.GitHubError("temporary read failure")
+        self.tick(7 * 24 * 60 + 10, config=backup, wake=False)
+        self.snap.side_effect = None
+        self.tick(7 * 24 * 60 + 15, config=backup)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+
+    def test_old_broadcast_waits_for_a_waking_reason_without_being_consumed(self):
+        self.tick(0)
+        self.message(1, to="all", text="old broadcast context")
+        self.tick(5)
+        self.tick(49 * 60)
+        self.assertEqual(self.runs, [])
+        self.message(49 * 60 + 1)
+        self.tick(49 * 60 + 5)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("old broadcast context", self.runs[0]["prompt"])
+
+    def test_capped_pending_mail_stays_until_a_wake_succeeds(self):
+        self.tick(0)
+        self.message(1)
+        capped = make_config(self.config.state_dir)
+        capped.max_wakes_per_day = 0
+        self.tick(5, config=capped)
+        self.tick(49 * 60, config=capped)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(conductor.load_state(self.config).get("handled"), {})
+        self.tick(49 * 60 + 5)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+
+    def test_an_operator_inbox_read_consumes_saved_mail_without_replaying_it(self):
+        self.tick(0)
+        self.message(1)
+        comment_id = self.gh.repo_comments[-1]["id"]
+        self.tick(5, wake=False)
+        cache.store_cursor(self.gh.repo, self.config.agent, snapshot.iso(at(5)), [comment_id])
+        self.tick(7 * 24 * 60)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(conductor.load_state(self.config).get("pendingInbox"), {})
 
     def test_state_loss_reuses_only_its_own_heartbeat_comment(self):
         payload = {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,

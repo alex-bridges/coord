@@ -146,6 +146,14 @@ class MarkerTests(unittest.TestCase):
         self.assertEqual(marker.decode(body), payload)
         self.assertEqual(marker.strip(body), "Claimed.")
 
+    def test_handoff_receipts_require_a_list_of_string_keys(self):
+        payload = {"kind": "conductor", "v": 1, "agent": "conductor@Host:c", "event": "escalate",
+                   "handoffKeys": ["no-wake:comment:42"]}
+        self.assertEqual(marker.decode(marker.compose("Pending work.", payload)), payload)
+        for keys in ("no-wake:comment:42", [42], [None], {}, True):
+            with self.subTest(keys=keys):
+                self.assertIsNone(marker.decode(marker.compose("Invalid receipt.", dict(payload, handoffKeys=keys))))
+
     def test_double_hyphen_cannot_close_the_comment(self):
         payload = {"kind": "msg", "v": 1, "agent": "x", "to": ["all"], "note": "a --> b -- c ---"}
         encoded = marker.encode(payload)

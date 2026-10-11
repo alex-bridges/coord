@@ -326,6 +326,19 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual(len(self.app.markers("review")), 1)
         self.assertEqual(self.gh.records("conductor", "escalate"), [])
 
+    def test_no_wake_review_handoff_is_not_repeated_after_leader_takeover(self):
+        self.tick(0)
+        self.ask(1)
+        self.tick(5, wake=False)
+        backup = make_config(os.path.join(self.tmp.name, "backup"), agent="conductor@Backup:conductor")
+        self.tick(25, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.ask(26)
+        self.tick(30, config=backup, wake=False)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        self.assertEqual(self.runs, [])
+        self.assertTrue(all(r["attempts"] == 0 for r in conductor.load_state(backup)["reviews"].values()))
+
     def test_a_usage_limit_posts_the_outage_and_keeps_the_request(self):
         self.tick(0)
         request = self.ask(1)
