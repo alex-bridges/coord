@@ -1025,6 +1025,8 @@ class Watcher:
                                    f"and is holding {len(wakeable)} reasons. Raise CONDUCTOR_MAX_WAKES_PER_DAY or look at "
                                    "what keeps waking it (`coord conductor status`).")
                 self.state["capEscalated"] = iso(self.now)
+            if down and leader and github_ok and can_read and not pause:
+                self.handoff_outage(wakeable, down["end"])
         elif wakeable:
             woke = True
             self.state.pop("capEscalated", None)
@@ -1034,6 +1036,8 @@ class Watcher:
             extra["lastWake"] = self.state.get("lastWake")
             if result.get("limit") and github_ok:
                 self.post_outage(result["limit"])
+                if leader:
+                    self.handoff_outage(wakeable, result["limit"]["until"])
             elif result.get("ok") and ended and github_ok and leader:
                 self.post_outage_end(ended)
         if leader and github_ok:
@@ -1225,6 +1229,26 @@ class Watcher:
             return
         self.escalate_text(text)
         told[key] = iso(self.now)
+
+    def handoff_outage(self, reasons: List[Dict[str, Any]], until: dt.datetime) -> None:
+        """Tell the backup operator about new work; leave model work and mail pending."""
+        told = self.state.setdefault("escalatedOnce", {})
+        keys = {r["key"]: f"claude-outage:{iso(until)}:{r['key']}" for r in reasons}
+        waiting = [r for r in reasons if (_time(told.get(keys[r["key"]])) is None
+                   or self.now - _time(told[keys[r["key"]]]) >= REMIND_AFTER)]
+        if not waiting:
+            return
+        text = (f"Claude is unavailable until {iso(until)}. {len(waiting)} pending conductor "
+                "reason(s) need a human or an active Codex session to take over repair duties. "
+                "The model-free watcher still maintains its heartbeat and wakes the merge train. "
+                "These reasons and the inbox cursor remain pending for recovery.\n\n"
+                + "\n".join(f"- [{r['kind']}] {_clip(r['summary'], 300)}"
+                            + (f" {r['url']}" if r["url"] else "") for r in waiting[:10]))
+        if len(waiting) > 10:
+            text += f"\n- {len(waiting) - 10} additional reasons: inspect `coord conductor tick --dry-run`."
+        self.escalate_text(text)
+        for item in waiting:
+            told[keys[item["key"]]] = iso(self.now)
 
     def escalate_text(self, text: str) -> None:
         self.say(f"escalating to Alex: {_clip(text, 120)}")

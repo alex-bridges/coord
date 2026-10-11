@@ -16,7 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from coordlib import cli, conductor, lease, marker, outage, render, snapshot, train, train_step  # noqa: E402
+from coordlib import cache, cli, conductor, lease, marker, outage, render, snapshot, train, train_step  # noqa: E402
 
 # Friday 2026-09-25 21:00Z = 17:00 in New York (EDT, UTC-4).
 NOW = dt.datetime(2026, 9, 25, 21, 0, tzinfo=dt.timezone.utc)
@@ -598,6 +598,52 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.runs, [])
         self.assertFalse(any("issues/comments?since" in path for _, path in self.gh.calls), "no inbox read")
         self.assertIn("standby", self.gh.issue_comments[-1]["body"])
+
+    def test_outage_handoff_notifies_once_per_new_reason_without_consuming_mail(self):
+        self.tick(0)
+        self.message(1)
+        cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+        self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(120))}, 2)
+        self.tick(5)
+        self.tick(10)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.assertEqual(len(self.gh.dispatches), 1)
+        self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+        self.assertEqual(conductor.load_state(self.config).get("handled"), {})
+        self.message(11, text="new failed job")
+        self.tick(15, wake=False)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 2)
+        alerts = [c["body"] for c in self.gh.issue_comments
+                  if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
+        self.assertIn("new failed job", alerts[-1])
+        self.assertNotIn("the train looks stuck", alerts[-1])
+        self.tick(125)
+        self.assertEqual(len(self.runs), 1)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+        self.assertIn("new failed job", self.runs[0]["prompt"])
+
+    def test_limit_hit_hands_off_in_the_same_tick(self):
+        self.tick(0)
+        self.message(1)
+        self.replies = [claude_result("You've hit your limit · resets in 2h", code=1, is_error=True)]
+        self.tick(5)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+        self.tick(10)
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(len(self.gh.records("conductor", "escalate")), 1)
+
+    def test_outage_standby_does_not_handoff_the_leaders_work(self):
+        self.gh.post(900, "leader", {"kind": "conductor", "v": 1, "event": "beat",
+                     "agent": "conductor@Old:c", "beat": snapshot.iso(at(-1))}, -600)
+        self.gh.post(900, "Claude unavailable", {"kind": "outage", "v": 1, "event": "start",
+                     "agent": self.config.agent, "harness": "claude", "until": snapshot.iso(at(120))}, -1)
+        self.message(-1)
+        self.tick(0)
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
 
     def test_state_loss_reuses_only_its_own_heartbeat_comment(self):
         payload = {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,

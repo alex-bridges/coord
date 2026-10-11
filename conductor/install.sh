@@ -7,6 +7,8 @@
 #
 # Options: --home DIR (the conductor's checkout; default ~/conductor/INISA, made as a
 # detached worktree of this repository), --interval SECONDS (default 300).
+# --no-wake installs model-free ticks and does not require Claude; --wake enables
+# model wakes. Refreshes preserve the installed choice; new installs enable wakes.
 # Every CI box runs one; the lease in coord makes exactly one of them the conductor.
 # See Docs/agent-coordination.md, "The conductor".
 set -euo pipefail
@@ -17,13 +19,18 @@ LOG="$HOME/Library/Logs/inisa-conductor.log"
 HOME_DIR="$HOME/conductor/INISA"
 INTERVAL=300
 UNINSTALL=0
+WAKE_MODE=preserve
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --home) HOME_DIR="$2"; shift 2 ;;
-    --interval) INTERVAL="$2"; shift 2 ;;
+    --home|--interval)
+      [ $# -ge 2 ] || { echo "install.sh: $1 needs a value" >&2; exit 1; }
+      if [ "$1" = --home ]; then HOME_DIR="$2"; else INTERVAL="$2"; fi
+      shift 2 ;;
+    --no-wake) WAKE_MODE=no-wake; shift ;;
+    --wake) WAKE_MODE=wake; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown option $1" >&2; exit 1 ;;
   esac
 done
@@ -36,9 +43,26 @@ if [ "$UNINSTALL" = 1 ]; then
   exit 0
 fi
 
-for tool in git python3 gh claude; do
+[[ "$INTERVAL" =~ ^[1-9][0-9]*$ ]] || { echo "install.sh: interval must be a positive integer" >&2; exit 1; }
+for tool in git python3 gh; do
   command -v "$tool" >/dev/null || { echo "install.sh: $tool is not on PATH" >&2; exit 1; }
 done
+PY="$(command -v python3)"
+WAKE_MODE="$("$PY" - "$PLIST" "$WAKE_MODE" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+path, mode = pathlib.Path(sys.argv[1]), sys.argv[2]
+if mode == "preserve":
+    installed = plistlib.loads(path.read_bytes()) if path.exists() else {}
+    mode = "no-wake" if "--no-wake" in installed.get("ProgramArguments", []) else "wake"
+print(mode)
+PY
+)"
+if [ "$WAKE_MODE" = wake ]; then
+  command -v claude >/dev/null || { echo "install.sh: claude is not on PATH (use --no-wake for model-free ticks)" >&2; exit 1; }
+fi
 gh auth status >/dev/null 2>&1 || { echo "install.sh: gh is not authenticated" >&2; exit 1; }
 
 REPO="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -51,9 +75,11 @@ fi
 
 HOST="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
 AGENT="conductor@$HOST:conductor"
-PY="$(command -v python3)"
-# launchd starts jobs with a bare PATH; give the watcher the one gh and claude run with here.
-JOB_PATH="$(dirname "$(command -v claude)"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+# launchd starts jobs with a bare PATH. Model-free installations need no Claude path.
+JOB_PATH="$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [ "$WAKE_MODE" = wake ]; then
+  JOB_PATH="$(dirname "$(command -v claude)"):$JOB_PATH"
+fi
 
 # Check the code that will run: bring a clean, detached checkout to origin/main first.
 if [ -n "$(git -C "$HOME_DIR" status --porcelain)" ]; then
@@ -64,8 +90,49 @@ elif ! { git -C "$HOME_DIR" fetch -q origin main && git -C "$HOME_DIR" checkout 
   echo "install.sh: WARNING: could not fetch origin/main; checking the checkout as it is" >&2
 fi
 echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --short HEAD) ..."
-CHECK="$(cd "$HOME_DIR" && env PATH="$JOB_PATH" COORD_AGENT="$AGENT" CONDUCTOR_HOME="$HOME_DIR" \
-  "$PY" Tools/coord/coord conductor tick --dry-run)"
+# Build and check the candidate before stopping the installed job. plistlib keeps
+# paths and environment values literal, including XML and shell metacharacters.
+mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
+TMP_PLIST="$(mktemp "$PLIST.XXXXXX")"
+trap 'rm -f "$TMP_PLIST"' EXIT
+"$PY" - "$PLIST" "$TMP_PLIST" "$LABEL" "$PY" "$HOME_DIR" "$JOB_PATH" "$HOME" "$AGENT" "$INTERVAL" "$LOG" "$WAKE_MODE" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+old_path, new_path, label, python, checkout, path, home, agent, interval, log, mode = sys.argv[1:]
+old = pathlib.Path(old_path)
+installed = plistlib.loads(old.read_bytes()) if old.exists() else {}
+# Keep operator settings (including CONDUCTOR_WAKE/CONDUCTOR_TRAIN) on refresh.
+environment = dict(installed.get("EnvironmentVariables", {}))
+environment.update(PATH=path, HOME=home, COORD_AGENT=agent, CONDUCTOR_HOME=checkout)
+arguments = [python, str(pathlib.Path(checkout) / "Tools/coord/coord"), "conductor", "tick"]
+if mode == "no-wake":
+    arguments.append("--no-wake")
+candidate = {
+    "Label": label,
+    "ProgramArguments": arguments,
+    "WorkingDirectory": checkout,
+    "EnvironmentVariables": environment,
+    "StartInterval": int(interval),
+    "RunAtLoad": True,
+    "StandardOutPath": log,
+    "StandardErrorPath": log,
+}
+pathlib.Path(new_path).write_bytes(plistlib.dumps(candidate))
+PY
+CHECK="$("$PY" - "$TMP_PLIST" <<'PY'
+import os
+import plistlib
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    candidate = plistlib.load(handle)
+os.chdir(candidate["WorkingDirectory"])
+arguments = candidate["ProgramArguments"] + ["--dry-run"]
+os.execve(arguments[0], arguments, dict(os.environ, **candidate["EnvironmentVariables"]))
+PY
+)"
 echo "$CHECK"
 case "$CHECK" in
   *"another tick is running"*) echo "install.sh: a tick is running; try again when it ends" >&2; exit 1 ;;
@@ -73,36 +140,8 @@ esac
 
 # Only now replace a running installation: a failed check above leaves it as it was.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
-cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PY</string>
-    <string>$HOME_DIR/Tools/coord/coord</string>
-    <string>conductor</string>
-    <string>tick</string>
-  </array>
-  <key>WorkingDirectory</key><string>$HOME_DIR</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key><string>$JOB_PATH</string>
-    <key>HOME</key><string>$HOME</string>
-    <key>COORD_AGENT</key><string>$AGENT</string>
-    <key>CONDUCTOR_HOME</key><string>$HOME_DIR</string>
-  </dict>
-  <key>StartInterval</key><integer>$INTERVAL</integer>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>$LOG</string>
-  <key>StandardErrorPath</key><string>$LOG</string>
-</dict>
-</plist>
-EOF
+mv "$TMP_PLIST" "$PLIST"
 
 launchctl bootstrap "$DOMAIN" "$PLIST"
-echo "installed $LABEL: every ${INTERVAL}s, log $LOG"
+echo "installed $LABEL: every ${INTERVAL}s ($WAKE_MODE), log $LOG"
 echo "status: Tools/coord/coord conductor status   stop: $0 --uninstall"
