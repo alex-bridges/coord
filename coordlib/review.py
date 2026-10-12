@@ -37,8 +37,8 @@ _FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"
 # ran, so it is not evidence either way: NOT RUN, neither red nor green. Only this
 # prefix; any other annotation on a failed run leaves it red.
 NOT_RUN_PREFIX = "The job was not started because"
-# Xcode Cloud checks are billing-dead (memory: reference_xcode_cloud_out_of_credits)
-# and report failure on every PR; they are not CI for this repository.
+# Alex's policy excludes Xcode Cloud from automatic PR/review and merge decisions.
+# Ignore its legacy statuses; authoritative hosted CI is GitHub Actions.
 _IGNORED_CHECK_PREFIXES = ("LegacyCI | ",)
 
 
