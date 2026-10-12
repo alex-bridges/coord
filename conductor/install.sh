@@ -61,9 +61,6 @@ if mode == "preserve":
 print(mode)
 PY
 )"
-if [ "$WAKE_MODE" = wake ]; then
-  command -v claude >/dev/null || { echo "install.sh: claude is not on PATH (use --no-wake for model-free ticks)" >&2; exit 1; }
-fi
 gh auth status >/dev/null 2>&1 || { echo "install.sh: gh is not authenticated" >&2; exit 1; }
 
 REPO="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
@@ -79,9 +76,6 @@ AGENT="conductor@$HOST:conductor"
 # launchd starts jobs with a bare PATH; retain every required tool's directory.
 # Git may live separately from gh/Python and is needed for the watcher's self-update.
 JOB_PATH="$(dirname "$GIT"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-if [ "$WAKE_MODE" = wake ]; then
-  JOB_PATH="$(dirname "$(command -v claude)"):$JOB_PATH"
-fi
 
 # Check the code that will run: bring a clean, detached checkout to origin/main first.
 if [ -n "$(git -C "$HOME_DIR" status --porcelain)" ]; then
@@ -98,8 +92,10 @@ mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
 TMP_PLIST="$(mktemp "$PLIST.XXXXXX")"
 trap 'rm -f "$TMP_PLIST"' EXIT
 "$PY" - "$PLIST" "$TMP_PLIST" "$LABEL" "$PY" "$HOME_DIR" "$JOB_PATH" "$HOME" "$AGENT" "$INTERVAL" "$LOG" "$WAKE_MODE" <<'PY'
+import os
 import pathlib
 import plistlib
+import shutil
 import sys
 
 old_path, new_path, label, python, checkout, path, home, agent, interval, log, mode = sys.argv[1:]
@@ -108,6 +104,19 @@ installed = plistlib.loads(old.read_bytes()) if old.exists() else {}
 # Keep operator settings (including CONDUCTOR_WAKE/CONDUCTOR_TRAIN) on refresh.
 environment = dict(installed.get("EnvironmentVariables", {}))
 environment.update(PATH=path, HOME=home, COORD_AGENT=agent, CONDUCTOR_HOME=checkout)
+if mode == "wake":
+    # Validate the command selected by the candidate's preserved configuration,
+    # without running it. Resolve relative paths from the job's working directory.
+    configured = environment.get("CONDUCTOR_CLAUDE")
+    os.chdir(checkout)
+    executable = shutil.which(configured or "claude")
+    if executable is None:
+        if configured:
+            sys.exit(f"install.sh: CONDUCTOR_CLAUDE is not executable: {configured}")
+        sys.exit("install.sh: claude is not on PATH (use --no-wake for model-free ticks)")
+    # A configured command name may live outside the other tools' directories.
+    # Persist its resolved directory so launchd selects the same executable.
+    environment["PATH"] = os.path.dirname(os.path.abspath(executable)) + os.pathsep + path
 arguments = [python, str(pathlib.Path(checkout) / "Tools/coord/coord"), "conductor", "tick"]
 if mode == "no-wake":
     arguments.append("--no-wake")

@@ -427,6 +427,204 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual((self.reviews(), self.app.posts), ([], []))
 
 
+class ReviewPreflightTests(unittest.TestCase):
+    """Model-free settlement must precede a backup handoff, even while runs are held."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = make_config(os.path.join(self.tmp.name, "state"))
+        self.gh, self.app, self.user = FakeGitHub(), FakeApp(), FakeUser()
+        self.gh.clock_minutes = 5
+        self.app.echo_posts = True
+        self.runs, self.replies = [], []
+        self.watcher = conductor.Watcher(self.config, self.gh, now=at(5), runner=self.run_review,
+                                         disk=lambda _: 100.0, git=self.git)
+        self.watcher.issue = 900
+        self.watcher.app_gh_factory = lambda: self.app
+        self.watcher.user_gh_factory = lambda: self.user
+        self.jobs = reviewer.Reviews(self.watcher, self.app)
+        for name in ("kill_run", "kill_holders"):
+            patch = mock.patch.object(reviewer, name)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, args):
+        if args[:2] == ["symbolic-ref", "-q"]:
+            return 1, ""
+        if args[:1] == ["rev-parse"]:
+            return 0, "m" * 40 + "\n"
+        return 0, ""
+
+    def run_review(self, cmd, *args, **kwargs):
+        self.runs.append(cmd)
+        return self.replies.pop(0) if self.replies else review_reply()
+
+    def request(self, number=1, model="opus", **fields):
+        request = {"id": number, "pr": 7, "model": model, "error": None,
+                   "url": f"https://github.com/o/r/pull/7#issuecomment-{number}",
+                   "status": "pending", "attempts": 2, "seen": snapshot.iso(at(1)), **fields}
+        self.jobs.state[str(number)] = request
+        return request
+
+    def posted(self, request=99, model="opus", **fields):
+        payload = {"kind": "review", "v": 1, "agent": "reviewer@Other:review", "pr": 7,
+                   "head": HEAD, "model": model, "request": request, "verdict": "pass", **fields}
+        return {"id": 80, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"},
+                "created_at": snapshot.iso(at(2)), "body": marker.compose("Review", payload),
+                "html_url": "https://github.com/o/r/pull/7#issuecomment-80"}
+
+    def test_closed_requests_settle_through_model_blocks_and_the_daily_cap(self):
+        self.app.pr["state"] = "closed"
+        for number, blocked in enumerate(("waking is off (--no-wake)", "Claude is down", "paused", ""), 1):
+            with self.subTest(blocked=blocked):
+                self.config.max_reviews_per_day = 0
+                request = self.request(number)
+                waiting = self.jobs.step([], [], blocked)
+                self.assertEqual((request["status"], request["attempts"]), ("skipped", 2))
+                self.assertEqual(waiting, [])
+        self.assertEqual((self.runs, self.app.claims), ([], []))
+        self.assertEqual(len(self.app.posts), 4)
+
+    def test_a_locally_reviewed_head_settles_while_waking_is_off(self):
+        request = self.request()
+        self.jobs.done_heads[f"7:{HEAD}:opus"] = {"url": "prior review", "at": snapshot.iso(at(2))}
+        waiting = self.jobs.step([], [], "waking is off (--no-wake)")
+        self.assertEqual(request["status"], "skipped")
+        self.assertEqual(waiting, [])
+        self.assertIn("already reviewed", self.app.posts[-1])
+        self.assertEqual(self.runs, [])
+
+    def test_an_answer_from_another_host_settles_during_an_outage(self):
+        request = self.request()
+        self.app.pr_comments = [self.posted(request=1, verdict="none")]
+        waiting = self.jobs.step([], [], "Claude is down")
+        self.assertEqual((request["status"], self.app.posts, self.runs), ("done", [], []))
+        self.assertEqual(waiting, [])
+
+    def test_an_already_posted_review_settles_during_an_outage(self):
+        request = self.request()
+        self.app.pr_comments = [self.posted()]
+        waiting = self.jobs.step([], [], "Claude is down")
+        self.assertEqual(request["status"], "skipped")
+        self.assertEqual(waiting, [])
+        self.assertIn("issuecomment-80", self.app.posts[-1])
+        self.assertIn(f"7:{HEAD}:opus", self.jobs.done_heads)
+        self.assertEqual(self.runs, [])
+
+    def test_mixed_backlog_returns_only_the_verified_model_wait(self):
+        waiting = self.request(1)
+        reviewed = self.request(2, "sonnet")
+        answered = self.request(3, "haiku")
+        invalid = self.request(4, error="unknown model")
+        unsent = self.request(5, status="failed", unsent="gave up")
+        self.jobs.done_heads[f"7:{HEAD}:sonnet"] = {"url": "prior review", "at": snapshot.iso(at(2))}
+        self.app.pr_comments = [self.posted(request=3, model="haiku", verdict="none")]
+        self.assertEqual(self.jobs.step([], [], "waking is off (--no-wake)"), [waiting])
+        self.assertEqual([r["id"] for r in self.jobs.pending()], [1])
+        self.assertEqual([r["status"] for r in (reviewed, answered, invalid, unsent)],
+                         ["skipped", "done", "skipped", "failed"])
+        self.assertNotIn("unsent", unsent)
+        self.assertEqual((waiting["attempts"], self.runs, self.app.claims), (2, [], []))
+
+    def test_failed_preflight_is_not_reported_as_a_verified_model_wait(self):
+        request = self.request()
+        for failure in (reviewer.AppAuthError("no token"), reviewer.GitHubError("HTTP 502")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(self.app, "rest", side_effect=failure):
+                self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+                self.assertEqual((request["status"], request["attempts"]), ("pending", 2))
+        self.jobs.app = None
+        self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+        self.assertEqual(self.runs, [])
+
+    def test_failed_comment_read_and_failed_settlement_post_are_not_model_waits(self):
+        request = self.request()
+        with mock.patch.object(self.app, "rest_paginated", side_effect=reviewer.GitHubError("HTTP 502")):
+            self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+        self.app.pr["state"] = "closed"
+        self.app.fail_posts = 1
+        self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+        self.assertEqual((request["status"], request["attempts"]), ("pending", 2))
+        self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+        self.assertEqual(request["status"], "skipped")
+
+    def test_only_one_review_runs_per_step_and_the_next_step_can_run(self):
+        first, second = self.request(1), self.request(2, "sonnet")
+        self.assertEqual(self.jobs.step([], [], ""), [second])
+        self.assertEqual((first["status"], second["status"], len(self.runs)), ("done", "pending", 1))
+        self.assertEqual(self.jobs.step([], [], ""), [])
+        self.assertEqual((second["status"], len(self.runs)), ("done", 2))
+
+    def test_quota_refusal_does_not_allow_a_second_run_in_the_same_step(self):
+        first, second = self.request(1), self.request(2, "sonnet")
+        self.replies = [claude_result("You've hit your limit · resets in 2h", code=1, is_error=True)]
+        self.assertEqual(self.jobs.step([], [], ""), [second])
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(self.jobs.runs, [], "a quota refusal removes its daily run receipt")
+        self.assertEqual((first["status"], second["status"], first["attempts"], second["attempts"]),
+                         ("pending", "pending", 2, 2))
+
+    def test_finished_review_precedes_a_matching_pending_request(self):
+        pending = self.request(1)
+        finished = self.request(2, finished={"head": HEAD, "found": {"summary": "checked", "findings": [],
+                                                                       "checked": []},
+                                             "verdict": "pass", "run": {}})
+        self.assertEqual(self.jobs.step([], [], "paused"), [])
+        self.assertEqual((finished["status"], pending["status"], self.runs), ("done", "skipped", []))
+
+    def test_finished_review_waiting_for_user_budget_is_not_a_model_wait(self):
+        request = self.request(finished={"head": HEAD, "found": {"summary": "checked", "findings": [],
+                                                                 "checked": []},
+                                         "verdict": "pass", "run": {}})
+        self.jobs.user_ok = False
+        self.assertEqual(self.jobs.step([], [], "Alex's API budget is low"), [])
+        self.assertEqual((request["status"], self.user.posts, self.runs), ("pending", [], []))
+        self.assertIn("finished", request)
+        self.assertIn("posting", request)
+
+    def test_a_stale_posting_checks_the_current_heads_posted_review(self):
+        request = self.request(posting={"head": "old", "started": False})
+        self.app.pr_comments = [self.posted()]
+        self.assertEqual(self.jobs.step([], [], "Claude is down"), [])
+        self.assertEqual(request["status"], "skipped")
+        self.assertNotIn("posting", request)
+        self.assertEqual(self.runs, [])
+
+    def test_watcher_hands_off_only_requests_left_after_successful_preflight(self):
+        pending, settled = self.request(1), self.request(2, "sonnet")
+        self.app.pr_comments = [self.posted(model="sonnet")]
+        self.watcher.review_step([], None, None, False, {})
+        escalations = self.gh.records("conductor", "escalate")
+        self.assertEqual(len(escalations), 1)
+        self.assertEqual(escalations[0]["handoffKeys"], ["no-wake:review:1"])
+        self.assertEqual((pending["status"], settled["status"], self.runs), ("pending", "skipped", []))
+
+    def test_watcher_does_not_handoff_a_request_when_preflight_failed(self):
+        request = self.request()
+        with mock.patch.object(self.app, "rest_paginated", side_effect=reviewer.GitHubError("HTTP 502")):
+            self.watcher.review_step([], None, None, False, {})
+        self.assertEqual(self.gh.records("conductor", "escalate"), [])
+        self.assertEqual((request["status"], request["attempts"], self.runs), ("pending", 2, []))
+
+    def test_a_long_backlog_has_bounded_preflight_and_does_not_starve_later_settlement(self):
+        count = reviewer.MAX_REQUESTS_PER_TICK
+        pending = [self.request(n) for n in range(1, count + 1)]
+        answered = self.request(count + 1, "sonnet")
+        self.app.pr_comments = [self.posted(request=count + 1, model="sonnet", verdict="none")]
+        with mock.patch.object(self.app, "rest", wraps=self.app.rest) as calls:
+            self.assertEqual(self.jobs.step([], [], "Claude is down"), pending)
+            self.assertEqual(sum(call.args[0].endswith("pulls/7") for call in calls.call_args_list), count)
+        self.assertEqual(answered["status"], "pending", "the unchecked tail is not handed off or consumed")
+        with mock.patch.object(self.app, "rest", wraps=self.app.rest) as calls:
+            waiting = self.jobs.step([], [], "Claude is down")
+            self.assertEqual(sum(call.args[0].endswith("pulls/7") for call in calls.call_args_list), count)
+        self.assertEqual(answered["status"], "done")
+        self.assertEqual(waiting, pending[:count - 1])
+        self.assertEqual([r["attempts"] for r in pending], [2] * count)
+        self.assertEqual((self.runs, self.app.claims), ([], []))
+
+
 class ReviewFixTests(ReviewFlowTests):
     """The adversarial review of a205acfe (Fable 5.1), one test per finding."""
 

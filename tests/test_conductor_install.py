@@ -85,7 +85,7 @@ class ConductorInstallTests(unittest.TestCase):
     def read_plist(self):
         return plistlib.loads(self.plist.read_bytes())
 
-    def existing(self, no_wake=True):
+    def existing(self, no_wake=True, **environment):
         self.plist.parent.mkdir(parents=True, exist_ok=True)
         arguments = ["/old/python", "/old/coord", "conductor", "tick"]
         if no_wake:
@@ -97,6 +97,7 @@ class ConductorInstallTests(unittest.TestCase):
                 "CONDUCTOR_HOME": "/old/checkout", "CONDUCTOR_TRAIN": "0",
                 "CONDUCTOR_REVIEWER": "0", "CONDUCTOR_WAKE": "custom & <wake> ' $(false)",
                 "CONDUCTOR_WAKE_LIMIT": "2", "OTHER_OPERATOR_SETTING": "keep me",
+                **environment,
             },
         }))
 
@@ -164,7 +165,7 @@ class ConductorInstallTests(unittest.TestCase):
         ])
 
     def test_refresh_preserves_no_wake_and_operator_environment(self):
-        self.existing()
+        self.existing(CONDUCTOR_CLAUDE="/missing/claude-is-unneeded-with-no-wake")
         before = self.read_plist()["EnvironmentVariables"]
         candidate = self.assert_installed(self.run_install(), True)
         managed = {"HOME", "PATH", "COORD_AGENT", "CONDUCTOR_HOME"}
@@ -176,6 +177,37 @@ class ConductorInstallTests(unittest.TestCase):
         self.existing()
         (self.bin / "claude").symlink_to(self.fake_tool)
         self.assert_installed(self.run_install("--wake"), False)
+
+    def test_wake_refresh_accepts_configured_executable_without_ambient_claude(self):
+        custom_bin = self.root / "custom model & <bin> ' $(false)"
+        custom_bin.mkdir()
+        custom_claude = custom_bin / "claude"
+        custom_claude.symlink_to(self.fake_tool)
+        self.existing(no_wake=False, CONDUCTOR_CLAUDE=str(custom_claude))
+        self.assertIsNone(shutil.which("claude", path=self.env["PATH"]))
+
+        candidate = self.assert_installed(self.run_install(), False)
+        self.assertEqual(candidate["EnvironmentVariables"]["CONDUCTOR_CLAUDE"],
+                         str(custom_claude))
+        self.assertEqual(shutil.which("claude", path=candidate["EnvironmentVariables"]["PATH"]),
+                         str(custom_claude))
+
+    def test_wake_refresh_rejects_invalid_configured_executable_despite_ambient_claude(self):
+        (self.bin / "claude").symlink_to(self.fake_tool)
+        for executable in ("missing", "not-executable"):
+            with self.subTest(executable=executable):
+                configured = self.root / executable
+                if executable == "not-executable":
+                    configured.write_text("not an executable")
+                self.existing(no_wake=False, CONDUCTOR_CLAUDE=str(configured))
+                before = self.plist.read_bytes()
+
+                result = self.run_install()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("CONDUCTOR_CLAUDE", result.stderr)
+                self.assertEqual(self.plist.read_bytes(), before)
+                self.assertFalse(any(event["tool"] in ("tick", "launchctl", "claude")
+                                     for event in self.read_events()))
 
     def test_explicit_no_wake_changes_existing_wake_without_claude(self):
         self.existing(no_wake=False)

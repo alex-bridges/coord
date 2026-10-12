@@ -625,6 +625,43 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("the train looks stuck", self.runs[0]["prompt"])
         self.assertIn("new failed job", self.runs[0]["prompt"])
 
+    def test_large_handoff_backlog_posts_only_visible_receipts_and_keeps_heartbeat(self):
+        self.tick(0)
+        cursor = cache.load_cursor(self.gh.repo, self.config.agent)
+        reasons = [conductor.reason(f"comment:{i}:" + "x" * 96, "message", f"repair {i}", f"u/{i}")
+                   for i in range(1_011)]
+        original_rest = self.gh.rest
+
+        def bounded_comment(path, method="GET", body=None):
+            if method == "POST" and path.endswith("issues/900/comments") and len(body["body"]) > 65_536:
+                raise conductor.GitHubError("comment body exceeds GitHub's limit")
+            return original_rest(path, method, body)
+
+        with mock.patch.object(self.gh, "rest", side_effect=bounded_comment), \
+                mock.patch.object(conductor.Watcher, "github_reasons", return_value=reasons):
+            self.tick(5, wake=False)
+            state = conductor.load_state(self.config)
+            receipts = self.gh.records("conductor", "escalate")
+            first_keys = [f"no-wake:{r['key']}" for r in reasons[:10]]
+            self.assertEqual(receipts[0]["handoffKeys"], first_keys)
+            self.assertEqual(set(state["escalatedOnce"]), set(first_keys))
+            self.assertEqual(self.gh.records("conductor", "beat")[-1]["pending"], len(reasons))
+            self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+            self.assertEqual(state.get("handled"), {})
+            self.tick(10, wake=False)
+            second_keys = [f"no-wake:{r['key']}" for r in reasons[10:20]]
+            self.assertEqual(self.gh.records("conductor", "escalate")[1]["handoffKeys"], second_keys)
+            backup = make_config(os.path.join(self.tmp.name, "backup"), agent="conductor@Backup:conductor")
+            self.tick(30, config=backup, wake=False)
+            third_keys = [f"no-wake:{r['key']}" for r in reasons[20:30]]
+            self.assertEqual(self.gh.records("conductor", "escalate")[2]["handoffKeys"], third_keys)
+            self.assertEqual(self.gh.records("conductor", "beat")[-1]["pending"], len(reasons))
+            self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), cursor)
+            self.assertEqual(conductor.load_state(backup).get("handled"), {})
+        self.assertEqual(self.runs, [])
+        self.assertEqual(len(self.gh.dispatches), 3)
+        self.assertTrue(all(len(c["body"]) < 65_536 for c in self.gh.issue_comments))
+
     def test_limit_hit_hands_off_in_the_same_tick(self):
         self.tick(0)
         self.message(1)

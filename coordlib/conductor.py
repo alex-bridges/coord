@@ -1129,14 +1129,14 @@ class Watcher:
             # not only the watcher log nobody but this host can see.
             extra["reviewer"] = {"waiting": len(waiting),
                                  "appAvailable": jobs.app is not None and getattr(jobs.app, "app", None) is not None}
+        needs_model = jobs.step([], windows, blocked, extra)
         if (down or not wake) and not pause and not unread and user_ok:
-            # Match Reviews.step's continuation contract: finished posts and known-error
-            # replies need no model and still proceed. Only a waiting run needs a backup.
+            # Only requests whose current-head preflight reached the model gate
+            # need a backup. Closed/answered/reviewed requests settle first.
             self.handoff_pending([
                 reason(f"review:{r['id']}", "review", f"Requested {r['model']} review of #{r['pr']}", r["url"])
-                for r in waiting if not any(r.get(k) for k in ("unsent", "posting", "finished", "error"))
+                for r in needs_model
             ], down)
-        jobs.step([], windows, blocked, extra)
 
     def previous_outage(self, windows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """The most recent claude outage when it has run out and nobody has posted its
@@ -1286,17 +1286,18 @@ class Watcher:
                    or self.now - _time(told[keys[r["key"]]]) >= REMIND_AFTER)]
         if not waiting:
             return
+        handed_off = waiting[:10]
         blocked = f"Claude is unavailable until {iso(down['end'])}" if down else "Model wakes are disabled (--no-wake)"
         text = (f"{blocked}. {len(waiting)} pending conductor "
                 "reason(s) need a human or an active Codex session to take over repairs or reviews. "
                 "The model-free watcher still maintains its heartbeat and wakes the merge train. "
                 "These reasons and the inbox cursor remain pending for recovery.\n\n"
                 + "\n".join(f"- [{r['kind']}] {_clip(r['summary'], 300)}"
-                            + (f" {r['url']}" if r["url"] else "") for r in waiting[:10]))
+                            + (f" {r['url']}" if r["url"] else "") for r in handed_off))
         if len(waiting) > 10:
             text += f"\n- {len(waiting) - 10} additional reasons: inspect `coord conductor tick --dry-run`."
-        self.escalate_text(text, handoff_keys=[keys[item["key"]] for item in waiting])
-        for item in waiting:
+        self.escalate_text(text, handoff_keys=[keys[item["key"]] for item in handed_off])
+        for item in handed_off:
             told[keys[item["key"]]] = iso(self.now)
 
     def escalate_text(self, text: str, handoff_keys: Optional[List[str]] = None) -> None:

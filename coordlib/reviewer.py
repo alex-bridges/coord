@@ -50,6 +50,8 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
   runs a day; a run is stopped after CONDUCTOR_REVIEW_TIMEOUT (45 min); a job that fails
   three times gets a reply saying so; none run while Claude is out of usage or the
   conductor is paused. A usage limit hit mid-review posts the outage and keeps the job.
+  Model-free settlement checks at most eight requests a tick, continuations first;
+  pending requests rotate through that batch, and only checked model waits are handed off.
 
 What a bot author does and does not prove: any process on this Mac running as Alex can
 mint the app's tokens, so `inisa-sidechain[bot]` proves the result came through this
@@ -88,6 +90,7 @@ REVIEW_TIMEOUT_SECONDS = 45 * 60
 # its claim runs out (#1056).
 CLAIM_MARGIN = dt.timedelta(minutes=15)
 MAX_ATTEMPTS = 3
+MAX_REQUESTS_PER_TICK = 8  # bound model-free preflight reads/posts as well as model work
 KEEP = dt.timedelta(days=14)  # how long finished requests and reviewed heads are remembered
 FRESH = dt.timedelta(hours=48)  # a request comment older than this when first seen is not taken up
 # Directories never copied into the reviewer's view of the PR: Claude Code loads agents,
@@ -540,9 +543,16 @@ class Reviews:
         return len(self.runs)
 
     def step(self, issue_comments: List[Dict[str, Any]], windows: List[Dict[str, Any]], blocked: str,
-             extra: Optional[Dict[str, Any]] = None) -> None:
+             extra: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Settle model-free work, run at most one review, and return verified model waits.
+
+        Only a successful current-head preflight can put a request in the returned list;
+        an unavailable app or failed read/post is not evidence that a model is needed.
+        """
         self.extra = extra or {}
         self.began = snapshot.now_utc()  # clock()'s fallback when the watcher records no start
+        self.blocked = blocked
+        self.started_run = False
         self.prune()
         if self.app is not None and getattr(self.app, "app", None) is not None:
             # Before anything can return early (a wake's tick, a pause, the cap): the claims
@@ -553,41 +563,44 @@ class Reviews:
                 self.w.say(f"held review claims wait: no app token ({_clip(str(error), 120)})")
         jobs = sorted(self.pending(issue_comments), key=lambda r: not r.get("unsent"))
         if not jobs:
-            return
-        now = self.w.now
-        self.blocked = blocked
-        # Work that needs no model run (a reply or a finished review to post) goes ahead
-        # through a pause, an outage or the cap; only starting a run waits (Codex on #1049).
-        # A request with a known error needs only its reply (Codex on #1049).
-        continuing = [r for r in jobs if r.get("unsent") or r.get("posting") or r.get("finished") or r.get("error")]
-        if blocked and not continuing:
-            self.w.say(f"{len(jobs)} review request(s) waiting: {blocked}")
-            return
+            return []
         if self.app is None or getattr(self.app, "app", None) is None:
             self.w.say(f"{len(jobs)} review request(s) waiting: the inisa-sidechain app is not available here "
                        "(reviews are posted by the app only)")
-            return
-        if continuing:
-            jobs = continuing
-        elif self.may_run():
-            self.w.say(f"{len(jobs)} review request(s) waiting: {self.may_run()}")
-            return
-        request = jobs[0]
-        record = self.state[str(request["id"])]
+            return []
+        waiting = []
+        # Model-free settlement goes through a pause, outage or cap. Finish continuations
+        # first: a review posted here may also settle another request for the same head.
+        continuing = [r for r in jobs if any(r.get(k) for k in ("unsent", "posting", "finished", "error"))]
+        continuation_ids = {r["id"] for r in continuing}
+        pending = [r for r in jobs if r["id"] not in continuation_ids]
+        # A held run remains pending. Rotate past it next tick so it cannot keep later
+        # closed/answered requests out of this fixed-size preflight batch forever.
+        cursor = self.w.state.get("reviewPreflightCursor", 0)
+        cursor = cursor if isinstance(cursor, int) else 0
+        pending = [r for r in pending if r["id"] > cursor] + [r for r in pending if r["id"] <= cursor]
         try:
+            for request in (continuing + pending)[:MAX_REQUESTS_PER_TICK]:
+                record = self.state[str(request["id"])]
+                if request["id"] not in continuation_ids:
+                    self.w.state["reviewPreflightCursor"] = request["id"]
+                try:
+                    if record.get("unsent"):
+                        self.send_unsent(request, record)
+                    elif self.handle(request, record, windows):
+                        waiting.append(request)
+                except AppAuthError as error:
+                    self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
+                except GitHubError as error:
+                    self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
+        finally:
+            # A run, a wait or a failed read/post still renews this host's claims. Renew
+            # once around the batch, rather than once per preflight request.
             try:
-                if record.get("unsent"):
-                    self.send_unsent(request, record)
-                else:
-                    self.handle(request, record, windows)
-            finally:
-                # However it ended (a run, a failed run, a wait, a failed read or post), what
-                # this host still holds keeps its claim (Codex on #1088).
                 self.hold_claims()
-        except AppAuthError as error:
-            self.w.say(f"review of #{request['pr']} waits: no app token ({_clip(str(error), 120)})")
-        except GitHubError as error:
-            self.w.say(f"review of #{request['pr']} waits: GitHub error ({_clip(str(error), 120)})")
+            except AppAuthError as error:
+                self.w.say(f"held review claims wait: no app token ({_clip(str(error), 120)})")
+        return waiting
 
     def checkout_off_main(self) -> str:
         """Why the conductor's checkout may not govern a review, or "": the reviewer's orders,
@@ -605,6 +618,8 @@ class Reviews:
         """Why a new model run may not start now, or ""."""
         if getattr(self, "blocked", ""):
             return self.blocked
+        if getattr(self, "started_run", False):
+            return "a review already started this tick"
         off = self.checkout_off_main()
         if off:
             return off
@@ -620,12 +635,13 @@ class Reviews:
         body = marker.compose(text, payload)
         return self.app.rest(f"repos/{{repo}}/issues/{request['pr']}/comments", method="POST", body={"body": body})
 
-    def handle(self, request: Dict[str, Any], record: Dict[str, Any], windows: List[Dict[str, Any]]) -> None:
+    def handle(self, request: Dict[str, Any], record: Dict[str, Any], windows: List[Dict[str, Any]]) -> bool:
+        """Handle a request; True means its preflight reached a blocked model-run gate."""
         now = self.w.now
         if request["error"]:
             self.reply(request, f"@inisa-sidechain could not start that review: {request['error']}. ({request['url']})")
             record.update(status="skipped", at=snapshot.iso(now))
-            return
+            return False
         if not record.get("acked"):
             try:
                 self.app.rest(f"repos/{{repo}}/issues/comments/{request['id']}/reactions", method="POST",
@@ -639,27 +655,14 @@ class Reviews:
         if (pr or {}).get("state") != "open":
             self.reply(request, f"#{request['pr']} is not open; nothing to review. ({request['url']})")
             record.update(status="skipped", at=snapshot.iso(now))
-            return
+            return False
         head = ((pr.get("head") or {}).get("sha")) or ""
         key = f"{request['pr']}:{head}:{request['model']}"
         if key in self.done_heads:
             self.reply(request, f"`{head[:9]}` was already reviewed with {request['model']}: "
                                 f"{self.done_heads[key].get('url')}. Push a new head or name another model. ({request['url']})")
             record.update(status="skipped", at=snapshot.iso(now))
-            return
-        if not record.get("posting"):
-            comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
-            if request["id"] in answered(comments, self.app.repo):
-                # Another host answered this very request (it held the claim): nothing to add.
-                record.update(status="done", at=snapshot.iso(now))
-                return
-            earlier = posted_review(comments, request["pr"], head, request["model"], self.app.repo)
-            if earlier is not None:
-                self.reply(request, f"`{head[:9]}` was already reviewed with {request['model']}: {earlier}. "
-                                    f"Push a new head or name another model. ({request['url']})")
-                self.done_heads[key] = {"url": earlier, "at": snapshot.iso(now)}
-                record.update(status="skipped", at=snapshot.iso(now))
-                return
+            return False
         posting, finished = record.get("posting"), record.get("finished")
         if posting and posting.get("head") != head:
             record.pop("posting")  # the head moved: that review is stale
@@ -667,16 +670,33 @@ class Reviews:
         if finished and finished.get("head") != head:
             record.pop("finished")
             finished = None
+        if not record.get("posting"):
+            comments = self.app.rest_paginated(f"repos/{{repo}}/issues/{request['pr']}/comments?per_page=100")
+            if request["id"] in answered(comments, self.app.repo):
+                # Another host answered this very request (it held the claim): nothing to add.
+                record.update(status="done", at=snapshot.iso(now))
+                return False
+            earlier = posted_review(comments, request["pr"], head, request["model"], self.app.repo)
+            if earlier is not None:
+                self.reply(request, f"`{head[:9]}` was already reviewed with {request['model']}: {earlier}. "
+                                    f"Push a new head or name another model. ({request['url']})")
+                self.done_heads[key] = {"url": earlier, "at": snapshot.iso(now)}
+                record.update(status="skipped", at=snapshot.iso(now))
+                return False
         if not posting or not posting.get("started"):
             if not finished:
-                if self.may_run():
-                    self.w.say(f"review of #{request['pr']} waits: {self.may_run()}")
-                    return
+                blocked = self.may_run()
+                if blocked:
+                    self.w.say(f"review of #{request['pr']} waits: {blocked}")
+                    return True
                 if not self.claim(request, record, head):
-                    return
+                    return False
+                # A quota refusal removes its daily run receipt, but must not buy another
+                # model attempt for a later request in this same step.
+                self.started_run = True
                 finished = self.review(request, record, pr, head, windows)
                 if finished is None:
-                    return
+                    return False
                 # Kept before any GitHub call: if a read or a post fails, the next tick carries
                 # on from here instead of running the review again (review of 58ac99de; Codex).
                 record["finished"] = finished
@@ -685,6 +705,7 @@ class Reviews:
             posting = self.compose(request, pr, finished, windows)
             record["posting"] = posting
         self.publish(request, record, posting, key)
+        return False
 
     def clock(self) -> dt.datetime:
         """The tick's time advanced by the wall time the tick has taken so far: after a model
