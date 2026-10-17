@@ -1461,14 +1461,23 @@ class GuardHookTests(unittest.TestCase):
         # order. Main's lines are pinned here; test_guard_differential's
         # test_nothing_mains_guard_blocks_is_allowed_now shows, over its corpus, that the
         # additions only add refusals (an inserted line could still allow).
+        # The module docstring is prose, not a rule: its wording may change (Alex approved a
+        # rewording on 2026-10-16, #1468), so its lines are not pinned. Every other line is.
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "legacy_guard", "conductor-guard-59e25cc6f.py")
         with open(path, "rb") as handle:
             data = handle.read()
         blob = __import__("hashlib").sha1(b"blob %d\0" % len(data) + data).hexdigest()
         self.assertEqual(blob, "d0441c4ecc072255a06b189566b7afbbef524f5b", "the copy is main's guard at 59e25cc6f")
+        legacy = data.decode("utf-8")
+        docstring = __import__("ast").parse(legacy).body[0]
+        self.assertIsInstance(getattr(docstring, "value", None), __import__("ast").Constant,
+                              "main's guard opens with its module docstring")
+        prose = range(docstring.lineno, docstring.end_lineno + 1)
         with open(GUARD, encoding="utf-8") as handle:
             lines = iter(handle.read().split("\n"))
-        for number, line in enumerate(data.decode("utf-8").split("\n"), 1):
+        for number, line in enumerate(legacy.split("\n"), 1):
+            if number in prose:
+                continue
             self.assertTrue(any(candidate == line for candidate in lines), f"main's line {number} missing: {line!r}")
 
     def test_coord_token_exec_is_blocked_in_every_form(self):
