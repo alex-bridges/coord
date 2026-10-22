@@ -44,6 +44,7 @@ import signal
 import subprocess
 import tempfile
 import threading
+import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import budget, cache, identity, lease, marker, outage, review, runtime, snapshot, train
@@ -629,7 +630,8 @@ def coord_comments(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def conductor_issue(gh: GitHub, create: bool = True) -> Optional[int]:
-    found = gh.rest(f"repos/{{repo}}/issues?labels={lease.CONDUCTOR_LABEL}&state=open&per_page=5")
+    label = urllib.parse.quote(lease.CONDUCTOR_LABEL, safe="")
+    found = gh.rest(f"repos/{{repo}}/issues?labels={label}&state=open&per_page=5")
     if found:
         return int(sorted(found, key=lambda issue: issue["number"])[0]["number"])
     if not create:

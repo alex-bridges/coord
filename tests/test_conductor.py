@@ -427,7 +427,7 @@ class FakeGitHub:
 
     def rest(self, path, method="GET", body=None):
         self.calls.append((method, path))
-        if "labels=coord:conductor" in path:
+        if "labels=coord:conductor" in path or "labels=coord%3Aconductor" in path:
             return [{"number": 900}]
         if method == "POST" and path.endswith("issues/900/comments"):
             comment = self.raw(body["body"], self.clock_minutes)

@@ -240,7 +240,8 @@ def post_comment(gh: GitHub, number: int, text: str, payload: Dict[str, Any]) ->
 
 
 def find_or_create_mailbox(gh: GitHub) -> int:
-    found = gh.rest(f"repos/{{repo}}/issues?labels={snapshot.MAILBOX_LABEL}&state=open&per_page=5")
+    label = urllib.parse.quote(snapshot.MAILBOX_LABEL, safe="")
+    found = gh.rest(f"repos/{{repo}}/issues?labels={label}&state=open&per_page=5")
     if found:
         return int(sorted(found, key=lambda issue: issue["number"])[0]["number"])
     try:

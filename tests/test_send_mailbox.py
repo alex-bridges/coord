@@ -139,5 +139,49 @@ class MailboxLearnedByInboxTests(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+class FindOrCreateMailboxQueryEncodingTests(unittest.TestCase):
+    def test_find_or_create_mailbox_encodes_label_query(self):
+        gh = GitHub("o/r", transport="http")
+        calls = []
+
+        def rest(path, method="GET", body=None):
+            calls.append((method, path))
+            if "issues?labels=" in path:
+                return [{"number": 1001}]
+            return None
+
+        with mock.patch.object(gh, "rest", side_effect=rest):
+            num = cli.find_or_create_mailbox(gh)
+
+        self.assertEqual(num, 1001)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "GET")
+        self.assertIn("labels=coord%3Amailbox", calls[0][1])
+        self.assertNotIn("labels=coord:mailbox", calls[0][1])
+
+
+class ConductorIssueQueryEncodingTests(unittest.TestCase):
+    def test_conductor_issue_encodes_label_query(self):
+        from coordlib import conductor
+
+        gh = GitHub("o/r", transport="http")
+        calls = []
+
+        def rest(path, method="GET", body=None):
+            calls.append((method, path))
+            if "issues?labels=" in path:
+                return [{"number": 999}]
+            return None
+
+        with mock.patch.object(gh, "rest", side_effect=rest):
+            num = conductor.conductor_issue(gh)
+
+        self.assertEqual(num, 999)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "GET")
+        self.assertIn("labels=coord%3Aconductor", calls[0][1])
+        self.assertNotIn("labels=coord:conductor", calls[0][1])
+
+
 if __name__ == "__main__":
     unittest.main()
