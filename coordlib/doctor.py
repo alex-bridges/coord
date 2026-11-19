@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import os
-import platform
 import shutil
 import sys
 from typing import Any, Dict
 
 from . import budget, cache, identity, review, snapshot
 from .gh import GitHub, GitHubError, redact
+
+_PLATFORMS = {"darwin": "Darwin", "linux": "Linux", "win32": "Windows", "cygwin": "CYGWIN"}
+
+
+def _platform_name() -> str:
+    """Platform name without spawning subprocesses (platform.system() can shell out on Windows)."""
+    return _PLATFORMS.get(sys.platform, sys.platform)
+
+
+def _python_version() -> str:
+    v = sys.version_info
+    return f"{v.major}.{v.minor}.{v.micro}"
 
 
 def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
@@ -38,7 +49,7 @@ def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
         "status": "unverified",
         "agent": identity.agent_id(),
         "repo": gh.repo,
-        "environment": {"platform": platform.system(), "python": platform.python_version(),
+        "environment": {"platform": _platform_name(), "python": _python_version(),
                         "supported": os.name in ("posix", "nt") and sys.version_info >= (3, 9)},
         "tools": {name: shutil.which(name) is not None for name in ("git", "gh", "claude", "codex")},
         "transport": transport,

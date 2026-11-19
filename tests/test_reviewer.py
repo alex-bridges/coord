@@ -915,9 +915,10 @@ class CodexRound2Tests(ReviewFlowTests):
         self.assertEqual((sandbox["enabled"], sandbox["failIfUnavailable"], sandbox["allowUnsandboxedCommands"]),
                          (True, True, False))
         self.assertNotIn("network", sandbox, "no allowed domains: nothing reaches GitHub")
+        from coordlib import apptoken
         self.assertIn(os.path.realpath(self.config.home), sandbox["filesystem"]["denyWrite"])
-        self.assertTrue(any(p.endswith(os.path.join("Library", "Caches", "example-coord"))
-                            for p in sandbox["filesystem"]["denyRead"]))
+        self.assertIn(os.path.dirname(apptoken.default_config_path()), sandbox["filesystem"]["denyRead"])
+        self.assertIn(apptoken.token_cache_dir({}), sandbox["filesystem"]["denyRead"])
         self.assertIn("Bash(git push:*)", self.settings()["permissions"]["deny"])
 
     def test_d1_nothing_shaped_like_a_credential_is_posted(self):
@@ -1656,7 +1657,8 @@ class CodexRound11Tests(ReviewFlowTests):
         settings = reviewer.run_settings("/Users/x/conductor/example-repo", [], "/r")
         hook = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(hook["matcher"], "Read|Grep|Glob|LS|NotebookRead")
-        self.assertTrue(hook["hooks"][0]["command"].endswith("/conductor/example-repo/.claude/hooks/conductor-guard.py"))
+        command = hook["hooks"][0]["command"].replace("\\", "/").rstrip('"')
+        self.assertTrue(command.endswith("/conductor/example-repo/.claude/hooks/conductor-guard.py"), command)
 
     def test_m2_a_restarted_host_counts_its_own_mid_run_beat(self):
         from coordlib import lease
@@ -1793,6 +1795,7 @@ class CodexRound15Tests(ReviewFlowTests):
 
 
 class CodexRound16Tests(ReviewFlowTests):
+    @unittest.skipIf(os.name == "nt", "POSIX fork/setsid test; Windows Job Object isolation is in test_windows_compat.py")
     def test_r1_an_escaped_descendant_cannot_wedge_the_runner(self):
         script = ("import os, sys, time\n"
                   "if os.fork() == 0:\n"
@@ -1803,6 +1806,7 @@ class CodexRound16Tests(ReviewFlowTests):
         self.assertLess(time.monotonic() - started, 10, "returned when the run ended, not when the pipe closed")
         self.assertEqual((done.returncode, done.stdout.strip()), (0, "parent done"))
 
+    @unittest.skipIf(os.name == "nt", "POSIX fork/setsid test; Windows Job Object isolation is in test_windows_compat.py")
     def test_r1_a_timeout_returns_though_a_descendant_escaped(self):
         script = ("import os, time\n"
                   "if os.fork() == 0:\n"
@@ -1813,6 +1817,7 @@ class CodexRound16Tests(ReviewFlowTests):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(done.returncode, 124)
 
+    @unittest.skipIf(os.name == "nt", "POSIX lsof/start_new_session test; Windows uses Job Objects")
     def test_r1_holders_of_the_review_trees_are_killed(self):
         self.holders.stop()
         try:

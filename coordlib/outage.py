@@ -86,12 +86,73 @@ def _configured_weekly_spec() -> Optional[str]:
     return os.environ.get("COORD_CLAUDE_WEEKLY_RESET") or config.get("claude_weekly_reset") or None
 
 
+def _nth_sunday(year: int, month: int, nth: int) -> dt.datetime:
+    first = dt.datetime(year, month, 1)
+    return first + dt.timedelta(days=(6 - first.weekday()) % 7 + 7 * (nth - 1))
+
+
+class _USZone(dt.tzinfo):
+    """Stdlib US DST fallback when IANA tzdata is absent (e.g., Windows without tzdata)."""
+
+    def __init__(self, name: str, std_hours: int):
+        self._name = name
+        self._std = dt.timedelta(hours=std_hours)
+
+    def _dst_bounds_utc(self, year: int) -> tuple[dt.datetime, dt.datetime]:
+        # US Energy Policy Act of 2005 (effective 2007+): 2nd Sun Mar 02:00 std -> 1st Sun Nov 02:00 DST.
+        start_utc = _nth_sunday(year, 3, 2).replace(hour=2) - self._std
+        end_utc = _nth_sunday(year, 11, 1).replace(hour=2) - (self._std + dt.timedelta(hours=1))
+        return start_utc, end_utc
+
+    def tzname(self, d: Optional[dt.datetime]) -> str:
+        return self._name
+
+    def dst(self, d: Optional[dt.datetime]) -> dt.timedelta:
+        if d is None:
+            return dt.timedelta(0)
+        naive = d.replace(tzinfo=None)
+        start_local = _nth_sunday(d.year, 3, 2).replace(hour=2)
+        end_local = _nth_sunday(d.year, 11, 1).replace(hour=1 if d.fold else 2)
+        return dt.timedelta(hours=1) if start_local <= naive < end_local else dt.timedelta(0)
+
+    def utcoffset(self, d: Optional[dt.datetime]) -> dt.timedelta:
+        return self._std + self.dst(d)
+
+    def fromutc(self, d: dt.datetime) -> dt.datetime:
+        if d.tzinfo is not self:
+            raise ValueError("fromutc: dt.tzinfo is not self")
+        naive_utc = d.replace(tzinfo=None)
+        start_utc, end_utc = self._dst_bounds_utc(naive_utc.year)
+        if start_utc <= naive_utc < end_utc:
+            return (d + self._std + dt.timedelta(hours=1)).replace(fold=0)
+        fold = 1 if end_utc <= naive_utc < end_utc + dt.timedelta(hours=1) else 0
+        return (d + self._std).replace(fold=fold)
+
+
+_FALLBACK_ZONES: Dict[str, dt.tzinfo] = {
+    "UTC": dt.timezone.utc,
+    "Etc/UTC": dt.timezone.utc,
+    "GMT": dt.timezone.utc,
+    "America/New_York": _USZone("America/New_York", -5),
+    "US/Eastern": _USZone("US/Eastern", -5),
+    "America/Detroit": _USZone("America/Detroit", -5),
+    "America/Toronto": _USZone("America/Toronto", -5),
+    "America/Chicago": _USZone("America/Chicago", -6),
+    "US/Central": _USZone("US/Central", -6),
+    "America/Denver": _USZone("America/Denver", -7),
+    "US/Mountain": _USZone("US/Mountain", -7),
+    "America/Los_Angeles": _USZone("America/Los_Angeles", -8),
+    "US/Pacific": _USZone("US/Pacific", -8),
+    "America/Phoenix": dt.timezone(dt.timedelta(hours=-7), "America/Phoenix"),
+}
+
+
 def _zone(name: str) -> dt.tzinfo:
     try:
         from zoneinfo import ZoneInfo
         return ZoneInfo(name)
-    except Exception:  # no tz database (a bare container): Eastern standard time is at most an hour off
-        return dt.timezone(dt.timedelta(hours=-5), name)
+    except Exception:  # no tz database (Windows without tzdata, or a bare container)
+        return _FALLBACK_ZONES.get(name) or dt.timezone(dt.timedelta(hours=-5), name)
 
 
 def next_weekly_reset(now: dt.datetime, spec: Optional[str] = None) -> dt.datetime:

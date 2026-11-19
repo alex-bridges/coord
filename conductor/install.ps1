@@ -75,7 +75,7 @@ if (-not (Test-Path $CoordScript)) {
 
 & gh auth status *> $null
 if ($LASTEXITCODE -ne 0) {
-    throw "install.ps1: gh is not authenticated (run `gh auth login`)"
+    throw "install.ps1: gh is not authenticated (run 'gh auth login')"
 }
 
 # Preserve previous wake mode on refresh unless explicitly overridden
@@ -189,5 +189,5 @@ $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -Repetiti
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 2)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "coord conductor watcher for $Repo" -Force | Out-Null
-Write-Host "installed $TaskName: every ${minutes}m ($WakeMode), log $LogFile"
+Write-Host "installed ${TaskName}: every ${minutes}m ($WakeMode), log $LogFile"
 Write-Host "status: coord conductor status   stop: .\conductor\install.ps1 -Repo $Repo -Uninstall"

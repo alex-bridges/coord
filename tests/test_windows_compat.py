@@ -13,6 +13,7 @@ Exercises:
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import json
 import os
 import shutil
@@ -27,7 +28,7 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from coordlib import apptoken, compat, conductor, doctor, reviewer, snapshot  # noqa: E402
+from coordlib import apptoken, compat, conductor, doctor, identity, outage, reviewer, snapshot  # noqa: E402
 from coordlib.gh import GitHub  # noqa: E402
 
 
@@ -131,6 +132,29 @@ class CrossPlatformPrimitivesTests(unittest.TestCase):
             settings = reviewer.run_settings(tempfile.gettempdir(), [], tempfile.gettempdir())
             cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
             self.assertIn(sys.executable, cmd)
+
+    def test_identity_detects_codex_worktree_with_windows_backslashes(self):
+        self.assertEqual(identity.detect_harness({}, r"C:\Users\dev\.codex\worktrees\abc\repo"), "codex")
+        self.assertEqual(identity.detect_harness({}, r"C:\Users\dev\Projects\repo"), "human")
+
+    def test_outage_us_zone_fallback_matches_dst_and_standard_time(self):
+        eastern = outage._FALLBACK_ZONES["America/New_York"]
+        with mock.patch.object(outage, "_zone", return_value=eastern):
+            summer = outage.next_weekly_reset(dt.datetime(2026, 9, 28, 12, 0, tzinfo=dt.timezone.utc),
+                                              "Thu 12:00 America/New_York")
+            winter = outage.next_weekly_reset(dt.datetime(2026, 1, 12, 12, 0, tzinfo=dt.timezone.utc),
+                                              "Thu 12:00 America/New_York")
+        self.assertEqual(summer, dt.datetime(2026, 10, 1, 16, 0, tzinfo=dt.timezone.utc))
+        self.assertEqual(winter, dt.datetime(2026, 1, 15, 17, 0, tzinfo=dt.timezone.utc))
+        # Also verify transition instants (spring forward + fall back with fold)
+        before_spring = dt.datetime(2026, 3, 8, 6, 30, tzinfo=dt.timezone.utc).astimezone(eastern)
+        after_spring = dt.datetime(2026, 3, 8, 7, 30, tzinfo=dt.timezone.utc).astimezone(eastern)
+        self.assertEqual((before_spring.hour, before_spring.utcoffset()), (1, dt.timedelta(hours=-5)))
+        self.assertEqual((after_spring.hour, after_spring.utcoffset()), (3, dt.timedelta(hours=-4)))
+        before_fall = dt.datetime(2026, 11, 1, 5, 30, tzinfo=dt.timezone.utc).astimezone(eastern)
+        after_fall = dt.datetime(2026, 11, 1, 6, 30, tzinfo=dt.timezone.utc).astimezone(eastern)
+        self.assertEqual((before_fall.hour, before_fall.fold, before_fall.utcoffset()), (1, 0, dt.timedelta(hours=-4)))
+        self.assertEqual((after_fall.hour, after_fall.fold, after_fall.utcoffset()), (1, 1, dt.timedelta(hours=-5)))
 
 
 @unittest.skipUnless(os.name == "nt", "Windows-native DPAPI and PowerShell installer tests")

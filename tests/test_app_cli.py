@@ -153,7 +153,7 @@ class RoutingTests(AppCliTestCase):
                  ["train", "substitute-review", "7", "--head", "a" * 40, "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
                  ["conductor", "tick"], ["conductor", "status"], ["conductor", "diagnose"], ["conductor", "pause", "--for", "1h"],
                  ["conductor", "resume"], ["conductor", "escalate", "x"],
-                 ["token", "status"], ["token", "exec", "--", "true"]]
+                 ["token", "status"], ["token", "exec", "--", "true"], ["token", "import-key", "x.pem"]]
         self.assertEqual({tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
                           for argv in argvs}, parser_commands(), "every subcommand is decided here")
         for argv in argvs:
@@ -454,7 +454,8 @@ class ConfigPathTests(AppCliTestCase):
         self.assertEqual([r for r in self.server.requests if r["bearer"] == USER_TOKEN], [])
         self.assertEqual(self.server.api_requests(), [], "no API call went out at all")
 
-    @unittest.skipIf(os.geteuid() == 0, "root searches a mode-000 folder anyway")
+    @unittest.skipIf(os.name == "nt" or getattr(os, "geteuid", lambda: 1)() == 0,
+                     "requires POSIX non-root chmod semantics")
     def test_a_config_folder_that_cannot_be_searched_is_broken_not_absent(self):
         folder = os.path.join(self.root, "locked")
         os.makedirs(folder)
@@ -914,6 +915,7 @@ class NoLeakTests(AppCliTestCase):
             ["conductor", "diagnose", "--input", self.context, "--runtime", "claude", "--json"],
             ["conductor", "pause", "--for", "1h"], ["conductor", "resume"], ["conductor", "escalate", "look"],
             ["token", "status"], ["token", "exec", "--", "true"], ["token", "exec", "--kind", "ops", "--", "true"],
+            ["token", "import-key", os.path.join(self.root, "missing.pem")],
         ]
 
     def test_no_subcommand_prints_a_secret(self):

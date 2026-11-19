@@ -31,7 +31,7 @@ def detect_harness(env: Mapping[str, str], toplevel: str) -> str:
         return "claude"
     # Codex worktrees live under ~/.codex/worktrees. CODEX_COMPANION_* belongs
     # to the Codex plugin running INSIDE Claude Code, so it does not count.
-    if "/.codex/" in toplevel or any(
+    if "/.codex/" in toplevel.replace("\\", "/") or any(
         key.startswith("CODEX_") and not key.startswith("CODEX_COMPANION_") for key in env
     ):
         return "codex"
