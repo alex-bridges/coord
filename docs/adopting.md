@@ -1,48 +1,69 @@
 # Adopting coord in a repository
 
-This is the step-by-step for a new repository. The model and every command are in
-[agent-coordination.md](agent-coordination.md).
+This guide walks through adopting `coord` incrementally — from zero-config shared awareness
+up through the GitHub Actions merge train, GitHub App identity, and macOS conductor. The full
+protocol and architecture are in [agent-coordination.md](agent-coordination.md).
 
 ## 1. Install
 
 ```sh
-pipx install git+https://github.com/alex-bridges/coord      # installs a `coord` command
+pipx install git+https://github.com/alex-bridges/coord      # installs `coord` globally
 # or, from a clone, without installing:
 git clone https://github.com/alex-bridges/coord ~/tools/coord
 ln -s ~/tools/coord/coord ~/.local/bin/coord                # or run ~/tools/coord/coord directly
 ```
 
-It is pure Python 3.9+ standard library. Run it from a checkout of the target repository;
-the repository is read from the `origin` remote (`COORD_REPO=owner/name` overrides).
+Pure Python 3.9+ standard library (macOS and Linux). Run `coord` inside a checkout of the
+target repository; it detects `owner/name` from the `origin` remote (`COORD_REPO=owner/name`
+overrides).
 
-## 2. Authenticate
+## 2. Authenticate and verify
 
-`gh auth login` (the `gh` CLI), or set `GH_TOKEN` / `GITHUB_TOKEN` and coord talks to the API
-directly (`COORD_TRANSPORT=http` forces that). Check with `coord doctor --online`.
+Log in with the GitHub CLI (`gh auth login`), or export `GH_TOKEN` / `GITHUB_TOKEN` to use
+direct HTTPS (`COORD_TRANSPORT=http` forces HTTPS). Verify read access without writing
+anything:
 
-## 3. What works with no configuration
+```sh
+coord doctor --online
+```
 
-`board`, `whoami`, `doctor`, `claim`, `release`, `send`, `inbox` (and `outage`, whose weekly reset
-needs `claude_weekly_reset` or `--until`). Try:
+## 3. Start with zero configuration
+
+Without a config file, `board`, `whoami`, `doctor`, `claim`, `release`, `send`, `inbox`, and
+`outage` (with `--until`) all work immediately:
 
 ```sh
 coord board
 coord claim 12 --files src/foo.py --note "adding foo"
+coord send --on 12 "starting work on foo"
 coord inbox
 ```
 
-The merge train needs `ci_workflow` and `train_workflow`; the reviewer needs `reviewer_bot_login`
-and `reviewer_trigger` plus a GitHub App; the conductor needs its prompt and guard files
-(`conductor.*`), and a GitHub App for the reviewer. A feature missing a setting stops with a
-message naming the key.
+### Teaching your coding agents to use `coord`
 
-## 4. Configure: `.coord/config.json`
+Add a short block to `CLAUDE.md`, `AGENTS.md`, or your team's agent instructions:
 
-Commit it at the repository root (`COORD_CONFIG` names another path). All keys are listed with
-their defaults in the Configuration section of [agent-coordination.md](agent-coordination.md)
-and in `coordlib/config.py`.
+```markdown
+## Coordination (`coord`)
+- Run `coord board` before starting work to see open PRs, active claims, and file overlaps.
+- Claim your issue before editing: `coord claim <issue> --files <paths> --note "<summary>"`.
+- Check `coord inbox` between tasks and answer messages with `coord send --on <n> "..."`.
+- Release claims when stopping or handing off: `coord release <issue> --note "<why>"`.
+- Once a PR is reviewed and ready (if the merge train is enabled), run `coord train add <pr>` and stop polling.
+```
 
-Minimal, enabling the merge train:
+For Claude Code, copy [`examples/coord-board.sh`](../examples/coord-board.sh) to
+`.claude/hooks/coord-board.sh` and wire it as a `SessionStart` hook in `.claude/settings.json`
+so every session starts with `coord board --brief` automatically.
+
+## 4. Configure `.coord/config.json` (optional features)
+
+The merge train, sidechain reviewer, and conductor stay disabled until configured in
+`.coord/config.json` at the root of the target repository (`COORD_CONFIG` overrides the path).
+Every key and default is listed in [agent-coordination.md](agent-coordination.md#configuration)
+and `coordlib/config.py`.
+
+Minimal config to enable the merge train:
 
 ```json
 {
@@ -51,7 +72,7 @@ Minimal, enabling the merge train:
 }
 ```
 
-Full example (illustrative values; paths and names are yours to choose):
+Full example (all optional features enabled; adjust names and paths to your repo):
 
 ```json
 {
@@ -80,7 +101,7 @@ Full example (illustrative values; paths and names are yours to choose):
   },
   "reviewer": {
     "agent_file": ".claude/agents/reviewer.md",
-    "guard_hook": ".claude/hooks/reviewer-guard.py"
+    "guard_hook": ".claude/hooks/conductor-guard.py"
   },
   "claude_weekly_reset": "Thu 12:00 America/New_York",
   "keychain_service": "coord-github-app",
@@ -89,28 +110,41 @@ Full example (illustrative values; paths and names are yours to choose):
 }
 ```
 
-`ci_lanes` is sent as the `lanes` input when the train dispatches your CI workflow, so that
-workflow needs a `workflow_dispatch` `lanes` input if you set it; leave it unset to send no inputs.
-`verdict_job` and `wake_job` name jobs in the CI workflow that aggregate the others.
+- `ci_lanes`: passed as the `lanes` input when dispatching `ci_workflow` (omit if your CI workflow takes no `workflow_dispatch` inputs).
+- `verdict_job` / `wake_job`: optional aggregate jobs in your CI workflow excluded when diagnosing which underlying job failed.
+- `ignored_check_prefixes`: optional status/check prefixes (e.g. legacy external CI) to ignore in PR CI readiness.
 
-## 5. Labels
+## 5. Labels & human-approval gates
 
-`coord train step` creates these if missing (and ignores ones that exist); to create them ahead of
-time, for example with `gh label create <name> --color <hex> --description "<text>"`:
+`coord train step` creates these labels automatically if missing (or create them ahead of time
+with `gh label create`):
 
 | Label | Colour | Meaning |
 |---|---|---|
-| `train` | `0e8a16` | queued for the merge train (`coord train add`) |
-| `train:solo` | `fbca04` | the train tests this PR on its own (it was in a red batch) |
-| `reviewed` | `c2e0c6` | informational; a clean review is recorded |
-| `needs-owner` | `b60205` | a carve-out; held until the owner approves its head (configurable via `needs_owner_label`) |
-| `owner-approved` | `0e8a16` | the owner approved a head (`coord train approve`, configurable via `owner_approved_label`) |
+| `train` | `0e8a16` | Queued for the merge train (`coord train add`) |
+| `train:solo` | `fbca04` | The train tests this PR on its own (after a multi-PR batch failed) |
+| `reviewed` | `c2e0c6` | Informational; a clean review was recorded (`coord train review`) |
+| `needs-owner` | `b60205` | Holds a PR until the repository owner approves its exact head (rename via `needs_owner_label`) |
+| `owner-approved` | `0e8a16` | Applied when `coord train approve` records owner approval of a head (rename via `owner_approved_label`) |
+
+**How human-approval gates work:** PRs labelled `needs-owner`, PRs touching any path in
+`owner_only_paths` (such as agent prompts, guard hooks, or `.coord/`), and PRs touching
+`.github/workflows/` (when a workflow-capable app token is supplied) are held until a trusted
+owner records approval of the exact 40-char commit SHA:
+
+```sh
+coord train approve 42 --head <full-40-char-sha> --note "approved in review"
+```
+
+Because labels persist across pushes, the label alone is never enough — a new push requires a
+new approval.
 
 ## 6. The merge-train workflow
 
-The train advances one step per workflow run (see Merge train in [agent-coordination.md](agent-coordination.md)).
-Your `train_workflow` file checks out the target repository with push access and a pinned copy of
-`coord` next to it, then runs one step. Pin `COORD_SHA` to a reviewed commit and bump it deliberately.
+The train advances one step per workflow run (see Merge train in
+[agent-coordination.md](agent-coordination.md)). Your `train_workflow` checks out the target
+repository with push access plus a pinned commit of `coord`, and runs `coord train step`.
+Pin `COORD_SHA` to a reviewed commit and bump it deliberately.
 
 ```yaml
 name: Merge train
@@ -142,7 +176,7 @@ jobs:
       COORD_TRANSPORT: http
       COORD_AGENT: train@actions
       COORD_REPO: ${{ github.repository }}
-      COORD_SHA: 0000000000000000000000000000000000000000   # pin: a reviewed coord commit
+      COORD_SHA: 0000000000000000000000000000000000000000   # pin a reviewed coord commit SHA
       MODE: ${{ (inputs.mode != '' && inputs.mode != 'default') && inputs.mode || vars.COORD_TRAIN_MODE || 'dry-run' }}
     steps:
       - uses: actions/checkout@v4
@@ -159,26 +193,95 @@ jobs:
         run: python3 ../coord-tool/coord train step --mode "$MODE" --repo-dir .
 ```
 
-Notes. The default mode is a dry run (batches are tested, nothing merges); set the repository
-variable `COORD_TRAIN_MODE=live` when the dry runs look right. `actions/checkout` leaves its
-credential in the clone, which is what lets the step push `train/*` branches and fast-forward `main`
-with the Actions token; if your default branch is protected so that token cannot push, see Limits
-under Merge train in [agent-coordination.md](agent-coordination.md). In your CI workflow, add a job
-that dispatches or wakes this workflow after each batch, because runs started by the Actions token
-do not trigger `workflow_run`.
+**Going live:** Default mode is `dry-run` (batches are built and tested, trunk does not move).
+Once dry runs look right, set the repository variable `COORD_TRAIN_MODE=live`. Add a small
+final job in your CI workflow to dispatch `merge-train.yml` on batch completion, because runs
+started by `GITHUB_TOKEN` do not trigger `workflow_run`.
 
-## 7. The conductor (optional, macOS)
+### Review gating (with or without Codex)
 
-The conductor is a launchd agent that wakes an agent only when there is work. On your CI Mac:
+Before merging a PR, the train requires a clean review of its exact head commit. Either signal
+satisfies the gate:
+1. **Manual / agent review attestation (works for any team):** After another agent or human
+   completes a clean review, record it on the repository owner's identity:
+   ```sh
+   coord train review 42 --head <full-40-char-sha> --by <reviewer-agent-or-name> --note "clean review"
+   ```
+   (If you use the optional sidechain reviewer below, a passing review records this
+   automatically.)
+2. **GitHub Codex connector:** A fresh 👍 reaction from `chatgpt-codex-connector` plus its
+   pinned summary comment naming that head as `Completed`, with no unanswered review threads.
 
-```sh
-git clone https://github.com/alex-bridges/coord ~/tools/coord
-~/tools/coord/conductor/install.sh --repo owner/name [--home DIR] [--interval 300] [--no-wake]
-```
+## 7. GitHub App mode (optional, macOS)
 
-It installs `com.coord.conductor.<owner>-<name>` (log `~/Library/Logs/coord-conductor-<owner>-<name>.log`),
-keeps a checkout of the repository detached at `origin/main` (default `~/conductor/<name>`), and runs
-`coord conductor tick` from it every `--interval` seconds. `--no-wake` installs model-free ticks;
-`--uninstall` removes the agent. It needs `git`, `python3` and `gh` on PATH. Set the `conductor`
-keys (prompt, instructions file, guard hook) in the repository's `.coord/config.json` first; every CI
-box runs one and the lease picks the leader. Check with `coord conductor status`.
+If many local agents run concurrently, they share your user account's 5,000 REST calls/hour
+rate limit. App mode moves `coord`'s reads and operational writes onto a dedicated GitHub App
+installation (its own 5,000/hr quota), keeping attestations (`train approve`, `train review`)
+on your user login.
+
+1. **Create a GitHub App** in your GitHub settings (webhook inactive) and install it on your
+   target repository with these repository permissions:
+   - **Read token:** `Actions: Read`, `Checks: Read`, `Contents: Read`, `Issues: Read`,
+     `Metadata: Read`, `Pull requests: Read`, `Commit statuses: Read`
+   - **Ops token:** `Actions: Write`, `Issues: Write`, `Metadata: Read`, `Pull requests: Write`
+   - *(Optional, only if you also want the merge train to land `.github/workflows/` PRs via
+     `COORD_TRAIN_APP_TOKEN` in Actions: `Contents: Write` and `Workflows: Write`.)*
+2. **Generate a private key (`.pem`)** and note the app's **Client ID** (`Iv23...`) and bot
+   login (`<app-slug>[bot]`).
+3. **Store the base64-encoded PEM in the macOS login Keychain** (matching `keychain_service`,
+   default `coord-github-app`):
+   ```sh
+   security add-generic-password -U \
+     -s coord-github-app \
+     -a "Iv23YourClientIdHere" \
+     -w "$(base64 < path/to/your-app.private-key.pem | tr -d '\n')"
+   ```
+4. **Write the non-secret config** at `~/.config/coord/github-app.json` (or
+   `~/.config/<state_dir_name>/github-app.json`):
+   ```json
+   {
+     "client_id": "Iv23YourClientIdHere",
+     "repo": "owner/name",
+     "app_login": "my-coord-app[bot]"
+   }
+   ```
+5. **Verify:**
+   ```sh
+   coord token status
+   coord doctor --online
+   ```
+   To temporarily bypass app mode and use your `gh` login instead, set `COORD_APP=off`.
+
+## 8. The conductor and sidechain reviewer (optional, macOS)
+
+The conductor is a `launchd` watcher that polls cheaply in plain Python and wakes Claude only
+when there is real work (messages to `conductor@*`, red CI, train holds, offline runners, or
+`@<bot> review` comments).
+
+1. Copy and adapt the starter templates from [`examples/`](../examples/README.md) into your
+   target repository (`.claude/agents/conductor.md`, `.claude/agents/reviewer.md`,
+   `.claude/hooks/conductor-guard.py`) and point `.coord/config.json` at them.
+2. Install the `launchd` agent on your CI Mac:
+   ```sh
+   git clone https://github.com/alex-bridges/coord ~/tools/coord
+   ~/tools/coord/conductor/install.sh --repo owner/name [--home DIR] [--interval 300] [--no-wake]
+   ```
+   This installs `com.coord.conductor.<owner>-<name>` (log
+   `~/Library/Logs/coord-conductor-<owner>-<name>.log`), keeps a detached `origin/main`
+   checkout at `~/conductor/<name>`, and runs `coord conductor tick` every `--interval`
+   seconds. Use `--no-wake` for model-free ticks (lease + train wake + escalations without
+   Claude installed), and `--uninstall` to remove it. Check status with `coord conductor status`.
+
+## 9. Using `coord` on a public vs. private repository
+
+`coord` was designed primarily for private repositories where everyone who can comment is a
+collaborator, and it also enforces boundaries if used on a **public** repository:
+- **Approvals & clean reviews:** `owner-approve` and `review-clean` records are only trusted
+  when GitHub reports the comment author as the repository owner (`User`, never a `[bot]` or
+  external commenter).
+- **Merge train:** PRs from forks are automatically rejected (`fromFork`), and batch CI runs
+  only count when dispatched by `github-actions[bot]`.
+- **Untrusted comments:** On a public repo, any GitHub user can still post comments containing
+  `claim` or `msg` markers on open issues. If you run the unattended conductor on a public
+  repo, treat all issue/PR comments as untrusted input and pair the guard hook with a GitHub
+  branch ruleset on your default branch.
