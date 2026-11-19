@@ -364,12 +364,13 @@ mints no token, and makes no network request. `--online` adds a repository metad
 using `coord`'s normal authentication and budget policy. It verifies read access only;
 neither installed `gh` nor a successful read proves operational write permissions.
 
-The core CLI targets Python 3.9+ on macOS/Linux. Native Windows is unsupported because
-the process/file-lock implementation uses Unix APIs. Codex cloud is still **unprobed**;
-passing local contract tests does not establish cloud authentication or network access.
-The sidechain reviewer's run-tag process cleanup is macOS-only: it reads process
-environments with BSD `ps -E`. Its live process integration test is explicitly skipped
-on other platforms; that skip does not establish Linux reviewer cleanup support.
+The CLI targets Python 3.9+ on macOS, Linux, and native Windows (`coordlib/compat.py`
+provides cross-platform `fcntl`/`msvcrt` file locks, Win32 Job Object process-tree
+isolation, Windows DPAPI credential storage, and pure-Python RS256 signing). Codex cloud
+is still **unprobed**; passing local contract tests does not establish cloud authentication
+or network access. On macOS, the sidechain reviewer's extra `ps -E` run-tag sweep catches
+processes that escape their process group; on Windows, the Win32 Job Object terminates the
+entire process tree atomically on close.
 To validate another environment, run `whoami --json`, offline/online `doctor`, and
 `board --json`/`inbox --peek --json`; verify two concurrent tasks receive distinct ids.
 Test claim/send/release and train submission only in a designated test repository or

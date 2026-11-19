@@ -81,7 +81,7 @@ CACHE_READS = frozenset({"board", "inbox", "train status", "conductor status"}) 
 READS = CACHE_READS | {"ci", "token exec", "doctor", "train report", "conductor diagnose"}
 # `conductor tick` keeps its own floors (conductor.Watcher): it must beat and check the
 # machine even when reads are refused.
-UNGATED = frozenset({"send", "whoami", "train step", "conductor tick", "token status"})
+UNGATED = frozenset({"send", "whoami", "train step", "conductor tick", "token status", "token import-key"})
 
 OK, LOW, REFUSE = "ok", "low", "refuse"
 

@@ -987,6 +987,25 @@ def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
     return result.returncode if result.returncode >= 0 else 128 - result.returncode
 
 
+def cmd_token_import_key(args: argparse.Namespace, gh: GitHub) -> int:
+    """Import a GitHub App PEM private key into the OS credential store (macOS Keychain or
+    Windows DPAPI). Never prints the key."""
+    try:
+        with open(args.pem_file, "rb") as handle:
+            pem = handle.read()
+    except OSError as error:
+        raise UsageError(f"cannot read {args.pem_file}: {error.strerror}")
+    client_id = args.client_id
+    if not client_id:
+        mode = apptoken.detect(gh.repo)
+        client_id = (mode.config or {}).get("client_id")
+    if not client_id:
+        raise UsageError("pass --client-id <Iv23...> (or write github-app.json first)")
+    where = apptoken.store_private_key(pem, client_id, service=args.service)
+    print(f"stored GitHub App private key for {client_id} in {where}")
+    return EXIT_OK
+
+
 def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
     # merge-train.yml passes the GitHub App's installation token here, and only
     # here, when it could mint one; without it workflow PRs are dropped for a hand merge.
@@ -1349,6 +1368,11 @@ def parser() -> argparse.ArgumentParser:
                             help="read (default): every permission read-only; ops: coord's write token, only by name")
     token_exec.add_argument("cmd", nargs=argparse.REMAINDER, help="-- then the command and its arguments")
     token_exec.set_defaults(func=cmd_token_exec)
+    token_import = token_sub.add_parser("import-key", help="store a GitHub App .pem private key in macOS Keychain or Windows DPAPI")
+    token_import.add_argument("pem_file", help="path to the downloaded GitHub App .pem private key")
+    token_import.add_argument("--client-id", help="GitHub App client id (default: read from github-app.json)")
+    token_import.add_argument("--service", help="Keychain/DPAPI service name (default: config keychain_service)")
+    token_import.set_defaults(func=cmd_token_import_key)
     return top
 
 

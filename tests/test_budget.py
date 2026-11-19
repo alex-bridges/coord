@@ -554,6 +554,7 @@ class TrainStepTests(BudgetTestCase):
         self.assertEqual(budget.decision("train step", budget.current(REPO)), (budget.OK, ""))
 
 
+@unittest.skipIf(os.name == "nt", "tests POSIX bash SessionStart hook")
 class HookTests(BudgetTestCase):
     """.claude/hooks/coord-board.sh passes the budget line on and still exits 0."""
 

@@ -17,6 +17,7 @@ import unittest
 INSTALLER = Path(__file__).resolve().parents[1] / "conductor" / "install.sh"
 
 
+@unittest.skipIf(os.name == "nt", "tests macOS launchd install.sh")
 class ConductorInstallTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

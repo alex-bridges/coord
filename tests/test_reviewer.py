@@ -739,6 +739,7 @@ REVIEWER_GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtu
                               "conductor-guard.py")
 
 
+@unittest.skipIf(os.name == "nt", "fixture guard uses os.fork()")
 class ReviewerGuardTests(unittest.TestCase):
     def guard(self, command, agent="reviewer@ci-box:review"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
@@ -1637,6 +1638,7 @@ class CodexRound11Tests(ReviewFlowTests):
         return subprocess.run([sys.executable, REVIEWER_GUARD], input=payload, capture_output=True, text=True,
                               env=env).returncode
 
+    @unittest.skipIf(os.name == "nt", "fixture guard uses os.fork()")
     def test_m1_the_runs_own_reads_stay_in_the_review(self):
         home = os.path.realpath(os.path.expanduser("~"))
         state = os.path.join(home, ".local", "state", "example-conductor")
@@ -1912,6 +1914,7 @@ class CodexRound17Tests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 1)
 
 
+@unittest.skipIf(os.name == "nt", "fixture guard uses os.fork()")
 class ReviewerWriteGuardTests(unittest.TestCase):
     def guard(self, path, agent="reviewer@ci-box:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}

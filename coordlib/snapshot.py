@@ -900,7 +900,7 @@ def normalize_path(path: str) -> str:
     repository or names its root; callers reject those.
     """
     text = (path or "").strip().replace("\\", "/")
-    if not text or text.startswith("/"):
+    if not text or text.startswith("/") or re.match(r"^[A-Za-z]:", text):
         return ""
     normal = posixpath.normpath(text)
     if normal in (".", "..") or normal.startswith("../"):

@@ -688,6 +688,7 @@ def names_python_and_apptoken(command: str) -> bool:
             and "apptoken" in re.sub(r"(?<!\w)test_apptoken", "", folded))
 
 
+@unittest.skipIf(os.name == "nt", "fixture guard uses os.fork()")
 class GuardDifferentialTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -13,7 +13,7 @@ git clone https://github.com/alex-bridges/coord ~/tools/coord
 ln -s ~/tools/coord/coord ~/.local/bin/coord                # or run ~/tools/coord/coord directly
 ```
 
-Pure Python 3.9+ standard library (macOS and Linux). Run `coord` inside a checkout of the
+Pure Python 3.9+ standard library (macOS, Linux, and Windows). Run `coord` inside a checkout of the
 target repository; it detects `owner/name` from the `origin` remote (`COORD_REPO=owner/name`
 overrides).
 
@@ -212,7 +212,7 @@ satisfies the gate:
 2. **GitHub Codex connector:** A fresh 👍 reaction from `chatgpt-codex-connector` plus its
    pinned summary comment naming that head as `Completed`, with no unanswered review threads.
 
-## 7. GitHub App mode (optional, macOS)
+## 7. GitHub App mode (optional, macOS & Windows)
 
 If many local agents run concurrently, they share your user account's 5,000 REST calls/hour
 rate limit. App mode moves `coord`'s reads and operational writes onto a dedicated GitHub App
@@ -228,15 +228,7 @@ on your user login.
      `COORD_TRAIN_APP_TOKEN` in Actions: `Contents: Write` and `Workflows: Write`.)*
 2. **Generate a private key (`.pem`)** and note the app's **Client ID** (`Iv23...`) and bot
    login (`<app-slug>[bot]`).
-3. **Store the base64-encoded PEM in the macOS login Keychain** (matching `keychain_service`,
-   default `coord-github-app`):
-   ```sh
-   security add-generic-password -U \
-     -s coord-github-app \
-     -a "Iv23YourClientIdHere" \
-     -w "$(base64 < path/to/your-app.private-key.pem | tr -d '\n')"
-   ```
-4. **Write the non-secret config** at `~/.config/coord/github-app.json` (or
+3. **Write the non-secret config** at `~/.config/coord/github-app.json` (or
    `~/.config/<state_dir_name>/github-app.json`):
    ```json
    {
@@ -245,6 +237,14 @@ on your user login.
      "app_login": "my-coord-app[bot]"
    }
    ```
+4. **Import the `.pem` private key** into your OS credential store (macOS login Keychain or
+   Windows DPAPI under `%LOCALAPPDATA%\coord\keys\`):
+   ```sh
+   coord token import-key path/to/your-app.private-key.pem
+   ```
+   *(On macOS this stores base64(PEM) in Keychain service `coord-github-app`; on Windows it
+   encrypts the PEM to your Windows user account via DPAPI and signs JWTs in memory with
+   pure-Python RS256 — no OpenSSL required.)*
 5. **Verify:**
    ```sh
    coord token status
@@ -252,25 +252,37 @@ on your user login.
    ```
    To temporarily bypass app mode and use your `gh` login instead, set `COORD_APP=off`.
 
-## 8. The conductor and sidechain reviewer (optional, macOS)
+## 8. The conductor and sidechain reviewer (optional, macOS & Windows)
 
-The conductor is a `launchd` watcher that polls cheaply in plain Python and wakes Claude only
+The conductor is a periodic watcher that polls cheaply in plain Python and wakes Claude only
 when there is real work (messages to `conductor@*`, red CI, train holds, offline runners, or
 `@<bot> review` comments).
 
 1. Copy and adapt the starter templates from [`examples/`](../examples/README.md) into your
    target repository (`.claude/agents/conductor.md`, `.claude/agents/reviewer.md`,
    `.claude/hooks/conductor-guard.py`) and point `.coord/config.json` at them.
-2. Install the `launchd` agent on your CI Mac:
+2. Install the watcher on your CI machine:
+
+   **macOS (`launchd`):**
    ```sh
    git clone https://github.com/alex-bridges/coord ~/tools/coord
    ~/tools/coord/conductor/install.sh --repo owner/name [--home DIR] [--interval 300] [--no-wake]
    ```
-   This installs `com.coord.conductor.<owner>-<name>` (log
+   Installs `com.coord.conductor.<owner>-<name>` (log
    `~/Library/Logs/coord-conductor-<owner>-<name>.log`), keeps a detached `origin/main`
    checkout at `~/conductor/<name>`, and runs `coord conductor tick` every `--interval`
-   seconds. Use `--no-wake` for model-free ticks (lease + train wake + escalations without
-   Claude installed), and `--uninstall` to remove it. Check status with `coord conductor status`.
+   seconds. Use `--no-wake` for model-free ticks and `--uninstall` to remove it.
+
+   **Windows (Task Scheduler, PowerShell):**
+   ```powershell
+   git clone https://github.com/alex-bridges/coord $HOME\tools\coord
+   & "$HOME\tools\coord\conductor\install.ps1" -Repo owner/name [-HomeDir DIR] [-Interval 300] [-NoWake]
+   ```
+   Registers a per-user Scheduled Task `coord-conductor-<owner>-<name>` (log
+   `%LOCALAPPDATA%\coord\logs\conductor-<owner>-<name>.log`) running from `~\conductor\<name>`.
+   Use `-NoWake` for model-free ticks and `-Uninstall` to remove it.
+
+   Check status on either OS with `coord conductor status`.
 
 ## 9. Using `coord` on a public vs. private repository
 

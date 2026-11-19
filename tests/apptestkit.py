@@ -59,11 +59,14 @@ def _generate_key() -> bytes:
     return subprocess.run(["/usr/bin/openssl", "genrsa", "2048"], capture_output=True, check=True).stdout
 
 
-PEM = _generate_key()
-PEM_B64 = base64.b64encode(PEM).decode()
-PUBLIC_PEM = subprocess.run(["/usr/bin/openssl", "rsa", "-pubout"], input=PEM, capture_output=True,
-                            check=True).stdout
-KEY_LINES = [line for line in PEM.decode().splitlines() if line and not line.startswith("-----")]
+if os.name != "nt" and os.path.exists("/usr/bin/openssl"):
+    PEM = _generate_key()
+    PEM_B64 = base64.b64encode(PEM).decode()
+    PUBLIC_PEM = subprocess.run(["/usr/bin/openssl", "rsa", "-pubout"], input=PEM, capture_output=True,
+                                check=True).stdout
+    KEY_LINES = [line for line in PEM.decode().splitlines() if line and not line.startswith("-----")]
+else:
+    PEM, PEM_B64, PUBLIC_PEM, KEY_LINES = b"", "", b"", []
 
 JWT_SHAPE = re.compile(r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 
@@ -315,6 +318,8 @@ class AppTestCase(unittest.TestCase):
            "FAKE_SECURITY_LOG", "FAKE_SECURITY_MODE", "FAKE_KEYCHAIN_B64", "TMPDIR", "COORD_SECURITY_BIN")
 
     def setUp(self) -> None:
+        if os.name == "nt":
+            self.skipTest("AppTestCase uses POSIX /bin/sh fake security; Windows DPAPI flow is in test_windows_compat.py")
         # Registered first, so it runs last (cleanups run in reverse): no test may leave HOME
         # changed for the test modules that run after it.
         self.addCleanup(self._assert_home_unchanged, os.environ.get("HOME"))

@@ -33,20 +33,18 @@ from __future__ import annotations
 
 import dataclasses
 import datetime as dt
-import fcntl
 import json
 import os
 import re
 import secrets
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import budget, cache, config, identity, lease, marker, outage, review, runtime, snapshot, train
+from . import budget, cache, compat, config, identity, lease, marker, outage, review, runtime, snapshot, train
 from . import gh as gh_module
 from .gh import AppAuthError, GitHub, GitHubError
 
@@ -120,6 +118,8 @@ def deny_rules(repo: Optional[str] = None) -> List[str]:
     ]
     for name in state_dir_names():
         rules += [f"Read(~/Library/Caches/{name}/**)", f"Read(//Users/*/Library/Caches/{name}/**)"]
+        if compat.IS_WINDOWS:
+            rules += [f"Read(~/AppData/Local/{name}/**)"]
     rules += [str(rule) for rule in config.get("conductor").get("deny") or []]
     return rules
 
@@ -234,6 +234,11 @@ class Config:
                 return default
 
         data_volume = "/System/Volumes/Data"
+        if compat.IS_WINDOWS:
+            drive = os.path.splitdrive(os.path.abspath(home))[0]
+            default_disk = (drive + os.sep) if drive else "C:\\"
+        else:
+            default_disk = data_volume if os.path.isdir(data_volume) else "/"
         return cls(
             home=home,
             state_dir=env.get("CONDUCTOR_STATE_DIR") or default_state_dir(env),
@@ -244,7 +249,7 @@ class Config:
             repair_model=env.get("CONDUCTOR_REPAIR_MODEL") or REPAIR_MODEL,
             max_wakes_per_day=int(number("CONDUCTOR_MAX_WAKES_PER_DAY", MAX_WAKES_PER_DAY)),
             run_timeout=int(number("CONDUCTOR_RUN_TIMEOUT", RUN_TIMEOUT_SECONDS)),
-            disk_path=env.get("CONDUCTOR_DISK_PATH") or (data_volume if os.path.isdir(data_volume) else "/"),
+            disk_path=env.get("CONDUCTOR_DISK_PATH") or default_disk,
             disk_low_gb=number("CONDUCTOR_DISK_LOW_GB", DISK_LOW_GB),
             update_checkout=env.get("CONDUCTOR_UPDATE_CHECKOUT", "1") != "0",
             max_reviews_per_day=int(number("CONDUCTOR_MAX_REVIEWS_PER_DAY", 8)),
@@ -253,9 +258,14 @@ class Config:
 
 
 def default_state_dir(env: Dict[str, str]) -> str:
-    """$XDG_STATE_HOME/<state_dir_name>-conductor; configured `legacy_state_dir_names`
-    (with `-coord` read as `-conductor`) are kept while the new one does not exist."""
-    root = env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    """$XDG_STATE_HOME/<state_dir_name>-conductor (or %LOCALAPPDATA%/<name>-conductor on
+    Windows); configured `legacy_state_dir_names` are kept while the new one does not exist."""
+    if env.get("XDG_STATE_HOME"):
+        root = env["XDG_STATE_HOME"]
+    elif compat.IS_WINDOWS and env.get("LOCALAPPDATA"):
+        root = env["LOCALAPPDATA"]
+    else:
+        root = os.path.expanduser("~/.local/state")
     names = state_dir_names()
     current = os.path.join(root, names[0] + "-conductor")
     legacy = [n[:-len("-coord")] + "-conductor" if n.endswith("-coord") else n + "-conductor" for n in names[1:]]
@@ -284,7 +294,7 @@ def save_state(config: Config, state: Dict[str, Any]) -> None:
     tmp = state_path(config) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(state, handle, indent=1, sort_keys=True)
-    os.replace(tmp, state_path(config))
+    compat.atomic_replace(tmp, state_path(config))
 
 
 def append_wake(config: Config, record: Dict[str, Any]) -> None:
@@ -651,35 +661,13 @@ Runner = Callable[[Sequence[str], str, Dict[str, str], int], "subprocess.Complet
 
 
 def default_runner(cmd: Sequence[str], cwd: str, env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess[str]":
-    """The run in its own process group, so a timeout also stops the builds and tests it
-    started. stdin is closed: `claude -p` otherwise waits 3 s for piped input.
-
-    Output goes to files, not pipes, and only the run itself is waited for: a descendant
-    that left the group (setsid) and kept stdout open would otherwise hold a pipe forever
-    and wedge the watcher (Codex on #1049)."""
-    with tempfile.TemporaryFile("w+") as out_file, tempfile.TemporaryFile("w+") as err_file:
-        try:
-            process = subprocess.Popen(list(cmd), cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out_file,
-                                       stderr=err_file, text=True, start_new_session=True)
-        except OSError as error:
-            return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
-        try:
-            code = process.wait(timeout=timeout)
-            timed_out = False
-        except subprocess.TimeoutExpired:
-            timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)  # what the run left behind in its group, either way
-        except OSError:
-            pass
-        if timed_out:
-            process.wait()
-        out_file.seek(0)
-        err_file.seek(0)
-        out, err = out_file.read(), err_file.read()
-    if timed_out:
-        return subprocess.CompletedProcess(list(cmd), 124, out, f"timed out after {timeout}s")
-    return subprocess.CompletedProcess(list(cmd), code, out, err)
+    """Run `cmd` in its own process group (POSIX) or Job Object (Windows), so a timeout
+    stops the entire process tree. stdin is closed (`claude -p` otherwise waits for piped
+    input), and output goes to temp files so detached descendants cannot hold pipes open."""
+    try:
+        return compat.run_isolated_process(list(cmd), cwd, env, timeout)
+    except OSError as error:
+        return subprocess.CompletedProcess(list(cmd), 127, "", str(error))
 
 
 def model_command(config: Config, prompt: str, model: str) -> List[str]:
@@ -1026,9 +1014,11 @@ class Watcher:
 
     def tick(self, dry_run: bool = False, wake: bool = True) -> List[str]:
         os.makedirs(self.config.state_dir, exist_ok=True)
-        with open(os.path.join(self.config.state_dir, "tick.lock"), "w") as lock:
+        lock_path = os.path.join(self.config.state_dir, "tick.lock")
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compat.try_lock(fd)
             except OSError:
                 return ["another tick is running (a model run in progress); nothing to do"]
             self.state = load_state(self.config)
@@ -1039,7 +1029,10 @@ class Watcher:
                 prune(self.state, self.now)
                 if not dry_run:
                     save_state(self.config, self.state)
-        return self.lines
+            return self.lines
+        finally:
+            compat.unlock(fd)
+            os.close(fd)
 
     def _tick(self, dry_run: bool, wake: bool) -> None:
         last_slow = _time(self.state.get("lastSlow"))

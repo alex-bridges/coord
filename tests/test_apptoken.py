@@ -7,7 +7,6 @@ the real Keychain item, writes the real token cache or reaches GitHub.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import subprocess
@@ -18,6 +17,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+
+if os.name != "nt":
+    import fcntl
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

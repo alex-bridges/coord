@@ -70,11 +70,12 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import config, marker, review, runtime, snapshot, train
+from . import compat, config, marker, review, runtime, snapshot, train
 from . import gh as gh_module
 from .gh import AppAuthError, GitHub, GitHubError, redact
 
@@ -480,57 +481,64 @@ def prompt(pr: Dict[str, Any], head: str, worktree: str, scratch: str, request: 
 
 
 ENV_ALLOWED = ("PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "TERM", "DEVELOPER_DIR")
+WINDOWS_ENV_ALLOWED = frozenset({
+    "PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "OS",
+    "USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA",
+    "TEMP", "TMP", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "NUMBER_OF_PROCESSORS",
+})
 
 
 def isolated_env(base: Dict[str, str], empty_dir: str) -> Dict[str, str]:
-    """The review run's environment, with no GitHub credential in reach of gh or git (review
-    of #1049): gh gets an empty config directory (it is not logged in), git reads no system
-    or global config (no osxkeychain helper) and cannot prompt, and no token variables
-    remain. Prefix deny rules cannot stop `/opt/homebrew/bin/gh pr comment` or a test that
-    shells out; an unauthenticated gh and git can."""
+    """The review run's environment, with no GitHub credential in reach of gh or git:
+    gh gets an empty config directory (not logged in), git reads no system or global config
+    (no credential helper) and cannot prompt, and no token variables remain."""
     # An allowlist, not a denylist: nothing else in the host's environment (a model key, a
-    # cloud or npm token) reaches the run or the PR's tests (Codex on #1049). Claude Code signs
-    # in from the Keychain, which the sandboxed children cannot read.
-    env = {k: v for k, v in base.items() if k in ENV_ALLOWED or k.startswith("LC_")}
+    # cloud or npm token) reaches the run or the PR's tests.
+    if compat.IS_WINDOWS:
+        env = {k: v for k, v in base.items()
+               if k.upper() in WINDOWS_ENV_ALLOWED or k in ENV_ALLOWED or k.startswith("LC_")}
+    else:
+        env = {k: v for k, v in base.items() if k in ENV_ALLOWED or k.startswith("LC_")}
     # No app config either: with COORD_AGENT=reviewer@… apptoken.detect refuses anyway, and a
-    # nested process that resets COORD_AGENT still finds no config to mint with (Codex on #1049).
+    # nested process that resets COORD_AGENT still finds no config to mint with.
     env.update({"COORD_APP_CONFIG": os.path.join(empty_dir, "no-app-config"),
                 "COORD_TOKEN_CACHE_DIR": os.path.join(empty_dir, "no-token-cache")})
+    if compat.IS_WINDOWS:
+        env["COORD_WINDOWS_KEY_DIR"] = os.path.join(empty_dir, "no-windows-keys")
+    askpass = "" if compat.IS_WINDOWS else "/usr/bin/false"
+    ssh_null = os.devnull if compat.IS_WINDOWS else "/dev/null"
     env.update({"GH_CONFIG_DIR": empty_dir, "GH_PROMPT_DISABLED": "1", "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/usr/bin/false",
-                "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o IdentitiesOnly=yes -i /dev/null"})
+                "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": askpass,
+                "GIT_SSH_COMMAND": f"ssh -o BatchMode=yes -o IdentitiesOnly=yes -i {ssh_null}"})
     return env
 
 
 def run_settings(home: str, deny: List[str], reviews_root: str = "") -> Dict[str, Any]:
-    """The review run's settings. Its Bash runs in Claude Code's OS sandbox (macOS Seatbelt,
-    inherited by every child a PR's test starts): no network, so nothing it starts can mint a
-    token or reach GitHub whatever it does to its environment; no writes to the conductor's
-    checkout; no reading the app's config, token cache or keychain files. It refuses to start
-    without the sandbox, and nothing may run outside it (Codex on #1049). The added
-    directories (the PR's tree and scratch) stay writable."""
+    """The review run's settings. Its Bash runs in Claude Code's OS sandbox: no network,
+    no writes to the conductor's checkout, no reading the app's config, token cache or
+    credential store. Refuses to start without the sandbox."""
     from . import apptoken
-    # The guard hook is config `reviewer.guard_hook`, else `conductor.guard_hook`; the run
-    # refuses to start without one rather than run its Read tools unvetted.
     guard_file = runtime.setting("reviewer", "guard_hook", required=False) or runtime.setting("conductor", "guard_hook")
     guard = os.path.join(os.path.realpath(home), str(guard_file))
+    guard_cmd = f'"{sys.executable}" "{guard}"' if (compat.IS_WINDOWS and guard.lower().endswith(".py")) else guard
+    deny_read = [
+        os.path.realpath(os.path.expanduser("~")),
+        os.path.dirname(apptoken.default_config_path()),
+        apptoken.token_cache_dir({}),
+    ]
+    if compat.IS_WINDOWS:
+        deny_read.append(apptoken.dpapi_key_dir({}))
+    else:
+        deny_read.append(os.path.join(os.path.expanduser("~"), "Library", "Keychains"))
     return {
         "permissions": {"deny": deny},
-        # The sandbox covers Bash only: the guard (the checkout's, main's) also vets the run's own
-        # Read, Grep, Glob and LS, allowing nothing under the home folder but the review tree and
-        # the checkout (Codex on #1049). Registered here, so ordinary sessions pay nothing.
         "hooks": {"PreToolUse": [{"matcher": "Read|Grep|Glob|LS|NotebookRead",
-                                  "hooks": [{"type": "command", "command": guard, "timeout": 10}]}]},
+                                  "hooks": [{"type": "command", "command": guard_cmd, "timeout": 10}]}]},
         "sandbox": {
             "enabled": True, "failIfUnavailable": True, "allowUnsandboxedCommands": False,
             "filesystem": {
                 "denyWrite": [os.path.realpath(home)],
-                # Nothing under the home folder but the PR's tree, scratch and the conductor's
-                # checkout: no ~/.aws, ~/.npmrc, ~/.netrc or anything else a test could print
-                # (Codex on #1049). The named paths are inside it, and stay named.
-                "denyRead": [os.path.realpath(os.path.expanduser("~")),
-                             os.path.dirname(apptoken.default_config_path()), apptoken.token_cache_dir({}),
-                             os.path.join(os.path.expanduser("~"), "Library", "Keychains")],
+                "denyRead": deny_read,
                 "allowRead": [p for p in (os.path.realpath(reviews_root) if reviews_root else "",
                                           os.path.realpath(home)) if p],
             },
@@ -1093,11 +1101,10 @@ class Reviews:
 
 
 def kill_run(tag: str) -> None:
-    """SIGKILL every process whose environment carries this run's COORD_REVIEW_RUN tag: a
-    PR's test that left the process group (setsid) and the review trees is still found
-    (Codex on #1049). `ps -E` shows the environment of this user's processes. A process that
-    rewrote its own environment escapes this; only a separate OS identity closes that."""
-    if not re.fullmatch(r"[0-9a-f]{16}", tag or ""):
+    """Terminate any lingering process carrying this run's COORD_REVIEW_RUN tag.
+    On Windows, the Win32 Job Object in compat.run_isolated_process already terminates the
+    entire process tree atomically on close; on macOS, `ps -E` finds detached survivors."""
+    if compat.IS_WINDOWS or not re.fullmatch(r"[0-9a-f]{16}", tag or ""):
         return
     try:
         listed = subprocess.run(["ps", "-axwwE", "-o", "pid=,command="], capture_output=True, text=True,
@@ -1115,9 +1122,10 @@ def kill_run(tag: str) -> None:
 
 
 def kill_holders(paths: List[str]) -> None:
-    """SIGKILL every process with a file open or its working directory under `paths`: a
-    PR's test that escaped the run's process group (setsid) must not outlive the review
-    (Codex on #1049). Best-effort: lsof missing or failing kills nothing."""
+    """Terminate any process holding files open under `paths`. On Windows, the Win32 Job
+    Object already guarantees full descendant cleanup; on POSIX, uses `lsof` best-effort."""
+    if compat.IS_WINDOWS:
+        return
     for path in paths:
         if not os.path.isdir(path):
             continue

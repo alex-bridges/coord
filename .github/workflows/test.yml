@@ -24,10 +24,13 @@ jobs:
             python: "3.9"
           - os: macos-latest
             python: "3.12"
+          - os: windows-latest
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - name: Run the tests
-        run: cd tests && env -u CLAUDE_CODE_REMOTE python3 -m unittest discover -s . -p "test_*.py"
+        shell: bash
+        run: cd tests && env -u CLAUDE_CODE_REMOTE python -m unittest discover -s . -p "test_*.py"

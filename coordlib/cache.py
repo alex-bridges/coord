@@ -12,7 +12,6 @@ cached elsewhere (apptoken.py), never here.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -21,7 +20,7 @@ import tempfile
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
-from . import config
+from . import compat, config
 
 
 def state_dir_name() -> str:
@@ -35,9 +34,18 @@ def legacy_state_dir_names() -> List[str]:
 
 
 def base_cache_dir(name: Optional[str] = None) -> str:
-    """COORD_CACHE_DIR, else $XDG_CACHE_HOME or ~/.cache joined with the state dir name."""
-    return os.environ.get("COORD_CACHE_DIR") or os.path.join(
-        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), name or state_dir_name())
+    """COORD_CACHE_DIR, else $XDG_CACHE_HOME, or %LOCALAPPDATA%/<name>/cache on Windows
+    / ~/.cache/<name> on POSIX."""
+    explicit = os.environ.get("COORD_CACHE_DIR")
+    if explicit:
+        return explicit
+    dir_name = name or state_dir_name()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return os.path.join(xdg, dir_name)
+    if compat.IS_WINDOWS and os.environ.get("LOCALAPPDATA"):
+        return os.path.join(os.environ["LOCALAPPDATA"], dir_name, "cache")
+    return os.path.join(os.path.expanduser("~/.cache"), dir_name)
 
 
 def cache_dir(repo: str) -> str:
@@ -63,7 +71,7 @@ def _write(path: str, data: Dict[str, Any]) -> None:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
-        os.replace(tmp, path)
+        compat.atomic_replace(tmp, path)
         tmp = None
     except Exception:  # noqa: BLE001 - a cache that cannot be written is a slower board, not an error
         pass
@@ -205,7 +213,7 @@ def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) 
         deadline = time.monotonic() + timeout_seconds
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                compat.try_lock(fd)
                 break
             except OSError:
                 if time.monotonic() > deadline:
@@ -217,6 +225,7 @@ def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) 
         yield
     finally:
         if fd is not None:
+            compat.unlock(fd)
             os.close(fd)
 
 

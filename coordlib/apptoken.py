@@ -48,11 +48,10 @@ import base64
 import binascii
 import contextlib
 import errno
-import fcntl
+import hashlib
 import http.client
 import json
 import os
-import pwd
 import re
 import subprocess
 import tempfile
@@ -62,13 +61,14 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
-from . import cache, config, gh, review
+from . import cache, compat, config, gh, review
 from .gh import GITHUB_API, AppAuthError, redact
 
 SWITCH_ENV = "COORD_APP"
 CONFIG_ENV = "COORD_APP_CONFIG"
 TOKEN_CACHE_ENV = "COORD_TOKEN_CACHE_DIR"
 SECURITY_ENV = "COORD_SECURITY_BIN"
+WINDOWS_KEY_DIR_ENV = "COORD_WINDOWS_KEY_DIR"
 
 
 def keychain_services() -> Sequence[str]:
@@ -158,12 +158,9 @@ def config_path(env: Optional[Dict[str, str]] = None) -> str:
 
 
 def real_home() -> str:
-    """The invoking user's home from the password database, not $HOME: a test or a probe
-    that moves HOME must not stop the real config from being recognised as the real one."""
-    try:
-        return pwd.getpwuid(os.getuid()).pw_dir
-    except (KeyError, OSError):
-        return os.path.expanduser("~")
+    """The invoking user's home from the password database on POSIX (not $HOME), or
+    the user profile directory on Windows."""
+    return compat.real_home()
 
 
 def real_default_config_path() -> str:
@@ -236,7 +233,69 @@ def security_binary(env: Optional[Dict[str, str]] = None, client_id: Optional[st
 
 def token_cache_dir(env: Optional[Dict[str, str]] = None) -> str:
     env = os.environ if env is None else env
-    return env.get(TOKEN_CACHE_ENV) or os.path.join(os.path.expanduser("~"), "Library", "Caches", cache.state_dir_name())
+    explicit = env.get(TOKEN_CACHE_ENV)
+    if explicit:
+        return explicit
+    if compat.IS_WINDOWS:
+        base = env.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, cache.state_dir_name(), "tokens")
+    return os.path.join(os.path.expanduser("~"), "Library", "Caches", cache.state_dir_name())
+
+
+def dpapi_key_dir(env: Optional[Dict[str, str]] = None) -> str:
+    """Directory holding Windows DPAPI-protected GitHub App private keys."""
+    env = os.environ if env is None else env
+    explicit = env.get(WINDOWS_KEY_DIR_ENV)
+    if explicit:
+        return explicit
+    base = env.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, cache.state_dir_name(), "keys")
+
+
+def dpapi_key_path(service: str, client_id: str, env: Optional[Dict[str, str]] = None) -> str:
+    safe_service = re.sub(r"[^A-Za-z0-9._-]", "_", service)
+    digest = hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(dpapi_key_dir(env), f"{safe_service}-{digest}.dpapi")
+
+
+def store_private_key(pem: bytes, client_id: str, service: Optional[str] = None,
+                      env: Optional[Dict[str, str]] = None) -> str:
+    """Validate an RSA PEM private key and store it in the OS credential store
+    (Windows DPAPI or macOS login Keychain). Returns a human-readable destination."""
+    if not isinstance(client_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", client_id):
+        raise AppAuthError("client_id must be a non-empty GitHub App client id")
+    try:
+        compat.rs256_sign_pem(b"coord-key-check", pem)
+    except Exception as error:  # noqa: BLE001
+        raise AppAuthError(f"not a usable RSA PEM private key ({redact(str(error))})") from None
+    svc = service or keychain_services()[0]
+    if compat.IS_WINDOWS:
+        path = dpapi_key_path(svc, client_id, env)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        protected = compat.dpapi_protect(pem)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(protected)
+            compat.atomic_replace(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+        return f"Windows DPAPI store ({path})"
+    if compat.IS_MACOS:
+        encoded = base64.b64encode(pem).decode("ascii")
+        result = subprocess.run(
+            [SECURITY, "add-generic-password", "-U", "-s", svc, "-a", client_id, "-w", encoded],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            detail = redact((result.stderr or "").strip())[:200]
+            raise AppAuthError(f"macOS Keychain refused to store the key (exit {result.returncode}: {detail})")
+        return f"macOS login Keychain (service {svc}, account {client_id})"
+    raise AppAuthError("importing a GitHub App key requires macOS Keychain or Windows DPAPI")
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -329,11 +388,17 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def sign(message: bytes, pem: bytes, openssl: Optional[str] = None) -> bytes:
-    """RS256 signature of `message` by `openssl dgst -sha256 -sign /dev/fd/N`.
+    """RS256 signature of `message` with `pem`.
 
-    The key goes through a pipe the child inherits (`pass_fds`), so it is never written to
-    a file and never appears in an argument list.
+    On POSIX, signs through `openssl dgst -sha256 -sign /dev/fd/N` via an inherited pipe
+    so the key is never written to a file. On Windows (where `/dev/fd` is absent and
+    `/usr/bin/openssl` is not installed), signs in memory using Python's standard library.
     """
+    if compat.IS_WINDOWS and openssl is None:
+        try:
+            return compat.rs256_sign_pem(message, pem)
+        except Exception as error:  # noqa: BLE001
+            raise AppAuthError(f"could not sign the app JWT ({redact(str(error))})") from None
     binary = openssl or OPENSSL
     read_fd, write_fd = os.pipe()
     try:
@@ -557,11 +622,7 @@ class AppTokens:
 
     def _private_file(self, path: str) -> bool:
         """Owned by this user and readable by nobody else: anything looser is not ours."""
-        try:
-            info = os.stat(path)
-        except OSError:
-            return False
-        return info.st_uid == os.getuid() and (info.st_mode & 0o077) == 0
+        return compat.is_private_file(path)
 
     def usable(self, entry: Optional[Dict[str, Any]], kind: str) -> bool:
         if not isinstance(entry, dict) or not self._same_config(entry):
@@ -592,10 +653,10 @@ class AppTokens:
         try:
             os.makedirs(self.cache_dir, mode=0o700, exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=".tmp-")
-            os.fchmod(fd, 0o600)
+            compat.chmod_private(fd, tmp)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(data, handle)
-            os.replace(tmp, path)
+            compat.atomic_replace(tmp, path)
             tmp = None
         except (OSError, ValueError, TypeError):
             pass
@@ -616,10 +677,10 @@ class AppTokens:
             deadline = time.monotonic() + timeout
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    compat.try_lock(fd)
                     break
                 except OSError as error:
-                    if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES, getattr(errno, "EDEADLK", errno.EACCES)):
                         raise AppAuthError(f"the token cache lock failed ({error.strerror})") from None
                 if time.monotonic() >= deadline:
                     raise AppAuthError(f"another coord process has held the {kind} token lock for "
@@ -627,12 +688,36 @@ class AppTokens:
                 time.sleep(0.05)
             yield
         finally:
+            compat.unlock(fd)
             os.close(fd)  # closing releases the lock
 
     # MARK: minting
 
     def _private_key(self) -> bytes:
-        """The PEM from the login Keychain. Only minting calls this."""
+        """The PEM from the OS credential store (macOS Keychain or Windows DPAPI). Only minting calls this."""
+        if compat.IS_WINDOWS and not os.environ.get(SECURITY_ENV):
+            last_error = None
+            for service in keychain_services():
+                path = dpapi_key_path(service, self.config["client_id"])
+                if not os.path.lexists(path):
+                    continue
+                if not compat.is_private_file(path):
+                    raise AppAuthError(f"the DPAPI key file {path} is not a private regular file")
+                try:
+                    with open(path, "rb") as handle:
+                        pem = compat.dpapi_unprotect(handle.read())
+                except OSError as error:
+                    last_error = f"Windows DPAPI could not decrypt {path} ({redact(str(error))})"
+                    continue
+                if b"-----BEGIN" not in pem or b"PRIVATE KEY-----" not in pem:
+                    raise AppAuthError("the DPAPI key item does not decode to a PEM private key")
+                return pem
+            if last_error:
+                raise AppAuthError(last_error)
+            raise AppAuthError(
+                f"no Windows DPAPI key found for client {self.config['client_id']} "
+                "(import it with `coord token import-key --client-id <id> <pem-file>`)"
+            )
         binary = security_binary(client_id=self.config["client_id"])
         services = list(keychain_services())
         result = None

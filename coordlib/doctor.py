@@ -39,7 +39,7 @@ def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
         "agent": identity.agent_id(),
         "repo": gh.repo,
         "environment": {"platform": platform.system(), "python": platform.python_version(),
-                        "supported": os.name == "posix" and sys.version_info >= (3, 9)},
+                        "supported": os.name in ("posix", "nt") and sys.version_info >= (3, 9)},
         "tools": {name: shutil.which(name) is not None for name in ("git", "gh", "claude", "codex")},
         "transport": transport,
         "authentication": {"principal": gh.principal(),
@@ -54,7 +54,8 @@ def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
                          "train": "submission requires operational writes; merging stays in Actions",
                          "claudeRuntime": "conductor",
                          "codexRuntime": "read-only diagnosis; explicit repair handoff to conductor",
-                         "codexCloud": "not probed", "nativeWindows": "not supported"},
+                         "codexCloud": "not probed",
+                         "nativeWindows": "supported (DPAPI key store, Task Scheduler installer, Job Object isolation)"},
     }
     if online:
         gh.rest("repos/{repo}")
@@ -82,5 +83,5 @@ def render(report: Dict[str, Any]) -> str:
         "writes: not probed",
         "cache: " + (f"generated {cached['generatedAt']}, age {cached['ageSeconds']}s" if cached["present"] else "none"),
         *([f"problem: {auth['problem']}"] if auth["problem"] else []),
-        "Codex cloud: not probed; native Windows: not supported",
+        "Codex cloud: not probed; native Windows: supported",
     ]) + "\n"

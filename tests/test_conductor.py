@@ -1395,7 +1395,8 @@ class ReviewRegressionTests(unittest.TestCase):
 
     def test_10_a_timeout_stops_the_whole_process_group(self):
         started = dt.datetime.now()
-        done = conductor.default_runner(["/bin/sh", "-c", "sleep 30 & sleep 30"], "/tmp", dict(os.environ), 1)
+        script = "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); time.sleep(30)"
+        done = conductor.default_runner([sys.executable, "-c", script], tempfile.gettempdir(), dict(os.environ), 1)
         self.assertEqual(done.returncode, 124)
         self.assertLess((dt.datetime.now() - started).total_seconds(), 10)
 
@@ -1403,6 +1404,7 @@ class ReviewRegressionTests(unittest.TestCase):
 GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "hooks", "conductor-guard.py")
 
 
+@unittest.skipIf(os.name == "nt", "fixture guard uses os.fork()")
 class GuardHookTests(unittest.TestCase):
     """.claude/hooks/conductor-guard.py: the substitute reviews of 7afafab1 and 4d3b200b."""
 
