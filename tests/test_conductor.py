@@ -1400,7 +1400,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertLess((dt.datetime.now() - started).total_seconds(), 10)
 
 
-GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "hooks", "conductor-guard.py")
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks", "conductor-guard.py")
 
 
 class GuardHookTests(unittest.TestCase):
@@ -1419,10 +1419,10 @@ class GuardHookTests(unittest.TestCase):
         return result if full else result.returncode
 
     def test_moving_main_merging_and_approving_are_blocked(self):
-        for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
+        for command in ("gh api -X PUT repos/example-org/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
                         "./Tools/coord/coord train approve 1 --note x", "Tools/coord/coord train approve 1",
                         "git push origin +HEAD:main", "git push origin HEAD:main", "git push -uf origin x",
-                        "gh pr merge 5 --squash", "gh pr -R example-owner/example-repo merge 5", "gh pr --repo o/r merge 5",
+                        "gh pr merge 5 --squash", "gh pr -R example-org/example-repo merge 5", "gh pr --repo o/r merge 5",
                         "bash -c 'gh pr merge 5'", "sh -c \"git push origin main\"", "eval 'coord train approve 3'",
                         "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "gh api repos/o/r/merges -f base=main",
                         "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
@@ -1504,8 +1504,8 @@ class GuardHookTests(unittest.TestCase):
                         "cd /tmp && Tools/coord/coord token exec -- true",
                         "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true",
                         # coord's top-level --repo before the command (round three, P3-1)
-                        "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
-                        "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
+                        "Tools/coord/coord --repo example-org/example-repo token exec -- env",
+                        "Tools/coord/coord --repo=example-org/example-repo token exec --kind ops -- env",
                         "sh -c 'coord --repo o/r token exec -- env'",
                         # Round twelve's review (P3-1): every spelling of coord's options that
                         # argparse takes, before the command and between its two words.
@@ -1523,8 +1523,8 @@ class GuardHookTests(unittest.TestCase):
                         "gh pr comment 5 -b 'never run coord token exec here'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("Tools/coord/coord token status", "grep -n 'token exec' Docs/agent-coordination.md",
-                        "Tools/coord/coord --repo example-owner/example-repo token status",
-                        "Tools/coord/coord --repo example-owner/example-repo board", "Tools/coord/coord --rep o/r board",
+                        "Tools/coord/coord --repo example-org/example-repo token status",
+                        "Tools/coord/coord --repo example-org/example-repo board", "Tools/coord/coord --rep o/r board",
                         "Tools/coord/coord -- token status", "Tools/coord/coord send --on 1 'the token exec docs'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
         self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
@@ -1533,7 +1533,7 @@ class GuardHookTests(unittest.TestCase):
     def test_train_approve_with_repo_is_blocked(self):
         # A second rule beside main's `coord train approve` rule, which is unchanged: the same
         # command with at least one of coord's options in it, in any spelling argparse takes.
-        for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
+        for command in ("Tools/coord/coord --repo example-org/example-repo train approve 5 --note x",
                         "coord --repo=o/r train approve 5", "Tools/coord/coord --rep o/r train approve 5 --note x",
                         "Tools/coord/coord --re=o/r train approve 5 --note x",
                         "Tools/coord/coord --r o/r train approve 5 --note x",
@@ -1644,8 +1644,8 @@ class GuardHookTests(unittest.TestCase):
         # `du -xhd1` of the CI trees and caches. A glob (`inisa*`) now passes: the spelling class
         # #1051 accepts.
         for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json",
-                        "git -C /Users/dev/Projects/INISA diff --cached", "gh cache list --repo example-owner/example-repo",
-                        "gh api repos/example-owner/example-repo/actions/caches",
+                        "git -C /Users/dev/Projects/INISA diff --cached", "gh cache list --repo example-org/example-repo",
+                        "gh api repos/example-org/example-repo/actions/caches",
                         "python3 /Users/dev/Projects/INISA/scripts/test-ci-cache-preservation.py",
                         "du -xhd1 ~/actions-runner*/_work/INISA ~/Library/Caches 2>/dev/null | sort -h",
                         "cat ~/Library/Caches/inisa*/ops.json"):

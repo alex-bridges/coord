@@ -39,7 +39,7 @@ def setUpModule():
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
+REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa")  # frozen INISA snapshot
 HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
 LIGHT_PATH = ".claude/skills/x.md"  # the docs lane only, and not one of train.ALEX_ONLY_PATHS
 # Who posted an attestation record, and whether it counts (snapshot.trusted_attestation):

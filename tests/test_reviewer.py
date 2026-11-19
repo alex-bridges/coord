@@ -735,7 +735,7 @@ class ReviewFixTests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 3)
 
 
-REVIEWER_GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "hooks",
+REVIEWER_GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks",
                               "conductor-guard.py")
 
 
@@ -816,9 +816,9 @@ class CodexRoundTests(ReviewFlowTests):
         env = self.reviews()[0]["env"]
         self.assertFalse(os.path.exists(env["COORD_APP_CONFIG"]))
         from coordlib import apptoken
-        mode = apptoken.detect("example-owner/example-repo", env)
+        mode = apptoken.detect("example-org/example-repo", env)
         self.assertTrue(mode.error, "on, and refusing: no token and no fallback to Alex")
-        mode = apptoken.detect("example-owner/example-repo", dict(env, COORD_APP="off"))
+        mode = apptoken.detect("example-org/example-repo", dict(env, COORD_APP="off"))
         self.assertTrue(mode.error, "COORD_APP=off does not turn a review run into Alex")
 
     def test_c5_a_review_already_posted_by_another_host_is_not_run_again(self):
@@ -1714,7 +1714,7 @@ class CodexRound13Tests(ReviewFlowTests):
         deny = json.loads(cmd[cmd.index("--settings") + 1])["permissions"]["deny"]
         for tool in ("Read", "Grep", "Glob", "LS", "Edit", "Write", "WebFetch", "Agent"):
             self.assertIn(tool, deny)
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "agents",
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "agents",
                             "reviewer.md")
         with open(path, encoding="utf-8") as handle:
             front = handle.read().split("---")[1]
@@ -1932,7 +1932,7 @@ class ReviewerWriteGuardTests(unittest.TestCase):
 
 class ReviewerAgentTests(unittest.TestCase):
     def test_the_reviewer_definition_exists_and_describes_the_block(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "agents", "reviewer.md")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "agents", "reviewer.md")
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn("name: reviewer", text)

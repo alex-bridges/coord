@@ -6,10 +6,13 @@ so COORD_CONFIG points at a temp file holding the values INISA configures.
 
 import json
 import os
+import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys_path = os.path.join(HERE, "..")
+if sys_path not in sys.path:
+    sys.path.insert(0, sys_path)
 
 INISA_CONFIG = {
     "default_branch": "main",
@@ -27,8 +30,9 @@ INISA_CONFIG = {
                   "guard_hook": ".claude/hooks/conductor-guard.py", "deny": []},
     "reviewer": {"agent_file": ".claude/agents/reviewer.md", "guard_hook": ".claude/hooks/conductor-guard.py"},
     "claude_weekly_reset": "Thu 12:00 America/New_York",
-    "state_dir_name": "coord",
-    "legacy_state_dir_names": ["inisa-coord"],
+    "state_dir_name": "inisa-coord",
+    "keychain_service": "example-coord-github-app",
+    "legacy_state_dir_names": [],
 }
 
 _saved = {}

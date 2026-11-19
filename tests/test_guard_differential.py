@@ -35,7 +35,7 @@ import unicodedata
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GUARD = os.path.join(HERE, "..", "..", "..", ".claude", "hooks", "conductor-guard.py")
+GUARD = os.path.join(HERE, "fixtures", "inisa", ".claude", "hooks", "conductor-guard.py")
 LEGACY_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard.py")
 MAIN_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard-59e25cc6f.py")
 MAIN_BLOB = "d0441c4ecc072255a06b189566b7afbbef524f5b"  # `git hash-object` of main's guard at 59e25cc6f

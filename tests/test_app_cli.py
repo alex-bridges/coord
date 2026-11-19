@@ -21,6 +21,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apptestkit import INSTALLATION, REPO, AppTestCase, FakeResponse  # noqa: E402
 from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli, conductor  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow names, state dir and weekly reset are config
+
+
+def setUpModule():
+    inisa_config.use()
+
 
 USER_TOKEN = "user-token-that-must-never-be-sent"
 DEEP_JSON = "[" * 1_000_000 + "]" * 1_000_000  # too deep for 3.9 and 3.14's parsers alike

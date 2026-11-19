@@ -557,7 +557,7 @@ class TrainStepTests(BudgetTestCase):
 class HookTests(BudgetTestCase):
     """.claude/hooks/coord-board.sh passes the budget line on and still exits 0."""
 
-    HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".claude", "hooks", "coord-board.sh")
+    HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks", "coord-board.sh")
 
     def run_hook(self):
         bin_dir = tempfile.mkdtemp()

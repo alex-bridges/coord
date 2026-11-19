@@ -25,6 +25,14 @@ from apptestkit import (API, CLIENT_ID, INSTALLATION, OPENSSLS, PEM, PEM_B64, PU
                         AppTestCase, file_mode, jwt_parts, read_json)
 from coordlib import apptoken, budget  # noqa: E402
 from coordlib.gh import AppAuthError  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow names, state dir and weekly reset are config
+
+
+def setUpModule():
+    inisa_config.use()
+
 
 
 class JWTTests(AppTestCase):

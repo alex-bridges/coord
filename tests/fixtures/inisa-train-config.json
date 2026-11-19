@@ -4,7 +4,7 @@
   "owner_mention": "@alex-bridges",
   "ci_workflow": "ci.yml",
   "train_workflow": "merge-train.yml",
-  "notify_workflow": "notify-owner.yml",
+  "notify_workflow": "notify-alex.yml",
   "verdict_job": "CI verdict",
   "wake_job": "Wake the merge train",
   "ci_lanes": "changed",
@@ -19,5 +19,8 @@
   "lane_classifier": {
     "script": ".github/scripts/select-ci-lanes.py",
     "rules": ".github/ci-lanes.json"
-  }
+  },
+  "claude_weekly_reset": "Thu 12:00 America/New_York",
+  "state_dir_name": "inisa-coord",
+  "keychain_service": "example-coord-github-app"
 }
