@@ -32,9 +32,10 @@ import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from . import review
+from . import config, review
 
-WEEKLY_RESET_DEFAULT = "Thu 12:00 America/New_York"
+# The weekly reset ("Thu 12:00 America/New_York") is per repo: config `claude_weekly_reset`
+# or COORD_CLAUDE_WEEKLY_RESET. Without either, the outage feature has no reset to aim for.
 # When a limit message names no reset time, look again after this long (a run that is
 # refused costs nothing). Capped at the next weekly reset.
 PROBE_AFTER = dt.timedelta(hours=1)
@@ -74,7 +75,15 @@ def affects(harness: str, agent: str) -> bool:
 
 
 def weekly_spec() -> str:
-    return os.environ.get("COORD_CLAUDE_WEEKLY_RESET") or WEEKLY_RESET_DEFAULT
+    """The weekly reset spec; raises ValueError (config.require) when none is configured."""
+    explicit = os.environ.get("COORD_CLAUDE_WEEKLY_RESET")
+    if explicit:
+        return explicit
+    return config.require("claude_weekly_reset")
+
+
+def _configured_weekly_spec() -> Optional[str]:
+    return os.environ.get("COORD_CLAUDE_WEEKLY_RESET") or config.get("claude_weekly_reset") or None
 
 
 def _zone(name: str) -> dt.tzinfo:
@@ -96,7 +105,10 @@ def next_weekly_reset(now: dt.datetime, spec: Optional[str] = None) -> dt.dateti
         hour, minute = (int(part) for part in words[1].split(":"))
         zone = _zone(words[2] if len(words) > 2 else "UTC")
     except (IndexError, KeyError, ValueError):
-        return next_weekly_reset(now, WEEKLY_RESET_DEFAULT)
+        configured = _configured_weekly_spec()
+        if spec is None or configured is None or configured == spec:
+            raise ValueError("coord: the weekly reset %r is not '<Day> <HH:MM> <IANA zone>'" % (spec or configured))
+        return next_weekly_reset(now, configured)  # a bad explicit spec falls back to the configured one
     local = now.astimezone(zone)
     days = (weekday - local.weekday()) % 7
     candidate = dt.datetime.combine(local.date() + dt.timedelta(days=days), dt.time(hour, minute), tzinfo=zone)
@@ -140,7 +152,10 @@ def parse_limit(text: str, now: dt.datetime) -> Optional[Dict[str, Any]]:
     # Times are read only from the lines that name the limit: a failed run's output can
     # hold any timestamp or table, and a far-future one would silence the watcher.
     near = "\n".join(lines)
-    weekly = next_weekly_reset(now)
+    try:
+        weekly: Optional[dt.datetime] = next_weekly_reset(now)
+    except ValueError:
+        weekly = None  # no weekly reset configured: only the message's own time and the probe apply
     until: Optional[dt.datetime] = None
     match = _EPOCH.search(near)
     if match:
@@ -156,14 +171,15 @@ def parse_limit(text: str, now: dt.datetime) -> Optional[Dict[str, Any]]:
         if match and any(match.groups()):
             days, hours, minutes = (int(value or 0) for value in match.groups())
             until = now + dt.timedelta(days=days, hours=hours, minutes=minutes)
-    if until is not None and now < until <= weekly:
+    if until is not None and now < until and (weekly is None or until <= weekly):
         return {"until": until, "reason": reason, "exact": True}
-    if until is not None and until > weekly:
+    if until is not None and weekly is not None and until > weekly:
         # No Claude limit outlives the weekly reset; a later time is a misread.
         return {"until": weekly, "reason": reason, "exact": False}
-    if re.search(r"weekly", near, re.IGNORECASE):
+    if weekly is not None and re.search(r"weekly", near, re.IGNORECASE):
         return {"until": weekly, "reason": reason, "exact": False}
-    return {"until": min(now + PROBE_AFTER, weekly), "reason": reason, "exact": False}
+    probe = now + PROBE_AFTER
+    return {"until": probe if weekly is None else min(probe, weekly), "reason": reason, "exact": False}
 
 
 # MARK: - Records

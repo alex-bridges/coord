@@ -97,5 +97,20 @@ class DiagnosisTests(unittest.TestCase):
             post.assert_not_called()
 
 
+_INISA_CONFIG_PATH = None
+
+
+def setUpModule():
+    global _INISA_CONFIG_PATH
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import conductor_config_fixture
+    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+
+
+def tearDownModule():
+    import conductor_config_fixture
+    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
+
+
 if __name__ == "__main__":
     unittest.main()

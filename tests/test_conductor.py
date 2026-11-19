@@ -50,8 +50,20 @@ class WeeklyResetTests(unittest.TestCase):
         reset = dt.datetime(2026, 10, 1, 16, 0, tzinfo=UTC)
         self.assertEqual(outage.next_weekly_reset(reset, "Thu 12:00 America/New_York"), reset + dt.timedelta(days=7))
 
-    def test_a_malformed_spec_falls_back_to_the_default(self):
-        self.assertEqual(outage.next_weekly_reset(NOW, "someday"), outage.next_weekly_reset(NOW, outage.WEEKLY_RESET_DEFAULT))
+    def test_a_malformed_spec_falls_back_to_the_configured_reset(self):
+        self.assertEqual(outage.next_weekly_reset(NOW, "someday"), outage.next_weekly_reset(NOW, "Thu 12:00 America/New_York"))
+
+    def test_without_a_configured_reset_the_outage_feature_says_so(self):
+        from coordlib import config
+        with mock.patch.dict(os.environ, {"COORD_CONFIG": os.devnull}):
+            config._cache.clear()
+            try:
+                with self.assertRaisesRegex(ValueError, "claude_weekly_reset"):
+                    outage.next_weekly_reset(NOW)
+                limit = outage.parse_limit("you have reached your weekly usage limit", NOW)
+                self.assertEqual(limit["until"], NOW + outage.PROBE_AFTER, "no weekly reset to aim for: probe")
+            finally:
+                config._cache.clear()
 
 
 class LimitMessageTests(unittest.TestCase):
@@ -1378,7 +1390,7 @@ class ReviewRegressionTests(unittest.TestCase):
     def test_5_the_run_is_denied_the_dangerous_commands(self):
         command = conductor.model_command(make_config("/tmp"), "p", "sonnet")
         settings = json.loads(command[command.index("--settings") + 1])
-        for rule in ("Bash(gh pr merge:*)", "Bash(git push --force:*)", "Bash(Tools/coord/coord train approve:*)"):
+        for rule in ("Bash(gh pr merge:*)", "Bash(git push --force:*)", "Bash(*coord train approve:*)"):
             self.assertIn(rule, settings["permissions"]["deny"])
 
     def test_10_a_timeout_stops_the_whole_process_group(self):
@@ -1876,6 +1888,41 @@ class GuardHookTests(unittest.TestCase):
         self.assertEqual(guard.CONTROL_PATHS, train.ALEX_ONLY_PATHS)
 
 
+class GenericConfigTests(unittest.TestCase):
+    """A repo with no .coord/config.json: no INISA value leaks, features needing config say so."""
+
+    def setUp(self):
+        from coordlib import config
+        self.config = config
+        patcher = mock.patch.dict(os.environ, {"COORD_CONFIG": os.devnull})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        config._cache.clear()
+        self.addCleanup(config._cache.clear)
+
+    def test_the_deny_list_is_built_from_the_slug_not_from_inisa(self):
+        rules = conductor.deny_rules("acme/widgets")
+        self.assertIn("Bash(gh api -X PUT repos/acme/widgets/pulls/*/merge:*)", rules)
+        self.assertFalse([rule for rule in rules if "INISA" in rule or "inisa" in rule], rules)
+        self.assertIn("Read(~/Library/Caches/coord/**)", rules)
+
+    def test_the_reviewer_is_off_and_the_login_is_a_sentinel(self):
+        from coordlib import reviewer
+        self.assertEqual(reviewer.find_tag("@inisa-sidechain review"), None)
+        self.assertNotEqual(snapshot.sidechain_login(), "")
+        self.assertIsNone(snapshot.sidechain_blocks({"author": {"login": ""}}, {"kind": "review", "verdict": "changes", "head": "h"}))
+
+    def test_the_agent_file_is_required(self):
+        with self.assertRaisesRegex(ValueError, "conductor.agent_file"):
+            conductor.model_command(make_config("/tmp"), "p", "sonnet")
+
+    def test_no_notify_workflow_means_no_dispatch(self):
+        gh = FakeGitHub() if "FakeGitHub" in globals() else None
+        if gh is not None:
+            self.assertFalse(conductor.notify_alex(gh, 1, "x"))
+            self.assertEqual(gh.dispatches, [])
+
+
 class TrainRecipientTests(unittest.TestCase):
     def test_ejections_and_removals_reach_the_adder_and_the_conductor(self):
         self.assertEqual(train_step.Step.recipients(None, {"trainAddedBy": "codex@E:x"}), ["codex@E:x", "conductor@*"])
@@ -1888,6 +1935,21 @@ class DurationTests(unittest.TestCase):
         self.assertEqual(conductor.parse_duration("2h"), dt.timedelta(hours=2))
         with self.assertRaises(ValueError):
             conductor.parse_duration("soon")
+
+
+_INISA_CONFIG_PATH = None
+
+
+def setUpModule():
+    global _INISA_CONFIG_PATH
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import conductor_config_fixture
+    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+
+
+def tearDownModule():
+    import conductor_config_fixture
+    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
 
 
 if __name__ == "__main__":

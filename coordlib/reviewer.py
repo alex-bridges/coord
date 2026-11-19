@@ -1,13 +1,14 @@
-"""Reviews on request: `@inisa-sidechain review` in a PR comment gets a review from an
-agent on the CI box, posted by the inisa-sidechain GitHub App.
+"""Reviews on request: the review trigger (config `reviewer_trigger`, e.g. `@my-bot review`) in a
+PR comment gets a review from an agent on the CI box, posted by the reviewer GitHub App
+(config `reviewer_bot_login`).
 
 Why: a PR reaches the train with Codex's 👍 on its head or a clean review of that head by
 any agent (#1054). Codex runs out of quota; until now the other review was an agent's own
 adversarial pass, recorded by hand (`coord train review`). This makes it a service (Alex,
 2026-09-25):
 
-    @inisa-sidechain review              Opus, the default
-    @inisa-sidechain review fable        or sonnet, haiku; `model=fable` works too
+    <trigger>              Opus, the default
+    <trigger> fable        or sonnet, haiku; `model=fable` works too
 
 - **Trigger.** The app's webhook is off (#1035), so nothing reacts to the tag by itself:
   the conductor's watcher (conductor.py) already reads every new issue comment each tick
@@ -19,14 +20,14 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
 - **Acknowledgement.** The app reacts 👀 on the tag comment when it picks it up.
 - **The review.** A fresh `claude -p --agent reviewer` (.claude/agents/reviewer.md) on
   the PR's head, checked out as a throwaway worktree. The run starts in the conductor's
-  own checkout, at origin/main, so the settings, hooks, guard and CLAUDE.md it loads are
+  own checkout, at origin/<default branch>, so the settings, hooks, guard and instructions it loads are
   main's, never the PR's; the PR's tree is an added directory it reads and tests, with its
   `.claude` directories removed. The run has no GitHub credential (`isolated_env`), and a
   deny list and the conductor guard's reviewer rules name any attempt to write.
   It ends with a JSON block of findings.
 - **The verdict is code's.** Pass means no P0, P1 or P2 finding (Alex, 2026-09-25); P3
   notes are listed and do not block. A finding with an unknown severity counts as P2.
-- **Posting.** The app posts the review as `inisa-sidechain[bot]`, with a `review` marker
+- **Posting.** The app posts the review as the configured bot (`reviewer_bot_login`), with a `review` marker
   naming the PR, head, model and verdict. When the app cannot mint a token the job waits
   and is retried, never sent another way (#1035's no-fallback rule).
 - **A pass is a clean review.** The train counts a clean review of the head by any agent
@@ -54,7 +55,7 @@ adversarial pass, recorded by hand (`coord train review`). This makes it a servi
   pending requests rotate through that batch, and only checked model waits are handed off.
 
 What a bot author does and does not prove: any process on this Mac running as Alex can
-mint the app's tokens, so `inisa-sidechain[bot]` proves the result came through this
+mint the app's tokens, so the bot's login proves the result came through this
 Mac's app credentials, not that the reviewer produced it. Cloud sessions and Codex cannot
 post as the app. The marker narrows it further by naming the head, the model and the run.
 """
@@ -73,10 +74,10 @@ import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import marker, review, snapshot, train
+from . import config, marker, review, runtime, snapshot, train
+from . import gh as gh_module
 from .gh import AppAuthError, GitHub, GitHubError, redact
 
-APP_LOGIN = snapshot.SIDECHAIN_LOGIN
 MODELS = {"opus": "opus", "sonnet": "sonnet", "haiku": "haiku", "fable": "claude-fable-5-1"}
 DEFAULT_MODEL = "opus"
 BLOCKING = ("P0", "P1", "P2")
@@ -114,9 +115,54 @@ REVIEW_DENY = [
 ]
 
 TRUSTED_ASSOCIATIONS = ("OWNER", "MEMBER", "COLLABORATOR")
-TRUSTED_LOGINS = ("alex-bridges",)
 
-_TAG = re.compile(r"(?<![\w@/.-])@inisa-sidechain\s+review\b(?P<rest>[^\n]*)", re.IGNORECASE)
+
+def trusted_logins() -> Tuple[str, ...]:
+    """Logins whose comments may request a review whatever their association: the configured
+    owner (`owner_login`), else the repository's owner."""
+    owner = config.get("owner_login")
+    if not owner:
+        try:
+            owner = gh_module.detect_repo().split("/", 1)[0]
+        except Exception:
+            owner = ""
+    return (str(owner),) if owner else ()
+
+
+def trigger_text() -> str:
+    """The review request text, e.g. "@my-bot review" (config `reviewer_trigger`); "" when the
+    reviewer is not configured."""
+    return str(config.get("reviewer_trigger") or "")
+
+
+def bot_mention() -> str:
+    """The handle a reply opens with: the trigger's first word ("@my-bot")."""
+    words = trigger_text().split()
+    return words[0] if words else "the reviewer"
+
+
+def bot_name() -> str:
+    return bot_mention().lstrip("@")
+
+
+_tag_patterns: Dict[str, "re.Pattern[str]"] = {}
+
+
+def _tag_pattern(trigger: str) -> "re.Pattern[str]":
+    if trigger not in _tag_patterns:
+        words = r"\s+".join(re.escape(word) for word in trigger.split())
+        _tag_patterns[trigger] = re.compile(r"(?<![\w@/.-])" + words + r"\b(?P<rest>[^\n]*)", re.IGNORECASE)
+    return _tag_patterns[trigger]
+
+
+def __getattr__(name: str) -> Any:
+    # Read from config on each access (not at import): the reviewer app's login, trusted logins.
+    if name == "APP_LOGIN":
+        return snapshot.sidechain_login()
+    if name == "TRUSTED_LOGINS":
+        return trusted_logins()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 _MODEL = re.compile(r"^\s*(?:model\s*[=:]\s*(?P<explicit>[\w.-]+)|(?P<bare>[\w.-]+))", re.IGNORECASE)
 _FENCE = re.compile(r"^[ \t]{0,3}(?P<mark>`{3,}|~{3,}).*?(^[ \t]{0,3}(?P=mark)|\Z)", re.S | re.M)
 _INLINE = re.compile(r"(?P<ticks>`+)(?!`).+?(?<!`)(?P=ticks)(?!`)", re.S)
@@ -160,7 +206,8 @@ def find_tag(body: Optional[str]) -> Optional[Dict[str, Optional[str]]]:
         else:
             kept.append(line[len(prefix):])  # a list item's text; a fence opened in one is found
     text = _INLINE.sub("", _FENCE.sub("", "\n".join(kept)))
-    match = _TAG.search(text)
+    trigger = trigger_text()
+    match = _tag_pattern(trigger).search(text) if trigger else None
     if not match:
         return None
     word = _MODEL.match(match.group("rest") or "")
@@ -180,11 +227,12 @@ def requests(issue_comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Review requests among raw REST issue comments, oldest first. Only comments on pull
     requests, and never a comment a bot wrote (this module's own replies quote the tag)."""
     out = []
+    trusted = trusted_logins()
     for comment in issue_comments:
         login = ((comment.get("user") or {}).get("login") or "")
         if login.endswith("[bot]") or (comment.get("user") or {}).get("type") == "Bot":
             continue
-        if comment.get("author_association") not in TRUSTED_ASSOCIATIONS and login not in TRUSTED_LOGINS:
+        if comment.get("author_association") not in TRUSTED_ASSOCIATIONS and login not in trusted:
             # A review costs a model run, and a blocking verdict holds the head in the train:
             # only Alex, his agents (they post as him) and collaborators may ask (Codex on #1049).
             continue
@@ -281,7 +329,7 @@ def claim_owner(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: st
     without a posting time is taken to have been posted while the holder was live."""
     owner: Optional[Dict[str, Any]] = None
     for comment in sorted(pr_comments, key=lambda c: c.get("id") or 0):
-        if (comment.get("user") or {}).get("login") != APP_LOGIN:
+        if (comment.get("user") or {}).get("login") != snapshot.sidechain_login():
             continue
         payload = marker.decode(comment.get("body")) or {}
         until = _time(payload.get("until"))
@@ -301,7 +349,7 @@ def ours(comment: Dict[str, Any], payload: Dict[str, Any], repo: str) -> bool:
     on Alex's identity for a pass (it names the request; `coord train review` does not)."""
     login = (comment.get("user") or {}).get("login")
     if payload.get("kind") == "review":
-        return login == APP_LOGIN
+        return login == snapshot.sidechain_login()
     return payload.get("kind") == "review-clean" and payload.get("request") is not None \
         and snapshot.trusted_attestation(snapshot.comment_author(comment), repo)
 
@@ -310,7 +358,7 @@ def blocked_head(pr_comments: List[Dict[str, Any]], pr: int, head: str) -> Optio
     """The link to a review this app posted that requested changes at (pr, head), or None.
     A pass by another model does not answer it: only a new head does (Codex on #1049)."""
     for comment in pr_comments:
-        if (comment.get("user") or {}).get("login") != APP_LOGIN:
+        if (comment.get("user") or {}).get("login") != snapshot.sidechain_login():
             continue
         payload = marker.decode(comment.get("body")) or {}
         if payload.get("kind") == "review" and payload.get("pr") == pr and payload.get("head") == head \
@@ -350,7 +398,7 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
     findings = result["findings"]
     passed = outcome == "pass"
     title = "PASS" if passed else "stale (not counted)" if outcome == "stale" else "changes requested"
-    lines = [f"## Review by inisa-sidechain: {title} at `{head[:9]}` ({model})", ""]
+    lines = [f"## Review by {bot_name()}: {title} at `{head[:9]}` ({model})", ""]
     if request.get("url"):
         lines.append(f"Requested in {request['url']}. Pass means no P0, P1 or P2 finding; P3 notes do not block.")
     if passed:
@@ -381,7 +429,7 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
         lines += ["<details><summary>Checked and found sound</summary>", ""]
         lines += [f"- {item}" for item in result["checked"]]
         lines += ["", "</details>", ""]
-    lines.append(f"<sub>A fresh `claude -p --agent reviewer` on Tycho: {run.get('seconds', '?')} s, "
+    lines.append(f"<sub>A fresh `claude -p --agent reviewer` on CI: {run.get('seconds', '?')} s, "
                  f"{run.get('turns', '?')} turns. Findings are the reviewer's; the verdict is coord's rule.</sub>")
     # The run could read files a PR's test pointed it at; nothing shaped like a credential is posted.
     text = redact("\n".join(lines))
@@ -399,16 +447,22 @@ def render(pr: int, head: str, model: str, result: Dict[str, Any], outcome: str,
 def base_of(pr: Dict[str, Any]) -> str:
     """What to diff against: the PR's base commit (a stacked PR's parent branch, not main)."""
     sha = str((pr.get("base") or {}).get("sha") or "")
-    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else "origin/main"
+    if re.fullmatch(r"[0-9a-f]{40}", sha):
+        return sha
+    hint = (((pr.get("base") or {}).get("repo") or {}).get("default_branch"))
+    return "origin/" + runtime.default_branch(None, hint)
 
 
 def prompt(pr: Dict[str, Any], head: str, worktree: str, scratch: str, request: Dict[str, Any]) -> str:
     body = (pr.get("body") or "").strip()
     # A boundary the author cannot know, so a body cannot close it early (Codex on #1049).
     fence = secrets.token_hex(8)
+    slug = (((pr.get("base") or {}).get("repo") or {}).get("full_name")) or gh_module.detect_repo()
+    base_hint = ((pr.get("base") or {}).get("repo") or {}).get("default_branch")
     return "\n".join([
-        f"Review pull request #{pr.get('number')} of example-owner/example-repo at head {head}.",
-        f"The PR's tree is checked out at {worktree} (base branch: {((pr.get('base') or {}).get('ref')) or 'main'}).",
+        f"Review pull request #{pr.get('number')} of {slug} at head {head}.",
+        f"The PR's tree is checked out at {worktree} (base branch: "
+        f"{((pr.get('base') or {}).get('ref')) or runtime.default_branch(None, base_hint)}).",
         f"Diff: `git -C {worktree} diff {base_of(pr)}...HEAD` (the PR's base; review only this delta). "
         f"Scratch space: {scratch}.",
         "This run has no GitHub credentials: `gh` is not logged in and git cannot fetch or push. Everything you "
@@ -456,7 +510,10 @@ def run_settings(home: str, deny: List[str], reviews_root: str = "") -> Dict[str
     without the sandbox, and nothing may run outside it (Codex on #1049). The added
     directories (the PR's tree and scratch) stay writable."""
     from . import apptoken
-    guard = os.path.join(os.path.realpath(home), ".claude", "hooks", "conductor-guard.py")
+    # The guard hook is config `reviewer.guard_hook`, else `conductor.guard_hook`; the run
+    # refuses to start without one rather than run its Read tools unvetted.
+    guard_file = runtime.setting("reviewer", "guard_hook", required=False) or runtime.setting("conductor", "guard_hook")
+    guard = os.path.join(os.path.realpath(home), str(guard_file))
     return {
         "permissions": {"deny": deny},
         # The sandbox covers Bash only: the guard (the checkout's, main's) also vets the run's own
@@ -565,7 +622,7 @@ class Reviews:
         if not jobs:
             return []
         if self.app is None or getattr(self.app, "app", None) is None:
-            self.w.say(f"{len(jobs)} review request(s) waiting: the inisa-sidechain app is not available here "
+            self.w.say(f"{len(jobs)} review request(s) waiting: the reviewer app is not available here "
                        "(reviews are posted by the app only)")
             return []
         waiting = []
@@ -604,14 +661,15 @@ class Reviews:
 
     def checkout_off_main(self) -> str:
         """Why the conductor's checkout may not govern a review, or "": the reviewer's orders,
-        guard and settings come from it, so it must be detached at origin/main, not on a
+        guard and settings come from it, so it must be detached at origin/<default branch>, not on a
         branch, however clean (Codex on #1049)."""
         if self.w.git(["symbolic-ref", "-q", "HEAD"])[0] == 0:
-            return "the conductor's checkout is on a branch, not detached at origin/main"
+            return "the conductor's checkout is on a branch, not detached at the default branch's origin ref"
         head = self.w.git(["rev-parse", "HEAD"])
-        main = self.w.git(["rev-parse", "refs/remotes/origin/main"])
+        branch = runtime.default_branch(self.w.gh)
+        main = self.w.git(["rev-parse", f"refs/remotes/origin/{branch}"])
         if head[0] != 0 or main[0] != 0 or not head[1].strip() or head[1].strip() != main[1].strip():
-            return "the conductor's checkout is not at origin/main"
+            return f"the conductor's checkout is not at origin/{branch}"
         return ""
 
     def may_run(self) -> str:
@@ -639,7 +697,7 @@ class Reviews:
         """Handle a request; True means its preflight reached a blocked model-run gate."""
         now = self.w.now
         if request["error"]:
-            self.reply(request, f"@inisa-sidechain could not start that review: {request['error']}. ({request['url']})")
+            self.reply(request, f"{bot_mention()} could not start that review: {request['error']}. ({request['url']})")
             record.update(status="skipped", at=snapshot.iso(now))
             return False
         if not record.get("acked"):
@@ -746,7 +804,7 @@ class Reviews:
         comments = self.app.rest_paginated(path)
         owner = claim_owner(comments, request["pr"], head, request["model"], self.clock())
         if owner is None or (owner["agent"] == self.agent() and owner["until"] < self.lease()):
-            self.post_claim(request, record, head, f"@inisa-sidechain is reviewing `{head[:9]}` with {request['model']} "
+            self.post_claim(request, record, head, f"{bot_mention()} is reviewing `{head[:9]}` with {request['model']} "
                                                    f"(asked in {request.get('url') or 'a comment'}).")
             comments = self.app.rest_paginated(path)
             owner = claim_owner(comments, request["pr"], head, request["model"], self.clock())
@@ -801,7 +859,7 @@ class Reviews:
                  else "is still answering the request to review" if record.get("unsent")
                  else "will retry its review of")
         try:
-            self.post_claim(record, record, head, f"@inisa-sidechain {state} `{head[:9]}` with {record.get('model')} "
+            self.post_claim(record, record, head, f"{bot_mention()} {state} `{head[:9]}` with {record.get('model')} "
                                                   f"(asked in {record.get('url') or 'a comment'}).",
                             now + 2 * self.gap())
         except AppAuthError:
@@ -970,7 +1028,7 @@ class Reviews:
             # Status first, so a failed post never buys a fourth run; the reply is kept until it
             # posts, so the requester always hears (Codex on #1049).
             record["status"] = "failed"
-            record["unsent"] = (f"@inisa-sidechain gave up on this review after {MAX_ATTEMPTS} tries: {why}. "
+            record["unsent"] = (f"{bot_mention()} gave up on this review after {MAX_ATTEMPTS} tries: {why}. "
                                 f"({request['url']})")
             self.send_unsent(request, record)
 
@@ -978,9 +1036,11 @@ class Reviews:
         self.reply(request, record["unsent"])
         record.pop("unsent", None)
 
-    def checkout(self, pr: int, head: str, worktree: str, scratch: str, base: str = "origin/main") -> bool:
+    def checkout(self, pr: int, head: str, worktree: str, scratch: str, base: Optional[str] = None) -> bool:
         # A fresh scratch every attempt: an interrupted run's tests could have left a `.claude`
         # there for the retry to load (Codex on #1049).
+        default_ref = "origin/" + runtime.default_branch(self.w.gh)
+        base = base or default_ref
         shutil.rmtree(scratch, ignore_errors=True)
         if os.path.lexists(scratch):
             return False
@@ -989,7 +1049,7 @@ class Reviews:
             self.w.git(["worktree", "remove", "--force", worktree])
         if self.w.git(["fetch", "-q", "origin", f"pull/{pr}/head"])[0] != 0:
             return False
-        if base != "origin/main" and self.w.git(["fetch", "-q", "origin", base])[0] != 0:
+        if base != default_ref and self.w.git(["fetch", "-q", "origin", base])[0] != 0:
             return False  # the diff the prompt names must exist
         if self.w.git(["worktree", "add", "-q", "--detach", worktree, head])[0] != 0:
             return False
@@ -1003,10 +1063,10 @@ class Reviews:
             scratch: str) -> Tuple[Any, int]:
         from . import conductor
         model = MODELS[request["model"]]
-        command = [self.config.claude, "-p", prompt(pr, head, worktree, scratch, request), "--agent", "reviewer",
+        command = [self.config.claude, "-p", prompt(pr, head, worktree, scratch, request), "--agent", runtime.agent_name("reviewer"),
                    "--model", model, "--output-format", "json", "--permission-mode", "auto",
                    "--add-dir", worktree, "--add-dir", scratch,
-                   "--settings", json.dumps(run_settings(self.config.home, conductor.DENY + REVIEW_DENY,
+                   "--settings", json.dumps(run_settings(self.config.home, conductor.deny_rules(self.w.gh.repo) + REVIEW_DENY,
                                                          os.path.join(self.config.state_dir, "reviews")))]
         empty = tempfile.mkdtemp(prefix="gh-none-", dir=scratch)
         env = isolated_env(dict(os.environ), empty)
