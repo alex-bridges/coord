@@ -50,8 +50,13 @@ class ConductorInstallTests(unittest.TestCase):
                     print(os.environ.get('FAKE_PUSH_URL' if '--push' in args else 'FAKE_FETCH_URL', ''))
                 elif '--show-toplevel' in args:
                     print(os.environ['FAKE_CHECKOUT'])
+                elif 'check-ref-format' in args:
+                    print(args[-1])
+                elif 'ls-remote' in args:
+                    print('ref: refs/heads/main\tHEAD')
+                    print('a' * 40 + '\tHEAD')
                 elif 'rev-parse' in args:
-                    print('abc1234')
+                    print('a' * 40)
                 elif 'symbolic-ref' in args:
                     sys.exit(1)
             elif name == 'gh':
@@ -70,7 +75,7 @@ class ConductorInstallTests(unittest.TestCase):
         (self.coord_root / "conductor").mkdir(parents=True)
         self.installer = self.coord_root / "conductor" / "install.sh"
         shutil.copy(INSTALLER, self.installer)
-        shutil.copy(INSTALLER.with_name("check-origin.py"), self.installer.with_name("check-origin.py"))
+        shutil.copy(INSTALLER.with_name("checkout.py"), self.installer.with_name("checkout.py"))
         (self.coord_root / "coordlib").symlink_to(INSTALLER.parents[1] / "coordlib", target_is_directory=True)
         coord = self.coord_root / "coord"
         coord.write_text(textwrap.dedent("""\
@@ -220,6 +225,7 @@ class ConductorInstallTests(unittest.TestCase):
             """))
         (self.bin / "gh").chmod(0o755)
         self.env["FAKE_ORIGIN"] = str(source)
+        self.env["COORD_CONFIG"] = os.devnull
         shutil.rmtree(self.checkout)
         for attempt in range(2):
             with self.subTest(attempt=attempt):
@@ -227,8 +233,9 @@ class ConductorInstallTests(unittest.TestCase):
                     commit()
                 result = self.run_install("--no-wake")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                local = subprocess.check_output([git, "-C", str(self.checkout), "rev-parse", "HEAD"])
-                self.assertEqual(local, subprocess.check_output([git, "-C", str(source), "rev-parse", "trunk"]))
+                tip = subprocess.check_output([git, "-C", str(source), "rev-parse", "trunk"])
+                for ref in ("HEAD", "refs/remotes/origin/trunk"):
+                    self.assertEqual(subprocess.check_output([git, "-C", str(self.checkout), "rev-parse", ref]), tip)
                 branch = subprocess.run([git, "-C", str(self.checkout), "symbolic-ref", "-q", "HEAD"], check=False)
                 self.assertEqual(branch.returncode, 1, "the watcher checkout must be detached")
 
@@ -262,8 +269,9 @@ class ConductorInstallTests(unittest.TestCase):
         self.assertEqual([event["args"] for event in self.read_events()[event_count:]], [
             ["-C", str(self.checkout), "status", "--porcelain"],
             ["-C", str(self.checkout), "symbolic-ref", "-q", "HEAD"],
-            ["-C", str(self.checkout), "fetch", "-q", "origin", "main"],
-            ["-C", str(self.checkout), "checkout", "-q", "--detach", "FETCH_HEAD"],
+            ["-C", str(self.checkout), "check-ref-format", "--branch", "main"],
+            ["-C", str(self.checkout), "fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            ["-C", str(self.checkout), "checkout", "-q", "--detach", "refs/remotes/origin/main"],
         ])
 
     def test_refresh_preserves_no_wake_and_operator_environment(self):
@@ -373,6 +381,47 @@ class ScheduledTaskIdentityTests(unittest.TestCase):
             command.extend(["-ExecutionPolicy", "Bypass"])
         return subprocess.run([*command, "-Command", script], env=env, text=True, capture_output=True, timeout=20)
 
+    def installer_env(self, temp, installer, checkout):
+        env = dict(os.environ, LOCALAPPDATA=temp, GIT_ALLOW_PROTOCOL="file", COORD_CONFIG=os.devnull,
+                   COORD_REPO="owner/repo", COORD_TEST_INSTALLER=str(installer), COORD_TEST_CHECKOUT=str(checkout))
+        if os.name == "nt":
+            python_dir = Path(sys.executable).parent
+        else:
+            python_dir = Path(temp, "bin")
+            python_dir.mkdir()
+            (python_dir / "python").symlink_to(sys.executable)
+        env["PATH"] = str(python_dir) + os.pathsep + env["PATH"]
+        return env
+
+    def test_refresh_advances_the_tracking_branch_and_detached_head(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, checkout = Path(temp, "source"), Path(temp, "checkout")
+            subprocess.run(["git", "init", "-q", "--initial-branch=trunk", str(source)], check=True)
+            commit = ["git", "-C", str(source), "-c", "user.name=Coord", "-c", "user.email=coord@example.com",
+                      "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "test"]
+            subprocess.run(commit, check=True)
+            subprocess.run(["git", "clone", "-q", str(source), str(checkout)], check=True)
+            subprocess.run(["git", "-C", str(checkout), "checkout", "-q", "--detach", "HEAD"], check=True)
+            subprocess.run(commit, check=True)
+
+            # Stop at the dry-run boundary so no API call or scheduler mutation is possible.
+            tool = Path(temp, "coord-src")
+            shutil.copytree(INSTALLER.parent, tool / "conductor")
+            shutil.copytree(INSTALLER.parents[1] / "coordlib", tool / "coordlib", ignore=shutil.ignore_patterns("__pycache__"))
+            (tool / "coord").write_text("print('checkout refresh finished')\nraise SystemExit(23)\n")
+            script = """
+            function gh { $global:LASTEXITCODE = 0 }
+            & $env:COORD_TEST_INSTALLER -Repo owner/repo -HomeDir $env:COORD_TEST_CHECKOUT -NoWake
+            """
+            env = self.installer_env(temp, tool / "conductor" / "install.ps1", checkout)
+            result = self.run_powershell(script, env)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("checkout refresh finished", result.stdout)
+            tip = subprocess.check_output(["git", "-C", str(source), "rev-parse", "trunk"])
+            for ref in ("HEAD", "refs/remotes/origin/trunk"):
+                self.assertEqual(subprocess.check_output(["git", "-C", str(checkout), "rev-parse", ref]), tip)
+            self.assertEqual(subprocess.run(["git", "-C", str(checkout), "symbolic-ref", "-q", "HEAD"]).returncode, 1)
+
     def test_install_refuses_an_existing_checkout_for_another_repository(self):
         with tempfile.TemporaryDirectory() as temp:
             checkout = Path(temp, "checkout")
@@ -383,18 +432,7 @@ class ScheduledTaskIdentityTests(unittest.TestCase):
             function gh { $global:LASTEXITCODE = 0 }
             & $env:COORD_TEST_INSTALLER -Repo owner/repo -HomeDir $env:COORD_TEST_CHECKOUT -NoWake
             """
-            env = dict(os.environ, LOCALAPPDATA=temp, GIT_ALLOW_PROTOCOL="file",
-                       COORD_REPO="owner/repo", COORD_TEST_INSTALLER=str(INSTALLER.with_suffix(".ps1")),
-                       COORD_TEST_CHECKOUT=str(checkout))
-            # Exercise the Windows installer's "python" entry point with the suite's
-            # interpreter, including on Unix runners that only ship python3.
-            if os.name == "nt":
-                python_dir = Path(sys.executable).parent
-            else:
-                python_dir = Path(temp, "bin")
-                python_dir.mkdir()
-                (python_dir / "python").symlink_to(sys.executable)
-            env["PATH"] = str(python_dir) + os.pathsep + env["PATH"]
+            env = self.installer_env(temp, INSTALLER.with_suffix(".ps1"), checkout)
             result = self.run_powershell(script, env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("targets other/project", result.stdout + result.stderr)

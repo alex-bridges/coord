@@ -1456,12 +1456,28 @@ class Watcher:
         if self.git(["symbolic-ref", "-q", "HEAD"])[0] == 0:
             self.say("checkout is on a branch; not updating it (it should be detached at origin/<default branch>)")
             return
-        # Remote HEAD is resolved by git during fetch, even when the REST quota is exhausted.
-        ref = config.get("default_branch") or "HEAD"
-        if self.git(["fetch", "-q", "origin", ref])[0] != 0:
-            self.say(f"could not fetch {ref} from origin; checkout update deferred")
-        elif self.git(["checkout", "-q", "--detach", "FETCH_HEAD"])[0] != 0:
-            self.say("could not check out the fetched revision; checkout update deferred")
+        error = refresh_checkout(self.git, config.get("default_branch"))
+        if error:
+            self.say(error)
+
+
+def refresh_checkout(git: Callable[[List[str]], Tuple[int, str]], branch: Optional[str]) -> str:
+    """Refresh the named tracking ref used by the reviewer and detach at its tip."""
+    if not branch:
+        status, refs = git(["ls-remote", "--symref", "origin", "HEAD"])
+        target = re.search(r"^ref: refs/heads/([^\t\n]+)\tHEAD$", refs, re.MULTILINE)
+        if status != 0 or target is None:
+            return "could not discover the default branch from origin; checkout update deferred"
+        branch = target.group(1)
+
+    if "\x00" in branch or git(["check-ref-format", "--branch", branch])[0] != 0:
+        return "invalid default branch; checkout update deferred"
+    tracking = f"refs/remotes/origin/{branch}"
+    if git(["fetch", "-q", "origin", f"+refs/heads/{branch}:{tracking}"])[0] != 0:
+        return f"could not fetch {branch} from origin; checkout update deferred"
+    if git(["checkout", "-q", "--detach", tracking])[0] != 0:
+        return "could not check out the fetched revision; checkout update deferred"
+    return ""
 
 
 def run_git(home: str, args: List[str]) -> Tuple[int, str]:

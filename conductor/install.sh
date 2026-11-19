@@ -98,7 +98,8 @@ if [ ! -d "$HOME_DIR/.git" ] && [ ! -f "$HOME_DIR/.git" ]; then
   gh repo clone "$REPO" "$HOME_DIR" -- -q
   NEW_CHECKOUT=1
 fi
-"$PY" -I "$(dirname "$COORD")/conductor/check-origin.py" "$HOME_DIR" "$REPO"
+CHECKOUT_HELPER="$(dirname "$COORD")/conductor/checkout.py"
+"$PY" -I "$CHECKOUT_HELPER" verify "$HOME_DIR" "$REPO"
 if [ "$NEW_CHECKOUT" = 1 ]; then
   git -C "$HOME_DIR" checkout -q --detach HEAD
   echo "made the conductor's checkout: $HOME_DIR (detached at the default branch)"
@@ -115,7 +116,7 @@ if [ -n "$(git -C "$HOME_DIR" status --porcelain)" ]; then
   echo "install.sh: WARNING: $HOME_DIR has local changes; checking it as it is" >&2
 elif git -C "$HOME_DIR" symbolic-ref -q HEAD >/dev/null; then
   echo "install.sh: WARNING: $HOME_DIR is on a branch; the watcher expects it detached at the default branch" >&2
-elif ! { git -C "$HOME_DIR" fetch -q origin HEAD && git -C "$HOME_DIR" checkout -q --detach FETCH_HEAD; }; then
+elif ! "$PY" -I "$CHECKOUT_HELPER" update "$HOME_DIR"; then
   echo "install.sh: WARNING: could not update from the default branch; checking the checkout as it is" >&2
 fi
 echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --short HEAD) ..."

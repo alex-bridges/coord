@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -515,6 +516,48 @@ def claude_result(text, code=0, is_error=False, stderr=""):
     return subprocess.CompletedProcess([], code, stdout, stderr)
 
 
+class CheckoutUpdateTests(unittest.TestCase):
+    def test_remote_default_advance_keeps_the_detached_checkout_ready_for_review(self):
+        from coordlib import reviewer, runtime
+
+        for single_branch in (False, True):
+            with self.subTest(single_branch=single_branch), tempfile.TemporaryDirectory() as temp, \
+                    mock.patch.dict(os.environ, {"COORD_CONFIG": os.devnull, "GIT_CONFIG_GLOBAL": os.devnull,
+                                                 "GIT_CONFIG_NOSYSTEM": "1"}), \
+                    mock.patch.dict(runtime._default_branches, clear=True):
+                source = Path(temp, "source")
+                checkout = Path(temp, "checkout")
+                source.mkdir()
+
+                def git(cwd, *args):
+                    return subprocess.run(["git", "-c", "user.name=Coord", "-c", "user.email=coord@example.com",
+                                           "-c", "commit.gpgSign=false", *args], cwd=cwd, check=True,
+                                          text=True, capture_output=True).stdout.strip()
+
+                git(source, "init", "-q", "--initial-branch=trunk")
+                git(source, "commit", "-q", "--allow-empty", "-m", "initial")
+                clone_options = ["--single-branch"] if single_branch else []
+                git(temp, "clone", "-q", *clone_options, str(source), str(checkout))
+                git(checkout, "checkout", "-q", "--detach")
+                branch = "trunk"
+                if single_branch:
+                    branch = "release/stable"
+                    git(source, "branch", "-m", branch)
+                git(source, "commit", "-q", "--allow-empty", "-m", "new default tip")
+                expected = git(source, "rev-parse", "HEAD")
+                self.assertNotEqual(git(checkout, "rev-parse", "HEAD"), expected)
+
+                gh = mock.Mock(repo="org/widgets")
+                gh.rest.return_value = {"default_branch": branch}
+                watcher = conductor.Watcher(make_config(str(checkout)), gh)
+                watcher.update_checkout()
+                gh.rest.assert_not_called()
+                self.assertEqual(git(checkout, "rev-parse", "HEAD"), expected)
+                self.assertEqual(git(checkout, "branch", "--show-current"), "")
+                self.assertEqual(reviewer.Reviews(watcher, None).checkout_off_main(), "")
+                self.assertEqual(git(checkout, "rev-parse", "refs/remotes/origin/" + branch), expected)
+
+
 class WatcherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -610,20 +653,31 @@ class WatcherTests(unittest.TestCase):
         for budget_left in (0, 1000):
             with self.subTest(budget_left=budget_left), mock.patch.dict(os.environ, {"COORD_CONFIG": os.devnull}):
                 git_calls = []
+                remote_head = ["ls-remote", "--symref", "origin", "HEAD"]
+                tracker = "refs/remotes/origin/trunk"
+
                 def git(args):
                     git_calls.append(args)
-                    return (1 if args[0] in ("fetch", "symbolic-ref") else 0, "")
+                    if args == remote_head:
+                        return 0, "ref: refs/heads/trunk\tHEAD\n" + "a" * 40 + "\tHEAD\n"
+                    if args[0] == "symbolic-ref" or (args[0] == "fetch" and budget_left > 0):
+                        return 1, ""
+                    return 0, ""
 
                 watcher = conductor.Watcher(self.config, self.gh, now=NOW, git=git, disk=lambda _: 1.0)
                 with mock.patch.object(watcher, "budget_left", return_value=budget_left):
                     lines = watcher.tick(wake=False)
-                self.assertIn(["fetch", "-q", "origin", "HEAD"], git_calls)
+                self.assertIn(remote_head, git_calls)
+                self.assertIn(["fetch", "-q", "origin", "+refs/heads/trunk:" + tracker], git_calls)
                 self.assertTrue(any("[disk-low]" in line for line in lines))
-                self.assertTrue(any("checkout update deferred" in line for line in lines))
                 self.assertNotIn(("GET", "repos/{repo}"), self.gh.calls)
+                checkout = ["checkout", "-q", "--detach", tracker]
                 if budget_left == 0:
+                    self.assertIn(checkout, git_calls)
                     self.assertEqual(self.gh.calls, [])
                 else:
+                    self.assertNotIn(checkout, git_calls)
+                    self.assertTrue(any("checkout update deferred" in line for line in lines))
                     self.assertTrue(self.gh.records("conductor", "beat"))
 
     def test_ci_branch_lookup_failure_does_not_discard_a_read_message(self):

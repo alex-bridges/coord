@@ -113,7 +113,8 @@ if ($NewCheckout) {
     & gh repo clone $Repo $HomeDir -- -q
     if ($LASTEXITCODE -ne 0) { throw "install.ps1: failed to clone $Repo" }
 }
-& $PythonExe -I (Join-Path $PSScriptRoot "check-origin.py") $HomeDir $Repo
+$CheckoutHelper = Join-Path $PSScriptRoot "checkout.py"
+& $PythonExe -I $CheckoutHelper verify $HomeDir $Repo
 if ($LASTEXITCODE -ne 0) { throw "install.ps1: checkout origin check failed" }
 if ($NewCheckout) {
     & git -C $HomeDir checkout -q --detach HEAD
@@ -134,9 +135,9 @@ if ($dirty) {
     if ($LASTEXITCODE -eq 0) {
         Write-Warning "$HomeDir is on a branch; watcher expects it detached at the default branch"
     } else {
-        & git -C $HomeDir fetch -q origin HEAD
-        if ($LASTEXITCODE -eq 0) {
-            & git -C $HomeDir checkout -q --detach FETCH_HEAD
+        & $PythonExe -I $CheckoutHelper update $HomeDir
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "could not update from the default branch; checking the checkout as-is"
         }
     }
 }
