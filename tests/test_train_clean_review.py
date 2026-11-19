@@ -30,9 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_train as base  # noqa: E402
 from coordlib import snapshot, train, train_step  # noqa: E402
 from test_coord import BOT, NOW, codex_summary, isolate_from_rest_env, reaction  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
+    inisa_config.use()
     isolate_from_rest_env()  # the fakes answer GraphQL; see test_coord.REST_ENV (#1085)
 
 

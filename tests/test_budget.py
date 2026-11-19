@@ -25,6 +25,9 @@ import urllib.error
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from coordlib import EXIT_BUDGET, EXIT_NOT_FOUND, EXIT_OK, budget, cache, cli  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # the train commands need the INISA workflow config
 from coordlib import gh as ghmodule  # noqa: E402
 from coordlib.gh import GitHub, GitHubError  # noqa: E402
 
@@ -296,7 +299,7 @@ class ReadFloorTests(BudgetTestCase):
         code, out, _ = self.run_cli(["ci", "mk4", "--ref", "feature/x"], gh)
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(requested, [("POST", "repos/o/r/actions/workflows/ci.yml/dispatches")])
-        self.assertIn("Not reading the Tycho queue back", out)
+        self.assertIn("Not reading the CI queue back", out)
 
     def test_an_allowed_write_does_not_take_the_fallback_away(self):
         # `send` invalidates the cached board; the next low-budget read must still find it.

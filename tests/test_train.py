@@ -28,9 +28,13 @@ from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
 from test_coord import (ALEX, BOT, NOW, REAL_FAILURE, REPO, check, codex_summary, coord_comment, pr_node,  # noqa: E402
                         isolate_from_rest_env, reaction, refused_check)
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
+    inisa_config.use()
     isolate_from_rest_env()  # the fakes answer GraphQL; see test_coord.REST_ENV (#1085)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane

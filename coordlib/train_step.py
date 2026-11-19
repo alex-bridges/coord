@@ -50,9 +50,6 @@ DISPATCH_GRACE_MINUTES = 10
 # that bookkeeping is left (every job done, or only the verdict job still running).
 SETTLE_SECONDS = 120
 SETTLE_POLL_SECONDS = 10
-VERDICT_JOB = train.VERDICT_JOB
-WAKE_JOB = train.WAKE_JOB
-FINAL_JOBS = train.FINAL_JOBS
 # A comment that asks Codex for a review: the mention at the start of a line, as people
 # and the train write it (a sentence quoting it mid-line is not a request).
 _CODEX_REQUEST = re.compile(r"(?m)^[ \t]*@codex[ \t]+review\b", re.IGNORECASE)
@@ -102,6 +99,7 @@ class Step:
         # the train's own gate runs), and ordinary batches never touch it.
         self.merger = merger
         self.workflow_token = merger is not None
+        self._main_branch: Optional[str] = None
         self.ref_writer = gh  # who pushes, moves, deletes and re-reads the refs of the batch at hand
         self.closed_batch = False
         self.lines: List[str] = []
@@ -168,7 +166,7 @@ class Step:
 
     def runs_at(self, name: str, tip: str) -> List[Dict[str, Any]]:
         pages = self.gh.rest_paginated(
-            f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
+            f"repos/{{repo}}/actions/workflows/{train.ci_workflow()}/runs?branch={urllib.parse.quote(name, safe='')}&per_page=20")
         return [r for page in pages for r in page.get("workflow_runs", []) if r.get("head_sha") == tip]
 
     def daily_budget_left(self, kind: str = train.HEAVY) -> int:
@@ -211,7 +209,7 @@ class Step:
         {} when main's commit has no finished run yet (a hand merge whose run is still
         queued): unknown is not red, so it does not stop the train.
         """
-        pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?head_sha={main}&per_page=20")
+        pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.ci_workflow()}/runs?head_sha={main}&per_page=20")
         runs = [r for page in pages for r in page.get("workflow_runs", [])
                 if r.get("status") == "completed" and r.get("conclusion") in ("success", "failure")]
         if not runs:
@@ -237,7 +235,7 @@ class Step:
             if not jobs:
                 break
             unfinished = [j for j in jobs if j.get("status") != "completed"]
-            if any(j.get("name") not in FINAL_JOBS or j.get("status") != "in_progress" for j in unfinished):
+            if any(j.get("name") not in train.final_jobs() or j.get("status") != "in_progress" for j in unfinished):
                 break  # real work, or a final job not yet started: an ordinary wait
             if not announced:
                 self.note(f"{name}: run {run['id']} has finished its jobs; waiting up to {SETTLE_SECONDS}s "
@@ -271,7 +269,7 @@ class Step:
         if not details:
             return [j["name"] for j in jobs if j.get("conclusion") in ("failure", "timed_out", "startup_failure")]
         return [train.job_detail(j, self.gh.rest(f"repos/{{repo}}/check-runs/{j['id']}/annotations?per_page=100") or [])
-                for j in jobs if j.get("conclusion") in train.CLASSIFIED_JOB_CONCLUSIONS and j.get("name") not in FINAL_JOBS]
+                for j in jobs if j.get("conclusion") in train.CLASSIFIED_JOB_CONCLUSIONS and j.get("name") not in train.final_jobs()]
 
     def cancel_branch_runs(self, branch: str) -> bool:
         """Cancel every run of a merged PR's branch that has not completed. True when done.
@@ -443,7 +441,8 @@ class Step:
                     + "To " + ", ".join(f"`{agent}`" for agent in to)
                     + ". The train says this once per head and reason.")
             if hold in train.OWNER_HOLDS:
-                text = f"{train.OWNER_MENTION}: this hold is yours to clear.\n\n" + text
+                mention = train.owner_mention(getattr(self.gh, "repo", None))
+                text = (f"{mention}: " if mention else "") + "this hold is yours to clear.\n\n" + text
             self.comment(number, text, "held", head=head, hold=hold, reason=reason, to=to)
         except GitHubError as error:
             self.note(f"#{number}: could not post the held notice ({error}); the next step tries again")
@@ -499,7 +498,8 @@ class Step:
         only that metadata; every other eligibility rule and the batch merge still apply.
         """
         files = self.gate_files(pr, main)
-        verdict = train.assess(pr, head_at_add, files, workflow_token=self.workflow_token)
+        verdict = train.assess(pr, head_at_add, files, workflow_token=self.workflow_token,
+                               base_branch=self.main_branch)
         if verdict[1] != train.HOLD_MERGE_CHECK:
             return verdict
         number, head = pr["number"], pr["head"]
@@ -519,7 +519,8 @@ class Step:
         if merged.returncode != 0:
             return train.HOLD, train.HOLD_MERGE_CHECK, (
                 f"git could not verify the reported conflict (merge-tree exited {merged.returncode})")
-        return train.assess(pr, head_at_add, files, workflow_token=self.workflow_token, merge_verified=True)
+        return train.assess(pr, head_at_add, files, workflow_token=self.workflow_token, merge_verified=True,
+                            base_branch=self.main_branch)
 
     def lane_classes(self, main: str, ready: List[Dict[str, Any]]) -> Dict[int, str]:
         """LIGHT or HEAVY for each ready PR (train.LaneClassifier), judged by the lane
@@ -528,6 +529,8 @@ class Step:
         if len(ready) < 2:
             return {}
         classifier = train.LaneClassifier(lambda path: self.git.run("show", f"{main}:{path}").stdout)
+        if not classifier.configured:
+            return {}  # one lane: nothing to tell apart
         if classifier.error:
             self.note(f"every ready PR counts as heavy: {classifier.error}")
             return {}
@@ -551,13 +554,20 @@ class Step:
             return None
         return [path for path in diff.split("\0") if path]
 
+    @property
+    def main_branch(self) -> str:
+        """The branch the train builds on (config `default_branch`, else GitHub's)."""
+        if self._main_branch is None:
+            self._main_branch = train.default_branch(self.gh)
+        return self._main_branch
+
     # MARK: - Step
 
     def run(self) -> List[str]:
         self.git.out("fetch", "--quiet", "--prune", "origin",
-                     "+refs/heads/main:refs/remotes/origin/main",
+                     f"+refs/heads/{self.main_branch}:refs/remotes/origin/{self.main_branch}",
                      "+refs/heads/train/*:refs/remotes/origin/train/*")
-        main = self.git.out("rev-parse", "refs/remotes/origin/main")
+        main = self.git.out("rev-parse", f"refs/remotes/origin/{self.main_branch}")
         refs = self.git.out("for-each-ref", "--sort=refname", "--format=%(refname:strip=3) %(objectname)",
                             "refs/remotes/origin/train/")
         batches = []
@@ -588,7 +598,7 @@ class Step:
         only a step that closed a batch dispatches, and a step that finds nothing ready
         closes nothing."""
         try:
-            self.gh.dispatch_workflow("merge-train.yml", "main")
+            self.gh.dispatch_workflow(train.train_workflow(), self.main_branch)
             self.note("dispatched the next train step")
         except GitHubError as error:
             self.note(f"could not dispatch the next train step ({error}); the cron will")
@@ -701,7 +711,7 @@ class Step:
         self._receipt = dict(plan, tip=tip, run=None if run is None else {
             "id": run["id"], "attempt": train_metrics.attempts(run), "status": run.get("status"),
             "conclusion": run.get("conclusion"), "url": run.get("html_url")})
-        if self.git.run("merge-base", "--is-ancestor", tip, "refs/remotes/origin/main", check=False).returncode == 0:
+        if self.git.run("merge-base", "--is-ancestor", tip, f"refs/remotes/origin/{self.main_branch}", check=False).returncode == 0:
             # Main already holds the batch: an earlier step moved it and was interrupted.
             self.note(f"{name} ({numbers}): main already contains {tip[:9]}; finishing the clean-up")
             self.finish(name, tip, members, prs, run)
@@ -718,7 +728,7 @@ class Step:
                 # again on top of it (that would repeat a full CI run every tick). Wait for
                 # a person to look (substitute review of #989).
                 actors = sorted({(r.get("actor") or {}).get("login", "?") for r in others})
-                self.note(f"{name} ({numbers}): {len(others)} ci.yml run(s) at {tip[:9]} by {', '.join(actors)}, "
+                self.note(f"{name} ({numbers}): {len(others)} {train.ci_workflow()} run(s) at {tip[:9]} by {', '.join(actors)}, "
                           "none dispatched by the train; not dispatching again")
                 return
             built = dt.datetime.fromtimestamp(int(self.git.out("log", "-1", "--format=%ct", tip)), dt.timezone.utc)
@@ -727,7 +737,7 @@ class Step:
                 return
             if not self.request_ci("redispatch"):
                 return
-            self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+            self.gh.dispatch_workflow(train.ci_workflow(), name, train.ci_dispatch_inputs())
             self.note(f"{name} ({numbers}): no CI run at {tip[:9]} at all (the dispatch was lost); dispatched once more")
             return
         url = run["html_url"]
@@ -766,7 +776,7 @@ class Step:
             if run.get("conclusion") == "startup_failure" and self.changes_workflows(base, tip):
                 # GitHub accepted the dispatch but could not start this workflow. Rebuilding
                 # the same workflow batch repeats that failure until the daily budget expires.
-                reason = (f"ci.yml ended in startup_failure after dispatch: {url}; this PR changes "
+                reason = (f"{train.ci_workflow()} ended in startup_failure after dispatch: {url}; this PR changes "
                           f"{train.WORKFLOW_DIR} and needs a manual gate review before it is re-added")
                 self.note(f"{name} ({numbers}): CI startup_failure; deleting the batch and removing workflow members")
                 self.record_outcome("abandoned", f"Merge train: `{name}` could not start CI; workflow members need manual review.")
@@ -779,12 +789,12 @@ class Step:
             return
         if action in ("eject", "split"):
             failed = self.failed_jobs(run["id"])
-            lanes = [job for job in failed if job not in FINAL_JOBS]  # the aggregate verdict adds nothing
+            lanes = [job for job in failed if job not in train.final_jobs()]  # the aggregate verdict adds nothing
             jobs = ", ".join((lanes or failed)[:5]) or "see the run"
             main_state = self.main_ci(main)
             # Lane jobs only: the aggregate verdict is red whenever anything is, so it
             # would always look "shared" between two red runs.
-            shared = sorted((set(failed) & set(main_state.get("failed") or [])) - set(FINAL_JOBS))
+            shared = sorted((set(failed) & set(main_state.get("failed") or [])) - set(train.final_jobs()))
             if shared:
                 # Red on main too: not these PRs' fault. Removing them one by one would
                 # empty the queue while main is broken (substitute review of #989).
@@ -800,7 +810,7 @@ class Step:
                     self.remove_label(number, train.SOLO_LABEL)
                     self.comment(number, (
                         f"**Removed from the merge train:** CI failed on this PR alone, twice "
-                        f"({jobs}): {url}\n\nFix it and add it again with `Tools/coord/coord train add {number}`."
+                        f"({jobs}): {url}\n\nFix it and add it again with `coord train add {number}`."
                     ), "ejected", batch=name, run=run["id"], failed=failed[:10],
                        to=self.recipients(prs.get(number) or {"number": number}))
                 else:
@@ -854,13 +864,13 @@ class Step:
                 return
         if self.mode == "live":
             try:
-                self.ref_writer.rest("repos/{repo}/git/refs/heads/main", method="PATCH", body={"sha": tip, "force": False})
+                self.ref_writer.rest(f"repos/{{repo}}/git/refs/heads/{self.main_branch}", method="PATCH", body={"sha": tip, "force": False})
             except GitHubError as error:
                 # The update may have been applied with its response lost. The batch
                 # branch is the only record of what to clean up, so look before deleting
                 # it, and keep it when even that cannot be told (Codex on #989).
                 try:
-                    now_main = ((self.ref_writer.rest("repos/{repo}/git/ref/heads/main") or {}).get("object") or {}).get("sha")
+                    now_main = ((self.ref_writer.rest(f"repos/{{repo}}/git/ref/heads/{self.main_branch}") or {}).get("object") or {}).get("sha")
                 except GitHubError as reread:
                     self.note(f"{name} ({numbers}): main update failed ({error}) and main cannot be re-read "
                               f"({reread}); keeping the batch for the next step")
@@ -1004,7 +1014,7 @@ class Step:
         if workflow_batch:
             self.note(f"{name}: it changes .github/workflows/; pushed with the inisa-sidechain app token")
         try:
-            self.gh.dispatch_workflow(train.CI_WORKFLOW, name, {"lanes": train.CI_LANES})
+            self.gh.dispatch_workflow(train.ci_workflow(), name, train.ci_dispatch_inputs())
         except GitHubError as error:
             if not workflow_batch:
                 raise
@@ -1016,7 +1026,7 @@ class Step:
                 f"Merge train: testing in batch `{name}` ({numbers}) at `{tip[:9]}` "
                 f"({'live' if self.mode == 'live' else 'dry run'})."
             ), "testing", batch=name, tip=tip, members=merged)
-        self.note(f"{name}: built {numbers} on main {main[:9]} -> {tip[:9]}; dispatched ci.yml lanes={train.CI_LANES}")
+        self.note(f"{name}: built {numbers} on main {main[:9]} -> {tip[:9]}; dispatched {train.ci_workflow()}" + (f" lanes={train.ci_lanes()}" if train.ci_lanes() else ""))
 
 
     def refuse_gateless_batch(self, name: str, main: str, member_heads: List[Dict[str, Any]],
@@ -1026,12 +1036,12 @@ class Step:
         the front, the batch would block every PR behind it. The branch goes; when GitHub
         refused the workflow itself (404 or 422, not a passing outage) the PRs that change
         workflow files leave the train for a hand merge, and the rest wait for the next batch."""
-        self.note(f"{name}: ci.yml could not be dispatched on the batch ({error}); deleting it")
-        self.record_outcome("abandoned", f"Merge train: `{name}` has no dispatchable ci.yml; deleting the batch.")
+        self.note(f"{name}: {train.ci_workflow()} could not be dispatched on the batch ({error}); deleting it")
+        self.record_outcome("abandoned", f"Merge train: `{name}` has no dispatchable {train.ci_workflow()}; deleting the batch.")
         self.delete_branch(name)
         if not re.search(r"\b(404|422)\b", str(error)):
             return  # possibly transient: the next step rebuilds and tries again
-        reason = (f"ci.yml, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
+        reason = (f"{train.ci_workflow()}, the gate the train runs, cannot be dispatched once it is merged ({error}): it changes "
                   f"{train.WORKFLOW_DIR} in a way that removes or breaks the gate, so this PR is merged by hand")
         self.remove_workflow_members(main, member_heads, prs, reason)
 

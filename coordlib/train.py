@@ -44,7 +44,7 @@ import tempfile
 import types
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import marker
+from . import config, marker
 
 TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
@@ -53,8 +53,137 @@ ALEX_APPROVED_LABEL = "alex-approved"
 REVIEWED_LABEL = "reviewed"
 BATCH_PREFIX = "train/"
 BATCH_CAP = 3
-CI_WORKFLOW = "ci.yml"
-CI_LANES = "changed"
+
+
+class NotConfigured(ValueError):
+    """The repo has not configured the merge train (.coord/config.json)."""
+
+
+NOT_CONFIGURED_MESSAGE = ("merge train is not configured for this repo: set 'ci_workflow' and 'train_workflow' "
+                          "in .coord/config.json (board, claim, send and inbox work without them)")
+
+
+def is_configured() -> bool:
+    return bool(config.get("ci_workflow")) and bool(config.get("train_workflow"))
+
+
+def _required(key: str) -> str:
+    value = config.get(key)
+    if not value:
+        raise NotConfigured(NOT_CONFIGURED_MESSAGE)
+    return value
+
+
+def ci_workflow() -> str:
+    """The CI workflow file the train dispatches and reads (config `ci_workflow`)."""
+    return _required("ci_workflow")
+
+
+def train_workflow() -> str:
+    """The workflow that runs `coord train step` (config `train_workflow`)."""
+    return _required("train_workflow")
+
+
+def ci_lanes() -> Optional[str]:
+    """The `lanes` input the train dispatches the gate with; None sends no inputs."""
+    return config.get("ci_lanes") or None
+
+
+def ci_dispatch_inputs(lanes: Optional[str] = None) -> Optional[Dict[str, str]]:
+    lanes = lanes or ci_lanes()
+    return {"lanes": lanes} if lanes else None
+
+
+def verdict_job() -> Optional[str]:
+    return config.get("verdict_job") or None
+
+
+def wake_job() -> Optional[str]:
+    return config.get("wake_job") or None
+
+
+def final_jobs() -> Tuple[str, ...]:
+    """The CI workflow's aggregate jobs (verdict, wake): red whenever any lane is."""
+    return tuple(job for job in (verdict_job(), wake_job()) if job)
+
+
+def owner_login(repo: Optional[str] = None) -> Optional[str]:
+    """The login that approves carve-outs: config `owner_login`, else the repo's owner."""
+    return config.get("owner_login") or (repo.split("/", 1)[0] if repo else None)
+
+
+def owner_mention(repo: Optional[str] = None) -> str:
+    """What a notice @-mentions to reach the owner; "" when there is nobody to mention."""
+    mention = config.get("owner_mention")
+    if mention:
+        return mention
+    login = owner_login(repo)
+    return "@" + login if login else ""
+
+
+def owner_only_paths() -> Tuple[str, ...]:
+    """Path prefixes whose changes wait for the owner's approval of the head (config)."""
+    return tuple(config.get("owner_only_paths") or ())
+
+
+_default_branch_cache: Dict[str, str] = {}
+_last_default_branch: List[str] = []
+
+
+def default_branch(gh: Any = None) -> str:
+    """The branch the train builds on: config `default_branch`, else the repository's
+    default branch from GitHub (one call, cached per repo). Without a GitHub handle it
+    reuses the last branch detected in this process, then falls back to "main"."""
+    configured = config.get("default_branch")
+    if configured:
+        return configured
+    repo = getattr(gh, "repo", None)
+    if repo and repo in _default_branch_cache:
+        return _default_branch_cache[repo]
+    if gh is not None and repo:
+        from .gh import AppAuthError, GitHubError
+        try:
+            branch = (gh.rest("repos/{repo}") or {}).get("default_branch")
+        except AppAuthError:
+            raise
+        except GitHubError:
+            branch = None
+        if branch:
+            _default_branch_cache[repo] = branch
+            _last_default_branch[:] = [branch]
+            return branch
+    return _last_default_branch[0] if _last_default_branch else "main"
+
+
+def lane_classifier_files() -> Optional[Tuple[str, str]]:
+    """(selector script, rules file) paths at the default branch, or None: every PR is then one lane."""
+    cfg = config.get("lane_classifier") or {}
+    script, rules = cfg.get("script"), cfg.get("rules")
+    return (script, rules) if script and rules else None
+
+
+_LAZY_NAMES = {
+    # Compatibility names for importers that read these as constants; each reads config on access.
+    "CI_WORKFLOW": lambda: config.get("ci_workflow"),
+    "CI_LANES": ci_lanes,
+    "VERDICT_JOB": verdict_job,
+    "WAKE_JOB": wake_job,
+    "FINAL_JOBS": final_jobs,
+    "OWNER_MENTION": owner_mention,
+    "ALEX_ONLY_PATHS": owner_only_paths,
+    "OWNER_ONLY_PATHS": owner_only_paths,
+    "LANE_SELECTOR": lambda: (lane_classifier_files() or (None, None))[0],
+    "LANE_RULES": lambda: (lane_classifier_files() or (None, None))[1],
+}
+
+
+def __getattr__(name: str) -> Any:
+    lazy = _LAZY_NAMES.get(name)
+    if lazy is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return lazy()
+
+
 WORKFLOW_DIR = ".github/workflows/"
 # The inisa-sidechain app's installation token, minted by merge-train.yml with contents
 # and workflows write, for the batch pushes and main moves that carry workflow changes.
@@ -67,13 +196,9 @@ WORKFLOW_TOKEN_ENV = "COORD_TRAIN_APP_TOKEN"
 VIEWS_ASSUME_WORKFLOW_TOKEN = True
 # What governs the unattended conductor: its standing orders, the settings, hooks and
 # deny list its runs load, and the watcher that starts them. The conductor must not be
-# able to widen its own powers through the train, so these wait for Alex's approval of
-# the head like a needs-alex PR, whoever queued them.
-# Everything the tick imports is under Tools/coord/, and CLAUDE.md is loaded into every run
-# (substitute review of #1043), so all of it is guarded, this list included.
-# Tools/ci-runner/ is the laptop runner's on/off tool, which runs with Alex's token.
-ALEX_ONLY_PATHS = (".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md",
-                   "Tools/ci-runner/")
+# able to widen its own powers through the train, so a repo lists those paths in config
+# `owner_only_paths` and they wait for the owner's approval of the head like a
+# needs-alex PR, whoever queued them. Default: none.
 MAX_ATTEMPTS = 2
 # Each light/heavy pool admits at most twelve attempts per 24 hours by default.
 # The former twelve-run bound assumed ~1 h per heavy run; counting retries makes
@@ -101,30 +226,29 @@ HOLD_CLASSES = (HOLD_DRAFT, HOLD_PARTIAL_DATA, HOLD_NEEDS_ALEX, HOLD_NO_REVIEW, 
 # cannot read whole) a hand merge. Their notice @-mentions him, so it reaches his GitHub
 # notifications even when no agent is running.
 OWNER_HOLDS = frozenset({HOLD_NEEDS_ALEX, HOLD_PARTIAL_DATA})
-OWNER_MENTION = "@alex-bridges"
 # Every held notice also goes to the conductor, whichever session that is.
 CONDUCTOR = "conductor@*"
 # What clears each hold; `{pr}` is the PR number.
 HOLD_ACTIONS = {
-    HOLD_DRAFT: "Mark it ready for review, or take it out with `Tools/coord/coord train remove {pr}`.",
+    HOLD_DRAFT: "Mark it ready for review, or take it out with `coord train remove {pr}`.",
     HOLD_PARTIAL_DATA: ("The train never merges a PR it cannot read whole, so this one stays held at this head. "
                         "Alex decides: merge it by hand, or take it out of the train."),
     # `--head` is a placeholder, never the current head: copying the current head would
     # attest whatever is there now, not the head that was reviewed or approved.
-    HOLD_NEEDS_ALEX: ("Alex: approve this head (`Tools/coord/coord train approve {pr} "
+    HOLD_NEEDS_ALEX: ("Alex: approve this head (`coord train approve {pr} "
                       "--head <full-sha-Alex-approved> --note \"…\"`, or tell an agent to), or take it out of the "
                       "train. A new push needs a new approval."),
     HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head, or a clean review of this head by any agent, recorded "
-                     "with `Tools/coord/coord train review {pr} --head <full-reviewed-sha> --by <agent> "
+                     "with `coord train review {pr} --head <full-reviewed-sha> --by <agent> "
                      "--note \"…\"`."),
     HOLD_UNANSWERED_FINDINGS: ("Answer every finding on the PR. If answering means a push, add the new head "
-                               "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
+                               "again with `coord train add {pr}` once it is reviewed."),
     HOLD_CI_RED: ("Fix the failing checks, or re-run them if they flaked. A fix is a new push: add the new head "
-                  "again with `Tools/coord/coord train add {pr}` once it is reviewed."),
+                  "again with `coord train add {pr}` once it is reviewed."),
     HOLD_HEAD_MOVED: ("The train takes it out at its next step. Add the new head again with "
-                      "`Tools/coord/coord train add {pr}` once it is reviewed."),
+                      "`coord train add {pr}` once it is reviewed."),
     HOLD_CONFLICT: ("If it conflicts with main, merge main into it (or rebase) and add it again with "
-                    "`Tools/coord/coord train add {pr}`. If it conflicts only with a PR ahead of it in the batch, "
+                    "`coord train add {pr}`. If it conflicts only with a PR ahead of it in the batch, "
                     "it waits for the next batch."),
     HOLD_MERGE_CHECK: ("The train verifies this head against its fetched main with git before removing it for a "
                        "conflict. It stays queued while that check is unavailable."),
@@ -140,33 +264,36 @@ LABELS = {
 
 
 def eligibility(pr: Dict[str, Any], head_at_add: Optional[str] = None,
-                all_files: Optional[Sequence[str]] = None, workflow_token: bool = False) -> Tuple[str, str]:
+                all_files: Optional[Sequence[str]] = None, workflow_token: bool = False,
+                base_branch: Optional[str] = None) -> Tuple[str, str]:
     """(READY | HOLD | DROP, reason). HOLD waits and retries; DROP removes the label.
 
     `all_files` is the complete file list when the summary's list was truncated.
     """
-    verdict, _, reason = assess(pr, head_at_add, all_files, workflow_token)
+    verdict, _, reason = assess(pr, head_at_add, all_files, workflow_token, base_branch=base_branch)
     return verdict, reason
 
 
 def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
            all_files: Optional[Sequence[str]] = None, workflow_token: bool = False,
-           *, merge_verified: bool = False) -> Tuple[str, str, str]:
+           *, merge_verified: bool = False, base_branch: Optional[str] = None) -> Tuple[str, str, str]:
     """(verdict, hold class, reason): `eligibility` plus, for a HOLD, which of
     HOLD_CLASSES it is ("" for READY and DROP).
 
     `workflow_token`: the step holds the inisa-sidechain app's installation token, which
     may push workflow files (merge-train.yml mints it). Without it a PR that changes
     `.github/workflows/` is dropped, since the Actions token cannot move main onto it;
-    with it, such a PR waits for Alex's approval of its head, like ALEX_ONLY_PATHS.
+    with it, such a PR waits for Alex's approval of its head, like owner_only_paths.
+    `base_branch` is the default branch (default_branch() when omitted).
     `merge_verified` is used only by Step after git confirms the exact head merges
     cleanly with its pinned main. Read-only views never override GitHub's metadata."""
     files = list(all_files) if all_files is not None else pr.get("files", [])
     labels = set(pr.get("labels", []))
-    if pr.get("base") != "main":
-        return DROP, "", f"its base is {pr.get('base')}, not main"
+    base = base_branch or default_branch()
+    if pr.get("base") != base:
+        return DROP, "", f"its base is {pr.get('base')}, not {base}"
     if pr.get("fromFork"):
-        return DROP, "", "it comes from a fork; the train only builds same-repository branches on Tycho"
+        return DROP, "", "it comes from a fork; the train only builds same-repository branches on CI"
     if head_at_add and head_at_add != pr.get("head"):
         return DROP, "", (f"its head moved from {head_at_add[:9]} to {str(pr.get('head'))[:9]} after it was added; "
                           "add it again once the new head is reviewed")
@@ -179,7 +306,7 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
         # CI itself, and the train's own workflow: the app token can merge it, Alex decides.
         return HOLD, HOLD_NEEDS_ALEX, (f"it changes {touched[0]}, a workflow file the train merges only at a head "
                                        "Alex approved (`coord train approve`)")
-    guarded = [f for f in files if any(f == p or f.startswith(p) for p in ALEX_ONLY_PATHS)]
+    guarded = [f for f in files if any(f == p or f.startswith(p) for p in owner_only_paths())]
     if guarded and not approved_at_head:
         return HOLD, HOLD_NEEDS_ALEX, (f"it changes {guarded[0]}, which governs the unattended conductor; "
                                        "Alex approves its head (`coord train approve`)")
@@ -278,8 +405,7 @@ def review_request_due(pr: Dict[str, Any], now: dt.datetime) -> Optional[str]:
 LIGHT, HEAVY = "light", "heavy"
 # The train comment (event) recording that a light batch went ahead of a heavy PR.
 OVERTAKEN_EVENT = "overtaken"
-LANE_SELECTOR = ".github/scripts/select-ci-lanes.py"
-LANE_RULES = ".github/ci-lanes.json"
+NO_CLASSIFIER_REASON = "no lane classifier is configured, so every PR is one lane"
 
 
 class _EveryApp:
@@ -306,16 +432,22 @@ class LaneClassifier:
 
     def __init__(self, show: Callable[[str], str]):
         self.error: Optional[str] = None
+        files = lane_classifier_files()
+        # Without a configured classifier nothing is executed: every PR is one lane.
+        self.configured = files is not None
+        if files is None:
+            return
+        selector, rules = files
         try:
             module = types.ModuleType("select_ci_lanes")
             # Read at import (its REPO constant), used by nothing called here; absolute,
             # so the process's working directory never matters.
-            module.__file__ = "/" + LANE_SELECTOR
-            exec(compile(show(LANE_SELECTOR), "main:" + LANE_SELECTOR, "exec"), module.__dict__)
+            module.__file__ = "/" + selector
+            exec(compile(show(selector), "main:" + selector, "exec"), module.__dict__)
             with tempfile.TemporaryDirectory(prefix="coord-lanes-") as scratch:
                 rules_file = os.path.join(scratch, "ci-lanes.json")
                 with open(rules_file, "w") as handle:
-                    handle.write(show(LANE_RULES))
+                    handle.write(show(rules))
                 self.rules = module.load_rules(rules_file)
             self.selector = module
             self.light_lanes = tuple(module.LIGHT_LANES)
@@ -334,6 +466,8 @@ class LaneClassifier:
         App scope does not affect whether the apps lane is heavy. Unknown plans have
         null lanes and charge the heavy budget, never the cheap one.
         """
+        if not self.configured:
+            return {"class": HEAVY, "lanes": None, "reason": NO_CLASSIFIER_REASON}
         if self.error:
             return {"class": HEAVY, "lanes": None, "reason": self.error}
         if not paths:
@@ -505,10 +639,8 @@ def is_gate_run(run: Dict[str, Any], tip: str) -> bool:
             and ((run.get("actor") or {}).get("login") == GATE_ACTOR))
 
 
-# ci.yml's aggregate jobs: red whenever any lane is, so they say nothing about why.
-VERDICT_JOB = "CI verdict"
-WAKE_JOB = "Wake the merge train"
-FINAL_JOBS = (VERDICT_JOB, WAKE_JOB)
+# The CI workflow's aggregate jobs (config verdict_job, wake_job; final_jobs()): red
+# whenever any lane is, so they say nothing about why.
 
 # Why a red batch run failed (classify), judged by the signals GitHub leaves on each job,
 # never by how long it ran: an 8-second exit 1 is a real failure.
@@ -559,7 +691,7 @@ def classify(jobs: Sequence[Dict[str, Any]]) -> Optional[str]:
     real and infrastructure counts as real; then a timeout; and only a run whose every
     judged job is infrastructure counts as infrastructure.
     """
-    classes = {job_class(job) for job in jobs if job.get("name") not in FINAL_JOBS}
+    classes = {job_class(job) for job in jobs if job.get("name") not in final_jobs()}
     for kind in (USER_CANCEL, REAL, TIMEOUT, INFRA):
         if kind in classes:
             return kind
@@ -570,7 +702,7 @@ def evidence(jobs: Sequence[Dict[str, Any]], kind: str) -> str:
     """The jobs classify judged `kind`, each with its runner and why, for notes and receipts."""
     parts = []
     for job in jobs:
-        if job.get("name") in FINAL_JOBS or job_class(job) != kind:
+        if job.get("name") in final_jobs() or job_class(job) != kind:
             continue
         notes = [note for note in job.get("annotations") or [] if note]
         why = notes[0] if notes else (f"failed in {job['failed_step']}" if job.get("failed_step") else "no step ran")
