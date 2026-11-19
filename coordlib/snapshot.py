@@ -22,7 +22,7 @@ import re
 import urllib.parse
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
-from . import lease, marker, outage, review, train
+from . import config, lease, marker, outage, review, runtime, train
 from .gh import AppAuthError, GitHub, GitHubError, NotFound, NullPageNode
 
 CLAIM_WINDOW_DAYS = 14
@@ -622,8 +622,9 @@ def rest_pr_node(gh: GitHub, pull: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def fetch_prs_rest(gh: GitHub) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    ref = gh.rest("repos/{repo}/git/ref/heads/main") or {}
-    main = {"name": "main", "sha": (ref.get("object") or {}).get("sha", "")}
+    branch = runtime.default_branch(gh)
+    ref = gh.rest(f"repos/{{repo}}/git/ref/heads/{branch}") or {}
+    main = {"name": branch, "sha": (ref.get("object") or {}).get("sha", "")}
     pulls = gh.rest_paginated("repos/{repo}/pulls?state=open&per_page=100")
     return main, [rest_pr_node(gh, pull) for pull in pulls]
 
@@ -1014,7 +1015,22 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
 # #1054). The attestation commands always post as Alex (cli.ATTESTATIONS never run on
 # the app), so every real record passes.
 HEAD_RECORDS = {"review-clean": "reviewedHead", "review-substitute": "reviewedHead", "alex-approve": "alexApprovedHead"}
-SIDECHAIN_LOGIN = "inisa-sidechain[bot]"  # the app that posts `@inisa-sidechain review` results (reviewer.py)
+# Shown for the reviewer app's login when config `reviewer_bot_login` is unset: not a valid
+# GitHub login, so nothing (not even an author with no login) ever equals it.
+NO_SIDECHAIN_LOGIN = "<reviewer-not-configured>"
+
+
+def sidechain_login() -> str:
+    """The reviewer app's login (config `reviewer_bot_login`, e.g. "my-bot[bot]"); the
+    sentinel NO_SIDECHAIN_LOGIN when the reviewer is not configured."""
+    return config.get("reviewer_bot_login") or NO_SIDECHAIN_LOGIN
+
+
+def __getattr__(name: str) -> Any:
+    # SIDECHAIN_LOGIN stays an attribute for other modules, read from config on each access.
+    if name == "SIDECHAIN_LOGIN":
+        return sidechain_login()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
@@ -1023,7 +1039,7 @@ def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Option
     else is said of it (Codex's 👍 included); only a new head answers it."""
     author = comment.get("author")
     login = author.get("login") if isinstance(author, dict) else ((comment.get("user") or {}).get("login"))
-    if login != SIDECHAIN_LOGIN:
+    if login != sidechain_login():
         return None
     if payload.get("kind") == "review" and payload.get("verdict") == "changes" and isinstance(payload.get("head"), str):
         return payload["head"]
@@ -1032,7 +1048,7 @@ def sidechain_blocks(comment: Dict[str, Any], payload: Dict[str, Any]) -> Option
 
 def trusted_attesters(repo: str) -> FrozenSet[str]:
     """The logins, lower-cased, whose attestation records count: the repository's owner
-    (alex-bridges for example-owner/example-repo). The one place this set is decided."""
+    (the owner login of "owner/name"). The one place this set is decided."""
     return frozenset({repo.split("/", 1)[0].lower()})
 
 

@@ -6,12 +6,11 @@ open for that is none of those: every turn pays for its whole transcript, an hou
 silence loses the prompt cache, and the process dies with a restart or a usage limit. So
 nothing stays open:
 
-- `coord conductor tick` runs every few minutes from launchd (Tools/coord/conductor/
-  install.sh). It is plain Python: a handful of GitHub calls and a look at this machine,
+- `coord conductor tick` runs every few minutes from launchd (conductor/install.sh). It is plain Python: a handful of GitHub calls and a look at this machine,
   then a decision. Most ticks end there and cost no tokens at all.
 - When something needs judgement it starts ONE headless run, `claude -p --agent
   conductor`, with the reasons in the prompt. Every run starts fresh, so its prefix
-  (system prompt, tools, .claude/agents/conductor.md, CLAUDE.md) is the same from wake to
+  (system prompt, tools, the agent file and instructions file named in the repo's config) is the same from wake to
   wake and comes from the prompt cache whenever wakes fall within the cache's lifetime;
   after hours of silence the first wake pays for that prefix once, never for a
   transcript. Memory lives on GitHub and in a short notes file (STATE_DIR/notes.md).
@@ -47,7 +46,8 @@ import threading
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import budget, cache, identity, lease, marker, outage, review, runtime, snapshot, train
+from . import budget, cache, config, identity, lease, marker, outage, review, runtime, snapshot, train
+from . import gh as gh_module
 from .gh import AppAuthError, GitHub, GitHubError
 
 TRIAGE_MODEL = "sonnet"
@@ -69,22 +69,61 @@ MAX_LOOKBACK = dt.timedelta(hours=48)
 
 # Enforced, not requested: the unattended run cannot do these whatever its prompt says.
 # The standing orders forbid them too; this is the part a prompt injection cannot undo.
-DENY = [
-    "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)",
-    "Bash(git push origin main:*)", "Bash(git push origin HEAD:main:*)", "Bash(git push origin +*)",
-    "Bash(gh pr merge:*)", "Bash(gh api -X PUT repos/example-owner/example-repo/pulls/*/merge:*)",
-    "Bash(gh variable:*)", "Bash(gh secret:*)", "Bash(gh repo delete:*)", "Bash(gh workflow disable:*)",
-    "Bash(Tools/coord/coord train approve:*)", "Bash(launchctl:*)", "Bash(sudo:*)",
-    # Mid-command forms; prefix rules alone missed `git push origin --force` and an API
-    # merge (substitute review of #1043). .claude/hooks/conductor-guard.py is the backstop.
-    "Bash(git push * --force*)", "Bash(git push * -f*)", "Bash(gh api * pulls/*/merge*)", "Bash(* train approve*)",
-    # A GitHub App token in a shell (#1035); the guard also blocks the Keychain item, the
-    # token cache and apptoken one-liners. The guard sees Bash; these Read rules keep the
-    # Read tool out of the token cache (`~/` is home in Claude Code's Read rules, `//` is an
-    # absolute path, so the second holds whatever HOME the run has).
-    "Bash(* token exec*)",
-    "Read(~/Library/Caches/inisa-coord/**)", "Read(//Users/*/Library/Caches/inisa-coord/**)",
-]
+def state_dir_names() -> List[str]:
+    """The configured state namespace and its legacy names (config `state_dir_name`,
+    `legacy_state_dir_names`): the Library/Caches folders the token cache may live in."""
+    names = [str(config.get("state_dir_name") or "coord")] + [str(n) for n in config.get("legacy_state_dir_names") or []]
+    return list(dict.fromkeys(names))
+
+
+def control_paths() -> List[str]:
+    """What governs a run: config `owner_only_paths` plus the agent, instructions and guard
+    files the config names. Local changes to them hold the conductor back (tampered)."""
+    paths = [str(p) for p in config.get("owner_only_paths") or []]
+    for section in ("conductor", "reviewer"):
+        for key in ("agent_file", "instructions_file", "guard_hook"):
+            value = (config.get(section) or {}).get(key)
+            if value:
+                paths.append(str(value))
+    return list(dict.fromkeys(paths))
+
+
+def deny_rules(repo: Optional[str] = None) -> List[str]:
+    """What the unattended run cannot do whatever its prompt says (enforced, not requested;
+    the standing orders forbid these too, this is the part a prompt injection cannot undo).
+    The API-merge rule names `repo` (the detected slug when None); config `conductor.deny`
+    adds repo-specific rules."""
+    if repo is None:
+        try:
+            repo = gh_module.detect_repo(os.getcwd())
+        except Exception:
+            repo = ""
+    rules = [
+        "Bash(git push --force:*)", "Bash(git push -f:*)", "Bash(git push --force-with-lease:*)",
+        "Bash(git push origin main:*)", "Bash(git push origin HEAD:main:*)", "Bash(git push origin +*)",
+        "Bash(gh pr merge:*)",
+    ]
+    if repo:
+        rules.append(f"Bash(gh api -X PUT repos/{repo}/pulls/*/merge:*)")
+    rules += [
+        "Bash(gh variable:*)", "Bash(gh secret:*)", "Bash(gh repo delete:*)", "Bash(gh workflow disable:*)",
+        "Bash(*coord train approve:*)", "Bash(launchctl:*)", "Bash(sudo:*)",
+        # Mid-command forms; prefix rules alone missed `git push origin --force` and an API
+        # merge (substitute review of #1043). The guard hook (config `conductor.guard_hook`)
+        # is the backstop.
+        "Bash(git push * --force*)", "Bash(git push * -f*)", "Bash(gh api * pulls/*/merge*)", "Bash(* train approve*)",
+        # A GitHub App token in a shell (#1035); the guard also blocks the Keychain item, the
+        # token cache and apptoken one-liners. The guard sees Bash; these Read rules keep the
+        # Read tool out of the token cache (`~/` is home in Claude Code's Read rules, `//` is an
+        # absolute path, so the second holds whatever HOME the run has).
+        "Bash(* token exec*)",
+    ]
+    for name in state_dir_names():
+        rules += [f"Read(~/Library/Caches/{name}/**)", f"Read(//Users/*/Library/Caches/{name}/**)"]
+    rules += [str(rule) for rule in config.get("conductor").get("deny") or []]
+    return rules
+
+
 FAILED = ("failure", "timed_out", "startup_failure")
 
 # Train notices worth a wake. The rest (waiting for Codex, unanswered findings, a draft,
@@ -99,10 +138,30 @@ ESCALATING_TRAIN_EVENTS = frozenset({"timed-out", "infra"})
 PERSISTENT_KINDS = frozenset({"runner-offline", "disk-low", "stuck", "routing", "control-queued"})
 REPAIR_KINDS = frozenset({"main-red", "train-workflow", "runner-offline", "disk-low", "control-queued"})
 
-# The repository variables that route CI jobs to runner labels (.github/workflows). A
-# runner that carries none of their values is parked (the laptop by day), not offline.
-ROUTING_VARIABLES = ("MK4_RUNNER_MACOS", "MK4_RUNNER_MACOS_LIGHT", "MK4_RUNNER_CONTROL", "MK4_RUNNER_LINUX_ARM64")
-CONTROL_VARIABLE = "MK4_RUNNER_CONTROL"
+# The repository variables that route CI jobs to runner labels (config `runner_variables`;
+# the one that routes the control runners is `runner_control_variable`). A runner that
+# carries none of their values is parked (the laptop by day), not offline.
+def routing_variables_config() -> Tuple[str, ...]:
+    return tuple(str(name) for name in config.get("runner_variables") or [])
+
+
+def control_variable() -> str:
+    return str(config.load().get("runner_control_variable") or "")
+
+
+def __getattr__(name: str) -> Any:
+    # Constants that depend on the repo's config, read on each access (not at import).
+    if name == "DENY":
+        return deny_rules()
+    if name == "ROUTING_VARIABLES":
+        return routing_variables_config()
+    if name == "CONTROL_VARIABLE":
+        return control_variable()
+    if name == "NOTIFY_WORKFLOW":
+        return config.get("notify_workflow")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # GitHub's cron fired 5 of 96 scheduled train steps on 2026-10-07: past this with work
 # waiting and no step started, the watcher dispatches one itself.
 TRAIN_ASLEEP_AFTER = dt.timedelta(minutes=20)
@@ -116,7 +175,7 @@ POISON_JOBS = 3
 
 ISSUE_TITLE = "Conductor (coord): heartbeats, pauses, escalations and outages"
 ISSUE_BODY = (
-    "Records of the coord conductor (`Tools/coord/coordlib/conductor.py`). Each CI box's watcher keeps ONE "
+    "Records of the coord conductor (`coordlib/conductor.py` in coord). Each CI box's watcher keeps ONE "
     "heartbeat comment here and edits it every tick; pauses, escalations to Alex and harness outages are "
     "ordinary comments. Every comment ends with a `<!-- coord:v1 ... -->` marker. `coord board` shows the "
     "result. Keep this issue open; coord finds it by the `coord:conductor` label."
@@ -177,8 +236,7 @@ class Config:
         data_volume = "/System/Volumes/Data"
         return cls(
             home=home,
-            state_dir=env.get("CONDUCTOR_STATE_DIR") or os.path.join(
-                env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "inisa-conductor"),
+            state_dir=env.get("CONDUCTOR_STATE_DIR") or default_state_dir(env),
             claude=env.get("CONDUCTOR_CLAUDE") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"),
             agent=agent,
             host=host,
@@ -192,6 +250,20 @@ class Config:
             max_reviews_per_day=int(number("CONDUCTOR_MAX_REVIEWS_PER_DAY", 8)),
             review_timeout=int(number("CONDUCTOR_REVIEW_TIMEOUT", 45 * 60)),
         )
+
+
+def default_state_dir(env: Dict[str, str]) -> str:
+    """$XDG_STATE_HOME/<state_dir_name>-conductor; a legacy directory (`inisa-conductor`, or
+    the legacy names with `-coord` read as `-conductor`) is kept while the new one does not exist."""
+    root = env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    names = state_dir_names()
+    current = os.path.join(root, names[0] + "-conductor")
+    legacy = [n[:-len("-coord")] + "-conductor" if n.endswith("-coord") else n + "-conductor" for n in names[1:]]
+    for name in legacy + ["inisa-conductor"]:
+        candidate = os.path.join(root, name)
+        if not os.path.exists(current) and os.path.isdir(candidate):
+            return candidate
+    return current
 
 
 def state_path(config: Config) -> str:
@@ -349,7 +421,7 @@ def routing_reasons(variables: Dict[str, str], runners: List[Dict[str, Any]], st
     online = set().union(*(runner_labels(r) for r in runners if r.get("status") == "online"))
     seen = set()
     out = []
-    for name in ROUTING_VARIABLES:
+    for name in routing_variables_config():
         value = variables.get(name) or ""
         if not value:
             continue
@@ -372,7 +444,7 @@ def routing_reasons(variables: Dict[str, str], runners: List[Dict[str, Any]], st
 
 def control_queued_reasons(jobs: List[Dict[str, Any]], label: str, state: Dict[str, Any],
                            now: dt.datetime) -> List[Dict[str, Any]]:
-    """Jobs for the control runners (`label`, MK4_RUNNER_CONTROL) queued longer than
+    """Jobs for the control runners (`label`, the config's `runner_control_variable`) queued longer than
     CONTROL_QUEUED_AFTER: the train's own steps, verdicts and wake-ups wait behind them."""
     stale = [job for job in jobs if job.get("status") == "queued"
              and label.lower() in {str(name).lower() for name in job.get("labels") or []}
@@ -434,7 +506,7 @@ def train_asleep(queue: List[Dict[str, Any]], batches: List[Dict[str, Any]], tra
     one whose CI dispatch was lost), no batch's CI is still running (its wake-train job
     wakes the train), no merge-train run is waiting or running, and none has started, nor
     has the watcher dispatched one, in TRAIN_ASLEEP_AFTER. `queue` and `batches` are
-    cli.train_queue and cli.train_batches; `train_runs` the newest merge-train.yml runs."""
+    cli.train_queue and cli.train_batches; `train_runs` the newest runs of the train workflow."""
     ready = [entry["pr"] for entry in queue if entry.get("verdict") == train.READY]
     if not ready and not batches:
         return None
@@ -611,7 +683,7 @@ def default_runner(cmd: Sequence[str], cwd: str, env: Dict[str, str], timeout: i
 
 
 def model_command(config: Config, prompt: str, model: str) -> List[str]:
-    return runtime.claude_command(config.claude, prompt, model, config.state_dir, DENY)
+    return runtime.claude_command(config.claude, prompt, model, config.state_dir, deny_rules())
 
 
 # MARK: - The watcher
@@ -652,15 +724,16 @@ def post_record(gh: GitHub, issue: int, text: str, payload: Dict[str, Any]) -> D
     return gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(text, payload)})
 
 
-NOTIFY_WORKFLOW = "notify-alex.yml"
-
-
 def notify_alex(gh: GitHub, issue: int, text: str) -> bool:
-    """Put `text` on Alex's phone: the Notify Alex workflow @-mentions him as
+    """Put `text` on Alex's phone: the repo's notify workflow (config `notify_workflow`; none
+    configured, nothing is sent) @-mentions him as
     github-actions[bot] (agents post as Alex, and GitHub does not notify you of your own
     comments). Best effort: the board has the escalation either way."""
+    workflow = config.get("notify_workflow")
+    if not workflow:
+        return False
     try:
-        gh.dispatch_workflow(NOTIFY_WORKFLOW, "main", {"issue": str(issue), "text": _clip(text, 1000)})
+        gh.dispatch_workflow(workflow, runtime.default_branch(gh), {"issue": str(issue), "text": _clip(text, 1000)})
         return True
     except GitHubError:
         return False
@@ -824,7 +897,7 @@ class Watcher:
         items = cli.inbox_items(issue_comments, review_comments, snap, me, since, "",
                                 cache.load_seen_ids(self.gh.repo, me))
         payloads = {c.get("id"): marker.decode(c.get("body")) for c in issue_comments}
-        self.issue_comments = issue_comments  # reviewer.py finds `@inisa-sidechain review` here
+        self.issue_comments = issue_comments  # reviewer.py finds the review trigger here
         from . import reviewer
         reviewer.Reviews(self, None).remember(issue_comments)  # kept in state: the cursor moves on
         if not self.state.get("wasLeader"):
@@ -849,15 +922,21 @@ class Watcher:
         self.state.pop("inboxRescan", None)
         if slow:
             reasons += stuck_reasons(snap, self.now)
-            main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?branch=main&per_page=5") or {}
-            reasons += run_reasons(main_runs.get("workflow_runs") or [], "main-red", "CI on main")
-            train_runs = (self.gh.rest("repos/{repo}/actions/workflows/merge-train.yml/runs?per_page=5") or {}
-                          ).get("workflow_runs") or []
-            reasons += run_reasons(train_runs, "train-workflow", "the merge-train workflow")
+            ci_workflow = config.get("ci_workflow")
+            train_workflow = config.get("train_workflow")
+            branch = urllib.parse.quote(runtime.default_branch(self.gh), safe="")
+            if ci_workflow:
+                main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{ci_workflow}/runs?branch={branch}&per_page=5") or {}
+                reasons += run_reasons(main_runs.get("workflow_runs") or [], "main-red", f"CI on {runtime.default_branch(self.gh)}")
+            train_runs = []
+            if train_workflow:
+                train_runs = (self.gh.rest(f"repos/{{repo}}/actions/workflows/{train_workflow}/runs?per_page=5") or {}
+                              ).get("workflow_runs") or []
+                reasons += run_reasons(train_runs, "train-workflow", "the merge-train workflow")
             runners = (self.gh.rest("repos/{repo}/actions/runners?per_page=100") or {}).get("runners") or []
             variables = self.routing_variables()
             reasons += runner_reasons(runners, self.state, self.now, routing_labels(variables))
-            control = (variables or {}).get(CONTROL_VARIABLE, "")
+            control = (variables or {}).get(control_variable(), "") if control_variable() else ""
             if variables is not None:
                 reasons += routing_reasons(variables, runners, self.state, self.now)
             # A failed read below skips its own check this tick, never the slow tick: that
@@ -875,10 +954,12 @@ class Watcher:
         return reasons
 
     def routing_variables(self) -> Optional[Dict[str, str]]:
-        """The ROUTING_VARIABLES that are set, or None when the repository's variables cannot
+        """The configured runner_variables that are set, or None when the repository's variables cannot
         be read. GET actions/variables needs what the runners read already needs: Alex's
         gh token (`repo` scope) has it; a fine-grained token needs "Variables: read". The
         routing checks are skipped while it is missing, with one note."""
+        if not routing_variables_config():
+            return {}  # no routing variables configured: nothing to read or check
         try:
             listed = (self.gh.rest("repos/{repo}/actions/variables?per_page=100") or {}).get("variables") or []
         except GitHubError as error:
@@ -889,7 +970,7 @@ class Watcher:
             return None
         self.state.pop("variablesUnreadable", None)
         values = {str(v.get("name")): str(v.get("value") or "").strip() for v in listed if isinstance(v, dict)}
-        return {name: values[name] for name in ROUTING_VARIABLES if values.get(name)}
+        return {name: values[name] for name in routing_variables_config() if values.get(name)}
 
     def recent_jobs(self, control: str) -> List[Dict[str, Any]]:
         """The jobs control_queued_reasons and poisoned_runners read, from one listing of the
@@ -914,6 +995,9 @@ class Watcher:
     def wake_train(self, queue: List[Dict[str, Any]], train_runs: List[Dict[str, Any]]) -> None:
         """Dispatch a merge-train step when the train is asleep (train_asleep). An action, not
         a reason: nothing for a model to judge. Not in a dry run."""
+        workflow = config.get("train_workflow")
+        if not workflow:
+            return  # no train workflow configured: the train is disabled for this repo
         from . import cli
         try:
             batches = cli.train_batches(self.gh)
@@ -925,15 +1009,15 @@ class Watcher:
         if why is None:
             return
         if self.dry_run:
-            self.say(f"the merge train is asleep ({why}); a tick would dispatch merge-train.yml")
+            self.say(f"the merge train is asleep ({why}); a tick would dispatch {workflow}")
             return
         try:
-            self.gh.dispatch_workflow("merge-train.yml", "main")
+            self.gh.dispatch_workflow(workflow, runtime.default_branch(self.gh))
         except GitHubError as error:
-            self.say(f"the merge train is asleep ({why}); merge-train.yml could not be dispatched: {_clip(str(error), 120)}")
+            self.say(f"the merge train is asleep ({why}); {workflow} could not be dispatched: {_clip(str(error), 120)}")
             return
         self.state["trainWokenAt"] = iso(self.now)
-        self.say(f"the merge train was asleep ({why}): dispatched merge-train.yml")
+        self.say(f"the merge train was asleep ({why}): dispatched {workflow}")
 
     # MARK: The tick
 
@@ -1047,7 +1131,7 @@ class Watcher:
             if tampered and github_ok and self.state.get("tamperEscalated") != tampered:
                 self.escalate_text(f"The conductor stopped waking on {self.config.host}: files that govern it are "
                                    f"modified in its checkout {self.config.home} ({tampered}). Look at `git status` "
-                                   "there; restore them (`git checkout -- . && git clean -fd -- .claude Tools/coord`) "
+                                   f"there; restore them (`git checkout -- . && git clean -fd -- {' '.join(control_paths())}`) "
                                    "to let it wake again.")
                 self.state["tamperEscalated"] = tampered
             if wakes_today >= self.config.max_wakes_per_day and github_ok and not self.state.get("capEscalated"):
@@ -1095,7 +1179,7 @@ class Watcher:
                 self.say(f"heartbeat failed: {_clip(str(error), 120)}")
 
     def default_app_gh(self) -> Optional[GitHub]:
-        """A GitHub on the inisa-sidechain app for posting reviews, or None when app mode is
+        """A GitHub on the reviewer app (config `reviewer_bot_login`) for posting reviews, or None when app mode is
         off on this machine (reviews are then held; they are never posted as Alex)."""
         from . import cli
         app_gh = GitHub(self.gh.repo)
@@ -1111,7 +1195,7 @@ class Watcher:
     def review_step(self, windows: List[Dict[str, Any]], down: Optional[Dict[str, Any]],
                     pause: Optional[Dict[str, Any]], wake: bool, extra: Optional[Dict[str, Any]] = None,
                     unread: str = "", user_ok: bool = True) -> None:
-        """`@inisa-sidechain review` requests (reviewer.py): at most one review a tick."""
+        """Review requests (the config `reviewer_trigger`, reviewer.py): at most one review a tick."""
         from . import reviewer
         blocked = (unread if unread else "waking is off (--no-wake)" if not wake
                    else f"Claude is down until {iso(down['end'])}" if down
@@ -1311,18 +1395,19 @@ class Watcher:
                              payload)
         link = (posted or {}).get("html_url") or ""
         if not notify_alex(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
-            self.say("could not dispatch Notify Alex; the escalation is on the board only")
+            self.say("could not dispatch the notify workflow; the escalation is on the board only")
 
     def tampered(self) -> str:
         """Local changes to what governs a run (orders, hooks, settings, the watcher): a run
         must not be able to leave the next one unguarded. "" when clean or not a checkout."""
-        code, out = self.git(["status", "--porcelain", "--", *train.ALEX_ONLY_PATHS])
+        paths = control_paths()
+        code, out = self.git(["status", "--porcelain", "--", *paths]) if paths else (1, "")
         return "" if code != 0 else ", ".join(line[3:] for line in out.splitlines() if line.strip())[:200]
 
     # MARK: Self-update
 
     def update_checkout(self) -> None:
-        """Keep the conductor's checkout at origin/main, so the watcher and its agent
+        """Keep the conductor's checkout at origin/<default branch>, so the watcher and its agent
         definition are what was reviewed. Only a clean, detached checkout is moved: a
         branch or a local edit is someone's work, and is left alone and reported."""
         code, dirty = self.git(["status", "--porcelain"])
@@ -1332,9 +1417,9 @@ class Watcher:
             self.say("checkout has local changes; not updating it")
             return
         if self.git(["symbolic-ref", "-q", "HEAD"])[0] == 0:
-            self.say("checkout is on a branch; not updating it (it should be detached at origin/main)")
+            self.say("checkout is on a branch; not updating it (it should be detached at origin/<default branch>)")
             return
-        if self.git(["fetch", "-q", "origin", "main"])[0] == 0:
+        if self.git(["fetch", "-q", "origin", runtime.default_branch(self.gh)])[0] == 0:
             self.git(["checkout", "-q", "--detach", "FETCH_HEAD"])
 
 

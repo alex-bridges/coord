@@ -10,7 +10,49 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Sequence
 
+from . import config
 from .gh import redact
+
+
+def setting(section: str, key: str, required: bool = True) -> Optional[str]:
+    """A nested config value (`conductor.agent_file`, `reviewer.guard_hook`); a missing
+    required one raises a ValueError that names the key and the config file."""
+    value = (config.get(section) or {}).get(key)
+    if not value and required:
+        raise ValueError("coord: '%s.%s' is not set; add it to %s to use this feature"
+                         % (section, key, config.CONFIG_RELATIVE_PATH))
+    return value or None
+
+
+def agent_name(section: str) -> str:
+    """The `claude --agent` name for the conductor or reviewer: the basename of its
+    configured agent file (".claude/agents/conductor.md" -> "conductor")."""
+    path = str(setting(section, "agent_file"))
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return base[:-3] if base.endswith(".md") else base
+
+
+_default_branches = {}
+
+
+def default_branch(gh: Any = None, hint: Optional[str] = None) -> str:
+    """The repository's default branch: config `default_branch`, else `hint` (a branch the
+    caller already read from GitHub), else one GitHub lookup per repo; "main" only when none
+    of those is available."""
+    configured = config.get("default_branch")
+    if configured:
+        return str(configured)
+    if hint:
+        return hint
+    repo = getattr(gh, "repo", None)
+    if gh is None or not repo:
+        return "main"
+    if repo not in _default_branches:
+        try:
+            _default_branches[repo] = str((gh.rest("repos/{repo}") or {}).get("default_branch") or "main")
+        except Exception:  # GitHub unavailable: not cached, so a later call retries
+            return "main"
+    return _default_branches[repo]
 
 
 def claude_command(executable: str, prompt: str, model: Optional[str], state_dir: str,
@@ -19,7 +61,7 @@ def claude_command(executable: str, prompt: str, model: Optional[str], state_dir
     if role == "repair":
         if not model:
             raise ValueError("Claude repair requires a model")
-        return [executable, "-p", prompt, "--agent", "conductor", "--model", model, "--output-format", "json",
+        return [executable, "-p", prompt, "--agent", agent_name("conductor"), "--model", model, "--output-format", "json",
                 "--permission-mode", "auto", "--add-dir", state_dir,
                 "--settings", json.dumps({"permissions": {"deny": list(deny)}})]
     if role != "diagnose":
