@@ -254,7 +254,7 @@ class LockTests(PrincipalTestCase):
         @contextlib.contextmanager
         def spy_lock(repo, timeout_seconds=5.0, principal=budget.USER):
             events.append(f"lock {principal}")
-            yield
+            yield True
             events.append("unlock")
 
         self.patch(cache, "budget_lock", spy_lock)

@@ -45,6 +45,7 @@ import types
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import config, marker
+from .runtime import default_branch
 
 TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
@@ -143,35 +144,6 @@ def owner_mention(repo: Optional[str] = None) -> str:
 def owner_only_paths() -> Tuple[str, ...]:
     """Path prefixes whose changes wait for the owner's approval of the head (config)."""
     return tuple(config.get("owner_only_paths") or ())
-
-
-_default_branch_cache: Dict[str, str] = {}
-_last_default_branch: List[str] = []
-
-
-def default_branch(gh: Any = None) -> str:
-    """The branch the train builds on: config `default_branch`, else the repository's
-    default branch from GitHub (one call, cached per repo). Without a GitHub handle it
-    reuses the last branch detected in this process, then falls back to "main"."""
-    configured = config.get("default_branch")
-    if configured:
-        return configured
-    repo = getattr(gh, "repo", None)
-    if repo and repo in _default_branch_cache:
-        return _default_branch_cache[repo]
-    if gh is not None and repo:
-        from .gh import AppAuthError, GitHubError
-        try:
-            branch = (gh.rest("repos/{repo}") or {}).get("default_branch")
-        except AppAuthError:
-            raise
-        except GitHubError:
-            branch = None
-        if branch:
-            _default_branch_cache[repo] = branch
-            _last_default_branch[:] = [branch]
-            return branch
-    return _last_default_branch[0] if _last_default_branch else "main"
 
 
 def lane_classifier_files() -> Optional[Tuple[str, str]]:

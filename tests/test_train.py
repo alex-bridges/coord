@@ -48,7 +48,7 @@ ATTESTERS = ((ALEX, True),
              ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"}, False),
              ({"login": "example-reviewer[bot]", "type": "Bot"}, False),
              ({"login": "mallory", "type": "User"}, False))
-FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
+FAKE_OWNER = ALEX  # configured approver for the test repositories
 
 
 class CodexRequestTests(unittest.TestCase):
@@ -84,6 +84,18 @@ class EligibilityTests(unittest.TestCase):
 
     def test_ready(self):
         self.assertEqual(train.eligibility(self.summary()), (train.READY, "ready"))
+
+    def test_only_the_connector_can_supply_its_summary_and_reaction(self):
+        node = ready_node(1, "a" * 40, "b")
+        for author in (node["reactions"]["nodes"][0]["user"], node["comments"]["nodes"][0]["author"]):
+            with mock.patch.dict(author, login="chatgpt-codex-connector-support"):
+                pr = snapshot.summarize_pr(node)
+                self.assertEqual(train.assess(pr)[:2], (train.HOLD, train.HOLD_NO_REVIEW))
+
+    def test_an_unidentified_reply_does_not_answer_a_finding(self):
+        node = ready_node(1, "a" * 40, "b")
+        node["reviewThreads"]["nodes"] = [{"comments": {"nodes": [{"author": {"login": BOT}}, {"author": None}]}}]
+        self.assertEqual(train.assess(snapshot.summarize_pr(node))[:2], (train.HOLD, train.HOLD_UNANSWERED_FINDINGS))
 
     def test_drops(self):
         cases = [
@@ -622,6 +634,7 @@ class FakeGitHub:
         if match:
             return [{"jobs": self.jobs.get(int(match.group(1)), [])}]
         if "ci.yml/runs?head_sha=" in path:
+            assert "&branch=main&" in path, "a run of another branch at the same SHA is not main CI"
             return [{"workflow_runs": self.main_runs}]
         if "ci.yml/runs?event=workflow_dispatch" in path:
             return [{"workflow_runs": self.dispatches_today}]
@@ -956,8 +969,8 @@ class StepTests(unittest.TestCase):
 
         lines = self.step(fake).run()
         self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
-        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
-        self.assertTrue(any("commit chain or merge trees" in line for line in lines), lines)
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("no trusted build record" in line for line in lines), lines)
 
     def test_batch_with_extra_first_parent_commit_cannot_fast_forward_main(self):
         h1 = self.pr_branch(1, "c.txt", "reviewed\n")
@@ -974,8 +987,8 @@ class StepTests(unittest.TestCase):
 
         lines = self.step(fake).run()
         self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
-        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
-        self.assertTrue(any("commit chain or merge trees" in line for line in lines), lines)
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("no trusted build record" in line for line in lines), lines)
 
     def closed_issues(self, fake):
         return [path.rsplit("/", 1)[1] for method, path, body in fake.writes
@@ -1067,6 +1080,32 @@ class StepTests(unittest.TestCase):
                    if method == "POST" and path.endswith("issues/55/comments")]
         self.assertEqual([(r["event"], r["pr"], r["issue"]) for r in receipt], [("closed-issue", 1, 55)])
         self.assertTrue(any("closed #55" in line for line in lines), lines)
+
+    def test_a_matching_tree_and_green_ci_still_require_a_build_record(self):
+        head = self.pr_branch(1, "c.txt", "reviewed\n")
+        fake, name, tip = self.build_batch([(1, head)])
+        for comment in fake.issue_comments[1]:
+            comment["user"] = {"login": "collaborator"}
+        self.run_on(fake, name, tip, conclusion="success")
+        step = self.step(fake)
+        self.assertTrue(step.valid_batch_chain(self.main, [{"pr": 1, "sha": head}], tip))
+        step.run()
+        self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+
+    def test_a_batch_recovers_from_either_durable_build_record(self):
+        head = self.pr_branch(1, "c.txt", "reviewed\n")
+        fake, name, tip = self.build_batch([(1, head)])
+        self.run_on(fake, name, tip, conclusion="success")
+        history = list(fake.issue_comments[1])
+        for event in ("ci-requested", "testing"):
+            with self.subTest(event=event):
+                fake.issue_comments[1] = [c for c in history if marker.decode(c["body"]).get("event") == event]
+                fake.writes.clear()
+                self.step(fake, mode="dry-run").run()
+                self.assertEqual(fake.posted("green-dry-run"), [1])
+                self.assertNotIn(("PATCH", "repos/{repo}/git/refs/heads/main", {"sha": tip, "force": False}),
+                                 fake.writes)
 
     def test_an_issue_already_closed_is_left_alone_and_dry_run_closes_nothing(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
@@ -1273,8 +1312,8 @@ class StepTests(unittest.TestCase):
         # conductor alone. The ejected record must name the adder and its fallback.
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
-        fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW - dt.timedelta(minutes=50)), "body": compose_record(
-            "added", {"kind": "train-add", "pr": 1, "head": h1, "agent": "worker@x", "fallback": "lead@y"})}]
+        fake.issue_comments[1][0]["body"] = compose_record(
+            "added", {"kind": "train-add", "pr": 1, "head": h1, "agent": "worker@x", "fallback": "lead@y"})
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
         fake.add_job(77, "CoreKit release gate")
         self.step(fake).run()
@@ -1322,7 +1361,12 @@ class StepTests(unittest.TestCase):
         lines = self.step(fake).run()
         self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         self.assertTrue(any("keeping the batch" in line for line in lines), lines)
-        # 3. The update really failed (main elsewhere): rebuild.
+        # 3. Another push followed the update. Its SHA alone cannot prove the batch failed.
+        fake.writes.clear()
+        fake.reread_error, fake.reread_main = "", "b" * 40
+        self.step(fake).run()
+        self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        # 4. The update really failed (main still at the base): rebuild.
         fake.writes.clear()
         fake.reread_error, fake.reread_main = "", self.main
         self.step(fake).run()
@@ -1791,7 +1835,7 @@ class StepTests(unittest.TestCase):
     def test_the_actions_train_repeats_a_hand_runs_notice_at_most_once(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
         self.add(fake, 1, self.H1, 30)
-        fake.login = "o"
+        fake.login = FAKE_OWNER["login"]
         self.step(fake, agent=self.HAND).run()
         self.step(fake, agent=self.HAND).run()
         self.assertEqual(fake.posted("held"), [1], "a hand run counts its own notice")
@@ -1806,7 +1850,7 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.login = "o"
+        fake.login = FAKE_OWNER["login"]
         self.step(fake, mode="dry-run", agent=self.HAND).run()
         self.step(fake, mode="dry-run", agent=self.HAND).run()  # the batch branch is still there
         self.assertEqual(fake.posted("green-dry-run"), [1])
@@ -1876,8 +1920,13 @@ class StepTests(unittest.TestCase):
                 fake, name, tip = self.build_batch([(1, h1)])
                 self.run_on(fake, name, tip, conclusion="success")
                 fake.nodes[0]["headRefOid"] = "f" * 40
-                fake.fail_comment_reads = error
-                lines = self.step(fake).run()
+                step = self.step(fake)
+                notify = step.notify_held
+                def fail_notice(*args):
+                    fake.fail_comment_reads = error
+                    return notify(*args)
+                step.notify_held = fail_notice
+                lines = step.run()
                 self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
                 self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
                 self.assertTrue(any("could not post the held notice" in line for line in lines), lines)
@@ -2491,11 +2540,17 @@ class WorkflowTokenStepTests(unittest.TestCase):
                 self.assertEqual(fake.posted("removed"), [])
                 self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), merger.writes)
 
-    def test_a_truncated_file_list_is_completed_with_both_sides_of_a_rename(self):
+    def test_file_gates_keep_rename_paths_without_refetching_a_capped_list(self):
         fake = FakeGitHub([], self.main)
-        fake.rest_paginated = lambda path: [{"filename": "elsewhere/x.yml", "previous_filename": ".github/workflows/x.yml"}]
-        files = self.step(fake).all_files({"number": 1, "filesTruncated": True})
-        self.assertEqual(sorted(files), [".github/workflows/x.yml", "elsewhere/x.yml"])
+        fake.rest_paginated = mock.Mock(return_value=[
+            {"filename": "elsewhere/x.yml", "previous_filename": ".github/workflows/x.yml"}])
+        connection = snapshot.rest_file_connection(fake, 1, expected=2)
+        pr = {"number": 1, "head": "abc", "filesTruncated": snapshot.truncated(connection),
+              "files": snapshot.file_paths(connection)}
+        step = self.step(fake)
+        with mock.patch.object(step, "changed_paths", return_value=["elsewhere/x.yml", "extra"]):
+            self.assertEqual(step.gate_files(pr, self.main), ["elsewhere/x.yml", ".github/workflows/x.yml", "extra"])
+        fake.rest_paginated.assert_called_once()
 
     def test_a_workflow_batch_whose_token_is_gone_does_not_move_main(self):
         head, node = self.approved_workflow_pr()

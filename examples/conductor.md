@@ -36,7 +36,7 @@ only when there is work to do. When you finish, you exit; the next wake is a fre
 Always work in a throwaway worktree, never in the conductor's own detached checkout:
 
 ```bash
-git worktree add -b conductor/<slug> ../conductor-<slug> origin/main
+git worktree add -b conductor/<slug> ../conductor-<slug> origin/HEAD
 ```
 
 Open a PR, queue it with `coord train add <pr>` once reviewed, and remove the worktree after

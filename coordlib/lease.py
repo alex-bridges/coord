@@ -25,7 +25,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Dict, Iterable, List, Optional
 
-from . import review
+from . import review, train
 
 CONDUCTOR_LABEL = "coord:conductor"
 ADDRESS = "conductor@*"
@@ -69,7 +69,7 @@ def _reviewer(value: Any) -> Optional[Dict[str, Any]]:
 
 def _owner_records(comments: Iterable[Dict[str, Any]], repo: str) -> List[Dict[str, Any]]:
     """Conductor controls are owner-authored; a marker's agent field is self-declared."""
-    owner = repo.split("/", 1)[0].lower()
+    owner = (train.owner_login(repo) or "").lower()
     return [c for c in comments if (c.get("author") or {}).get("type") == "User"
             and str((c.get("author") or {}).get("login") or "").lower() == owner]
 

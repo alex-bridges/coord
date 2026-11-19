@@ -13,7 +13,9 @@ Provides:
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
+import json
 import os
 import signal
 import stat
@@ -134,8 +136,6 @@ if IS_WINDOWS:
     _kernel32.SetInformationJobObject.restype = wintypes.BOOL
     _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
     _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-    _kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
-    _kernel32.TerminateJobObject.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -331,7 +331,7 @@ def _win_create_kill_job():
     """Create a Win32 Job Object that kills every assigned process & descendant on close."""
     job = _kernel32.CreateJobObjectW(None, None)
     if not job:
-        return None
+        raise ctypes.WinError()
     info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
     info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
     ok = _kernel32.SetInformationJobObject(
@@ -339,27 +339,27 @@ def _win_create_kill_job():
         ctypes.byref(info), ctypes.sizeof(info),
     )
     if not ok:
+        error = ctypes.WinError()
         _kernel32.CloseHandle(job)
-        return None
+        raise error
     return job
 
 
-def _win_terminate_tree(pid: int, job) -> None:
-    if job:
-        try:
-            _kernel32.TerminateJobObject(job, 1)
-        except Exception:
-            pass
-        try:
-            _kernel32.CloseHandle(job)
-        except Exception:
-            pass
-        return
-    try:
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        pass
+# Only the trusted interpreter starts outside the job. It cannot spawn the requested
+# command until the parent assigns it to the job and sends the argument list over stdin.
+_WINDOWS_LAUNCHER = """\
+import json
+import subprocess
+import sys
+
+command = json.load(sys.stdin)
+try:
+    exit_code = subprocess.call(command, stdin=subprocess.DEVNULL)
+except OSError as error:
+    print(error, file=sys.stderr)
+    exit_code = 127
+sys.exit(exit_code)
+"""
 
 
 def run_isolated_process(command: List[str], cwd: str, env: Dict[str, str],
@@ -371,35 +371,32 @@ def run_isolated_process(command: List[str], cwd: str, env: Dict[str, str],
             tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err_file:
         if IS_WINDOWS:
             job = _win_create_kill_job()
-            process = subprocess.Popen(
-                command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                stdout=out_file, stderr=err_file, text=True,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-            assigned = False
-            if job:
-                try:
-                    assigned = bool(_kernel32.AssignProcessToJobObject(job, int(process._handle)))
-                except Exception:
-                    assigned = False
-                if not assigned:
-                    _kernel32.CloseHandle(job)
-                    job = None
+            process = None
             timed_out = False
             try:
-                process.wait(timeout=timeout)
+                process = subprocess.Popen(
+                    [sys.executable, "-I", "-S", "-c", _WINDOWS_LAUNCHER],
+                    cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=out_file, stderr=err_file,
+                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                )
+                if not _kernel32.AssignProcessToJobObject(job, int(process._handle)):
+                    raise OSError("could not assign the isolated launcher to its Windows Job Object")
+                process.communicate(json.dumps(command).encode("ascii"), timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
             finally:
-                _win_terminate_tree(process.pid, job if assigned else None)
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+                _kernel32.CloseHandle(job)  # KILL_ON_JOB_CLOSE includes any live descendants.
+                if process is not None:
+                    # An unassigned launcher still needs killing. An assigned one
+                    # may have exited as the job closed. Always confirm its exit.
+                    with contextlib.suppress(OSError):
+                        process.kill()
+                    with contextlib.suppress(OSError):
+                        process.stdin.close()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        raise OSError("the isolated Windows launcher did not terminate") from None
         else:
             process = subprocess.Popen(
                 command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,

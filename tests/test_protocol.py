@@ -127,7 +127,7 @@ class ProtocolTests(unittest.TestCase):
             def rest_paginated(self, path):
                 return [{"id": index, "issue_url": "https://api.github.com/repos/o/r/issues/1",
                          "created_at": snapshot.iso(NOW), "html_url": f"u/{index}",
-                         "user": {"login": "o", "type": "User"}, "body": marker.compose("text", payload)}
+                         "user": {"login": "example-owner", "type": "User"}, "body": marker.compose("text", payload)}
                         for index, payload in enumerate(payloads, 1)]
         return snapshot.fetch_coord_comments(Fake(), NOW)
 

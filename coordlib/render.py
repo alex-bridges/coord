@@ -180,7 +180,7 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
     lines: List[str] = []
     cache = f" · cached {snapshot['cacheAgeSeconds']}s" if snapshot.get("cacheAgeSeconds") is not None else ""
     lines.append(
-        f"{snapshot['repo']} board · main {snapshot['main'].get('sha', '')[:9]} · "
+        f"{snapshot['repo']} board · {snapshot['main'].get('name') or 'main'} {snapshot['main'].get('sha', '')[:9]} · "
         f"{snapshot['generatedAt']} · {snapshot.get('apiCalls', '?')} API calls{cache}"
         + (f" · {budget}" if budget else "")
         + (f" · {stale_words(snapshot)}" if snapshot.get("stale") else "")
@@ -201,6 +201,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
         lines.append(f"  PR #{pr['number']}  {pr['branch']}{draft}{in_train}{who}")
         lines.append(f"      {_clip(pr['title'], 70)}")
         lines.append(f"      {ci_words(pr['ci'])} · {codex_words(pr)} · updated {ago(pr['updatedAt'], now)} ago")
+        if pr.get("filesTruncated"):
+            lines.append("      GitHub returned a partial file list. Some overlaps may be missing.")
     for claim in snapshot["claims"]:
         if claim["pr"] is not None:
             continue
@@ -239,10 +241,12 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
     if not snapshot["train"]:
         lines.append("  empty")
     prs = {pr["number"]: pr for pr in snapshot["prs"]}
+    base = train.default_branch(hint=snapshot["main"].get("name"))
     for position, entry in enumerate(snapshot["train"], start=1):
         by = f" by {entry['agent']}" if entry.get("agent") else ""
         pr = prs.get(entry["pr"])
-        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"),
+                                            workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN, base_branch=base)
                            if pr else (train.DROP, "not open"))
         state = "ready" if verdict == train.READY else ("held: " if verdict == train.HOLD else "will be removed: ") + reason
         lines.append(f"  {position}. PR #{entry['pr']} · added {ago(entry['addedAt'], now)} ago{by} · {state}")
@@ -277,11 +281,17 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     if budget:
         parts.append(budget)
     lines = [f"coord ({me}): " + ", ".join(parts)]
-    lines.extend(outage_line(window, now) for window in active_outages(snapshot, now))
+    windows = active_outages(snapshot, now)
+    for window in windows[:limit]:
+        lines.append(f"  outage: {_brief_identity(window['harness'])} until {window['end'].strftime('%a %H:%MZ')}")
+    if len(windows) > limit:
+        lines.append(f"  {len(windows) - limit} more outages")
     for pr in snapshot["prs"][:limit]:
         owner = claim_owner(snapshot, pr)
         who = f" [{_brief_identity(owner['agent'], agent=True)}]" if owner else ""
-        lines.append(f"  PR #{pr['number']} {_brief_identity(pr['branch'])}{who}: {ci_words(pr['ci'])}, {codex_words(pr)}")
+        ci = pr["ci"]
+        status = f"CI red ({_count(len(ci['failing']), 'check')})" if ci.get("failing") else ci_words(ci)
+        lines.append(f"  PR #{pr['number']} {_brief_identity(pr['branch'])}{who}: {status}, {codex_words(pr)}")
     for claim in open_claims[: max(0, limit - len(snapshot["prs"]))]:
         lines.append(f"  claim #{claim['issue']} {_brief_identity(claim['branch'])} "
                      f"[{_brief_identity(claim['agent'], agent=True)}]" + (" stale" if claim["stale"] else ""))

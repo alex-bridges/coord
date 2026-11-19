@@ -8,7 +8,11 @@ stay disabled until the repo configures them.
 
 import json
 import os
+import stat
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
 
 DEFAULTS = {
     "default_branch": None,          # None: ask GitHub
@@ -28,6 +32,7 @@ DEFAULTS = {
     "owner_only_paths": [],          # PRs touching these need the owner
     "lane_classifier": None,         # {"script": ..., "rules": ...} or None
     "runner_variables": [],          # repo variables the conductor may set
+    "runner_control_variable": None,
     "conductor": {
         "agent_file": None,          # path to the conductor prompt
         "instructions_file": None,   # e.g. "CLAUDE.md"
@@ -47,6 +52,21 @@ DEFAULTS = {
 CONFIG_RELATIVE_PATH = ".coord/config.json"
 
 _cache = {}
+_checkout = ContextVar("coord_config_checkout", default=None)
+
+
+class ConfigError(ValueError):
+    """An unreadable or invalid repository configuration."""
+
+
+@contextmanager
+def in_checkout(start):
+    """Resolve command-wide config reads in the selected checkout without changing cwd."""
+    scope = _checkout.set(start)
+    try:
+        yield
+    finally:
+        _checkout.reset(scope)
 
 
 def _repo_root(start=None):
@@ -67,32 +87,52 @@ def config_path(start=None):
     return os.path.join(root, CONFIG_RELATIVE_PATH) if root else None
 
 
-def _merge(base, over):
-    merged = dict(base)
+def _merge(base, over, path, prefix=""):
+    merged = deepcopy(base)
     for key, value in over.items():
-        if isinstance(merged.get(key), dict) and isinstance(value, dict):
-            merged[key] = _merge(merged[key], value)
-        else:
-            merged[key] = value
+        if key in base:
+            default = base[key]
+            field = prefix + key
+            if key == "lane_classifier" and value is not None:
+                default = {"script": None, "rules": None}
+            if isinstance(default, dict):
+                if not isinstance(value, dict):
+                    raise ConfigError(f"{path}: {field} must be an object")
+                value = _merge(default, value, path, field + ".")
+            elif isinstance(default, list):
+                if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                    raise ConfigError(f"{path}: {field} must be an array of strings")
+            elif value is not None and not isinstance(value, str):
+                raise ConfigError(f"{path}: {field} must be a string or null")
+        merged[key] = value
     return merged
 
 
 def load(start=None, refresh=False):
     """Return the merged config. Unknown keys are kept; bad JSON raises ValueError."""
+    # Cache before discovering the checkout. CI and review rules read configuration
+    # for every job and file, and discovery otherwise runs git for every lookup.
+    start = start or _checkout.get()
+    key = (os.path.abspath(start or os.curdir), os.environ.get("COORD_CONFIG"),
+           os.environ.get("GIT_DIR"), os.environ.get("GIT_WORK_TREE"))
+    if not refresh and key in _cache:
+        return _cache[key]
     path = config_path(start)
-    if not refresh and path in _cache:
-        return _cache[path]
-    merged = _merge(DEFAULTS, {})
-    if path and os.path.isfile(path):
-        with open(path, encoding="utf-8") as handle:
-            try:
+    data = {}
+    if path and os.path.abspath(path) != os.path.abspath(os.devnull):
+        try:
+            if not stat.S_ISREG(os.stat(path).st_mode):
+                raise OSError("expected a regular config file")
+            with open(path, encoding="utf-8") as handle:
                 data = json.load(handle)
-            except json.JSONDecodeError as err:
-                raise ValueError("invalid coord config %s: %s" % (path, err))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, RecursionError) as error:
+            raise ConfigError(f"cannot read coord config {path}: {error}") from error
         if not isinstance(data, dict):
-            raise ValueError("coord config %s must be a JSON object" % path)
-        merged = _merge(merged, data)
-    _cache[path] = merged
+            raise ConfigError(f"coord config {path} must be a JSON object")
+    merged = _merge(DEFAULTS, data, path)
+    _cache[key] = merged
     return merged
 
 
@@ -104,7 +144,7 @@ def require(key, start=None):
     """Value for a feature that cannot run without it; raises a clear error."""
     value = get(key, start)
     if value in (None, "", []):
-        raise ValueError(
-            "coord: '%s' is not set; add it to %s to use this feature"
+        raise ConfigError(
+            "'%s' is not set; add it to %s to use this feature"
             % (key, CONFIG_RELATIVE_PATH))
     return value

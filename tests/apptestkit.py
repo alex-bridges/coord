@@ -4,7 +4,7 @@ Nothing here reaches GitHub, the real Keychain item or the real token cache:
 - a throwaway RSA key, generated at import with /usr/bin/openssl and kept in memory;
 - a fake `security` (a shell script) that prints the throwaway key's base64 only when a
   test asks for it, and otherwise trips: exit 97, logged;
-- a fake GitHub behind `urllib.request.urlopen`, which mints tokens shaped like the real
+- a fake GitHub behind `gh.api_open`, which mints tokens shaped like the real
   ones (`ghs_…`, 390 characters) and answers the endpoints coord calls;
 - a fake `gh` runner that records every call and answers from the fake GitHub.
 
@@ -12,8 +12,7 @@ Nothing here reaches GitHub, the real Keychain item or the real token cache:
 temporary directory and installs the fakes for every test, so a test that forgets one
 fails instead of reaching anything real. App mode sends credentials to
 https://api.github.com only (apptoken.detect), so the tests leave GITHUB_API_URL unset
-and the fake `urlopen` answers for that host: it is patched on `urllib.request` itself,
-which both gh.py and apptoken.py call, and it fails any request to another host.
+and the fake opener answers for that host. Both gh.py and apptoken.py use it.
 """
 
 from __future__ import annotations
@@ -163,7 +162,7 @@ class FakeGitHub:
         assert url.startswith(API + "/"), f"a request left the fake API: {url}"
         path = url[len(API) + 1:]
         method = request.get_method()
-        auth = request.get_header("Authorization") or ""  # unredirected (app) or ordinary (Alex)
+        auth = request.get_header("Authorization") or ""
         bearer = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
         if (JWT_SHAPE.fullmatch(bearer) or bearer.startswith("ghs_")) and "Authorization" in request.headers:
             raise AssertionError("an app credential travelled as a header a redirect would copy (add_header)")
@@ -346,8 +345,7 @@ class AppTestCase(unittest.TestCase):
         os.chmod(security, 0o700)
         self.patch(apptoken, "SECURITY", security)
         self.server = FakeGitHub()
-        self.patch(urllib.request, "urlopen", self.server)  # Alex's HTTPS calls
-        self.patch(ghmodule, "app_open", self.server)  # every request carrying an app credential
+        self.patch(ghmodule, "api_open", self.server)  # all authenticated HTTPS calls
         self.runner = FakeRunner(self.server)
         self.patch(ghmodule, "_default_runner", self.runner)
 

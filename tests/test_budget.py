@@ -130,9 +130,9 @@ def rate_headers(remaining, resource, reset=BILLING_RESET, limit=5000):
 
 class RecordingTests(BudgetTestCase):
     def with_urlopen(self, fake):
-        original = ghmodule.urllib.request.urlopen
-        ghmodule.urllib.request.urlopen = fake
-        self.addCleanup(setattr, ghmodule.urllib.request, "urlopen", original)
+        original = ghmodule.api_open
+        ghmodule.api_open = fake
+        self.addCleanup(setattr, ghmodule, "api_open", original)
 
     def test_headers_are_recorded_per_resource(self):
         def urlopen(request, timeout=None):
@@ -405,13 +405,13 @@ class SharedCounterTests(BudgetTestCase):
         self.assertIn(f"API: 0 left (resets {self.until})", out.splitlines()[0])
 
     def test_https_headers_of_a_15000_token_with_the_shared_5000_spent(self):
-        original = ghmodule.urllib.request.urlopen
-        ghmodule.urllib.request.urlopen = lambda request, timeout=None: FakeResponse(
+        original = ghmodule.api_open
+        ghmodule.api_open = lambda request, timeout=None: FakeResponse(
             {}, rate_headers(10000, "core", limit=15000))
         try:
             GitHub(REPO, transport="http", token="t").rest("repos/{repo}/issues/1")
         finally:
-            ghmodule.urllib.request.urlopen = original
+            ghmodule.api_open = original
         self.assertEqual({k: cache.load_budget(REPO)["core"][k] for k in ("remaining", "limit", "used")},
                          {"remaining": 10000, "limit": 15000, "used": 5000})
         gh = self.silent_http()

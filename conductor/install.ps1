@@ -4,7 +4,7 @@ Install (or remove) the coord conductor watcher on Windows using Task Scheduler.
 
 .DESCRIPTION
 Registers a per-user Scheduled Task that runs `coord conductor tick` every N seconds from
-a checkout kept detached at `origin/main` (default: ~\conductor\<name>).
+a checkout kept detached at the repository default branch (default: ~\conductor\<owner>\<name>).
 
 .EXAMPLE
 .\conductor\install.ps1 -Repo owner/name
@@ -30,7 +30,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+if ($Repo -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' -or ($Repo -split '/') -match '^\.{1,2}$') {
     throw "install.ps1: -Repo owner/name is required"
 }
 if ($NoWake -and $Wake) {
@@ -40,16 +40,25 @@ if ($Interval -lt 60) {
     throw "install.ps1: -Interval must be at least 60 seconds for Windows Task Scheduler"
 }
 
-$RepoName = ($Repo -split '/', 2)[1]
-$RepoSlug = $Repo -replace '/', '-'
-$TaskName = "coord-conductor-$RepoSlug"
+$RepoOwner, $RepoName = $Repo -split '/', 2
+$RepoSlug = $Repo.ToLowerInvariant().Replace('/', '+')
 $LocalBase = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "coord" } else { Join-Path $HOME ".coord" }
+# Keep the old name only for the repository recorded in its installation metadata.
+$LegacySlug = $Repo.Replace('/', '-')
+$LegacyMeta = Join-Path $LocalBase "conductor-$LegacySlug.json"
+if (Test-Path -LiteralPath $LegacyMeta) {
+    $recorded = Get-Content -LiteralPath $LegacyMeta -Raw | ConvertFrom-Json
+    if ($recorded.PSObject.Properties['repo'] -and $recorded.repo -ieq $Repo) {
+        $RepoSlug = $LegacySlug
+    }
+}
+$TaskName = "coord-conductor-$RepoSlug"
 $LogDir = Join-Path $LocalBase "logs"
 $LogFile = Join-Path $LogDir "conductor-$RepoSlug.log"
 $WrapperPath = Join-Path $LocalBase "conductor-$RepoSlug.ps1"
 $MetaPath = Join-Path $LocalBase "conductor-$RepoSlug.json"
 if (-not $HomeDir) {
-    $HomeDir = Join-Path (Join-Path $HOME "conductor") $RepoName
+    $HomeDir = Join-Path (Join-Path (Join-Path $HOME "conductor") $RepoOwner) $RepoName
 }
 $CoordScript = Join-Path (Split-Path -Parent $PSScriptRoot) "coord"
 
@@ -98,28 +107,34 @@ if ($WakeMode -eq "wake") {
     }
 }
 
-if (-not (Test-Path (Join-Path $HomeDir ".git"))) {
+$NewCheckout = -not (Test-Path (Join-Path $HomeDir ".git"))
+if ($NewCheckout) {
     New-Item -ItemType Directory -Path (Split-Path -Parent $HomeDir) -Force | Out-Null
     & gh repo clone $Repo $HomeDir -- -q
     if ($LASTEXITCODE -ne 0) { throw "install.ps1: failed to clone $Repo" }
-    & git -C $HomeDir checkout -q --detach origin/main
-    Write-Host "created conductor checkout: $HomeDir (detached at origin/main)"
+}
+& $PythonExe -I (Join-Path $PSScriptRoot "check-origin.py") $HomeDir $Repo
+if ($LASTEXITCODE -ne 0) { throw "install.ps1: checkout origin check failed" }
+if ($NewCheckout) {
+    & git -C $HomeDir checkout -q --detach HEAD
+    if ($LASTEXITCODE -ne 0) { throw "install.ps1: failed to detach the new checkout" }
+    Write-Host "created conductor checkout: $HomeDir (detached at the default branch)"
 }
 
 $HostName = $env:COMPUTERNAME
 if (-not $HostName) { $HostName = [System.Net.Dns]::GetHostName() }
 $Agent = "conductor@${HostName}:conductor"
 
-# Bring a clean detached checkout up to origin/main before dry-run check
+# Bring a clean detached checkout up to the default branch before dry-run check
 $dirty = & git -C $HomeDir status --porcelain
 if ($dirty) {
     Write-Warning "$HomeDir has local changes; checking it as-is"
 } else {
     & git -C $HomeDir symbolic-ref -q HEAD *> $null
     if ($LASTEXITCODE -eq 0) {
-        Write-Warning "$HomeDir is on a branch; watcher expects it detached at origin/main"
+        Write-Warning "$HomeDir is on a branch; watcher expects it detached at the default branch"
     } else {
-        & git -C $HomeDir fetch -q origin main
+        & git -C $HomeDir fetch -q origin HEAD
         if ($LASTEXITCODE -eq 0) {
             & git -C $HomeDir checkout -q --detach FETCH_HEAD
         }
@@ -171,6 +186,7 @@ $wrapperContent = @"
 `$env:COORD_REPO = '$($Repo -replace "'", "''")'
 Set-Location '$($HomeDir -replace "'", "''")'
 & '$($PythonExe -replace "'", "''")' '$($CoordScript -replace "'", "''")' 'conductor' 'tick'$extraFlag *>> '$($LogFile -replace "'", "''")'
+exit `$LASTEXITCODE
 "@
 Set-Content -Path $WrapperPath -Value $wrapperContent -Encoding UTF8
 

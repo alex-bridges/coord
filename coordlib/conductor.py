@@ -219,7 +219,7 @@ class Config:
     review_timeout: int = 45 * 60       # reviewer.REVIEW_TIMEOUT_SECONDS
 
     @classmethod
-    def from_env(cls, env: Optional[Dict[str, str]] = None) -> "Config":
+    def from_env(cls, repo: str, env: Optional[Dict[str, str]] = None) -> "Config":
         env = dict(os.environ if env is None else env)
         home = env.get("CONDUCTOR_HOME") or identity.git_toplevel() or os.getcwd()
         host = identity.detect_host()
@@ -241,7 +241,7 @@ class Config:
             default_disk = data_volume if os.path.isdir(data_volume) else "/"
         return cls(
             home=home,
-            state_dir=env.get("CONDUCTOR_STATE_DIR") or default_state_dir(env),
+            state_dir=env.get("CONDUCTOR_STATE_DIR") or default_state_dir(env, repo),
             claude=env.get("CONDUCTOR_CLAUDE") or shutil.which("claude") or os.path.expanduser("~/.local/bin/claude"),
             agent=agent,
             host=host,
@@ -257,23 +257,16 @@ class Config:
         )
 
 
-def default_state_dir(env: Dict[str, str]) -> str:
-    """$XDG_STATE_HOME/<state_dir_name>-conductor (or %LOCALAPPDATA%/<name>-conductor on
-    Windows); configured `legacy_state_dir_names` are kept while the new one does not exist."""
+def default_state_dir(env: Dict[str, str], repo: str) -> str:
+    """Keep the lease state, review queue, notes and run logs local to one repository."""
     if env.get("XDG_STATE_HOME"):
         root = env["XDG_STATE_HOME"]
     elif compat.IS_WINDOWS and env.get("LOCALAPPDATA"):
         root = env["LOCALAPPDATA"]
     else:
         root = os.path.expanduser("~/.local/state")
-    names = state_dir_names()
-    current = os.path.join(root, names[0] + "-conductor")
-    legacy = [n[:-len("-coord")] + "-conductor" if n.endswith("-coord") else n + "-conductor" for n in names[1:]]
-    for name in legacy:
-        candidate = os.path.join(root, name)
-        if not os.path.exists(current) and os.path.isdir(candidate):
-            return candidate
-    return current
+    namespace = state_dir_names()[0] + "-conductor"
+    return os.path.join(root, namespace, "repo-" + urllib.parse.quote(repo.lower(), safe=""))
 
 
 def state_path(config: Config) -> str:
@@ -338,9 +331,11 @@ def reason(key: str, kind: str, summary: str, url: str = "", wake: bool = True, 
 def message_reasons(items: List[Dict[str, Any]], payloads: Dict[Any, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Inbox items (cli.inbox_items for the conductor) as reasons. Broadcasts to `all` and
     train notices outside WAKING_HOLDS / WAKING_TRAIN_EVENTS ride along without waking."""
+    from .cli import inbox_id
     out = []
     for item in items:
-        payload = payloads.get(item.get("id")) or {}
+        item_kind = item.get("kind", "comment")
+        payload = (payloads.get(item.get("id")) or {}) if item_kind == "comment" else {}
         kind, wake, escalate = "message", item.get("reason") != "to all", ""
         if payload.get("kind") == "train":
             kind = "train"
@@ -348,7 +343,7 @@ def message_reasons(items: List[Dict[str, Any]], payloads: Dict[Any, Dict[str, A
             wake = payload.get("hold") in WAKING_HOLDS if event == "held" else event in WAKING_TRAIN_EVENTS
             escalate = f"train:{event}" if event in ESCALATING_TRAIN_EVENTS else ""
         where = f"#{item['on']}" if item.get("on") else ""
-        out.append(reason(f"comment:{item.get('id')}", kind,
+        out.append(reason(f"comment:{inbox_id(item['id'], item_kind)}", kind,
                           f"{item.get('from')} on {where} ({item.get('reason')}): {_clip(item.get('text') or '', 240)}",
                           item.get("url") or "", wake, escalate))
     return out
@@ -357,13 +352,15 @@ def message_reasons(items: List[Dict[str, Any]], payloads: Dict[Any, Dict[str, A
 def stuck_reasons(snap: Dict[str, Any], now: dt.datetime) -> List[Dict[str, Any]]:
     """Queued PRs that have not been ready for STUCK_AFTER since they joined the train."""
     prs = {p["number"]: p for p in snap.get("prs") or []}
+    base = train.default_branch(hint=(snap.get("main") or {}).get("name"))
     out = []
     for entry in snap.get("train") or []:
         pr = prs.get(entry["pr"])
         added = _time(entry.get("addedAt"))
         if pr is None or added is None or now - added < STUCK_AFTER:
             continue
-        verdict, why = train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+        verdict, why = train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN,
+                                         base_branch=base)
         if verdict == train.READY:
             continue
         out.append(reason(f"stuck:{pr['number']}:{pr['head'][:12]}", "stuck",
@@ -575,6 +572,7 @@ def mark(state: Dict[str, Any], reasons: List[Dict[str, Any]], now: dt.datetime,
         record["at"] = iso(now)
         if done:
             record["done"] = True
+            record.pop("repairNote", None)
         else:
             record["attempts"] = record.get("attempts", 0) + 1
 
@@ -813,9 +811,9 @@ class Watcher:
     def beat(self, leader: bool, extra: Dict[str, Any]) -> None:
         payload = {"kind": "conductor", "v": 1, "event": "beat", "leader": leader, "agent": self.config.agent,
                    "host": self.config.host,
-                   "beat": iso(snapshot.now_utc() if extra.get("live") else self.now),
+                   "beat": iso(self.now + (snapshot.now_utc() - self.began)),
                    "seenThrough": cache.load_cursor(self.gh.repo, self.config.agent)}
-        payload.update({k: v for k, v in extra.items() if k != "live" and v is not None})
+        payload.update({k: v for k, v in extra.items() if v is not None})
         wake = payload.get("lastWake") or {}
         text = (f"Conductor watcher on **{self.config.host}** (`{self.config.agent}`): "
                 f"{'leader' if leader else 'standby'}, beat {payload['beat']}."
@@ -857,7 +855,7 @@ class Watcher:
                 if previous is None or previous < posted:
                     told[key] = iso(posted)
 
-    def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> None:
+    def adopt_cursor(self, hosts: List[Dict[str, Any]]) -> Tuple[Optional[str], List[int]]:
         """A new leader starts reading where the last leader had read to. Only beats posted
         as leader count: a standby's cursor says nothing about the conductor's inbox. On a
         takeover the old leader's cursor wins even when it is older than this host's (a
@@ -869,24 +867,26 @@ class Watcher:
                       and _time(h.get("seenThrough"))), key=lambda v: _time(v), default=None)
         takeover = not self.state.get("wasLeader") or self.state.get("inboxRescan")
         if newest and (mine is None or takeover or (_time(mine) or self.now) < (_time(newest) or self.now)):
-            cache.store_cursor(self.gh.repo, self.config.agent, newest, [])
-            self.say(f"adopted the conductor's inbox cursor {newest}")
+            if not self.dry_run:
+                cache.store_cursor(self.gh.repo, self.config.agent, newest, [])
+            self.say(f"using the previous leader's inbox cursor {newest}")
+            return newest, []
+        return mine, cache.load_seen_ids(self.gh.repo, self.config.agent)
 
     # MARK: Reasons from GitHub
 
-    def github_reasons(self, slow: bool) -> List[Dict[str, Any]]:
+    def github_reasons(self, slow: bool, cursor: Optional[str], seen_ids: List[int]) -> List[Dict[str, Any]]:
         from . import cli  # cli imports this module's command functions lazily; keep the cycle one-way
 
         reasons: List[Dict[str, Any]] = []
         me = self.config.agent
-        cursor = cache.load_cursor(self.gh.repo, me) or iso(self.now)
+        cursor = cursor or iso(self.now)
         unread_since = (_time(cursor) or self.now) - cli.CURSOR_OVERLAP
         since = unread_since if self.state.get("inboxRescan") else max(unread_since, self.now - MAX_LOOKBACK)
         snap = cli.get_snapshot(self.gh, 60 if slow else SLOW_EVERY.total_seconds())
         issue_comments = self.gh.rest_paginated(f"repos/{{repo}}/issues/comments?since={iso(since)}&per_page=100")
         review_comments = self.gh.rest_paginated(f"repos/{{repo}}/pulls/comments?since={iso(since)}&per_page=100")
-        items = cli.inbox_items(issue_comments, review_comments, snap, me, since, "",
-                                cache.load_seen_ids(self.gh.repo, me))
+        items = cli.inbox_items(issue_comments, review_comments, snap, me, since, "", seen_ids)
         payloads = {c.get("id"): marker.decode(c.get("body")) for c in issue_comments}
         self.issue_comments = issue_comments  # reviewer.py finds the review trigger here
         from . import reviewer
@@ -901,47 +901,61 @@ class Watcher:
             self.state.pop("reviewRescan", None)
         saved = self.state.setdefault("pendingInbox", {})
         for item, message in zip(items, message_reasons(items, payloads)):
-            saved[message["key"]] = dict(message, at=item["at"], id=item["id"])
-        seen = set(cache.load_seen_ids(self.gh.repo, me))
+            saved.setdefault(message["key"], dict(message, at=item["at"], id=cli.inbox_id(item["id"], item["kind"])))
+        seen = set(seen_ids)
         handled = self.state.get("handled") or {}
         # A successful run removes its entries; an operator's inbox read can also consume
         # them. Notification, cooldown, broadcast-only ticks and outages do neither.
-        self.state["pendingInbox"] = {key: item for key, item in saved.items()
-                                      if (_time(item.get("at")) or unread_since) > unread_since
-                                      and item.get("id") not in seen and not (handled.get(key) or {}).get("done")}
+        self.state["pendingInbox"] = {
+            key: item for key, item in saved.items() if not (handled.get(key) or {}).get("done")
+            and (item.get("retry") or (item.get("id") not in seen
+                                       and (_time(item.get("at")) or unread_since) > unread_since))
+        }
         reasons += list(self.state["pendingInbox"].values())
         self.state.pop("inboxRescan", None)
         if slow:
             reasons += stuck_reasons(snap, self.now)
             ci_workflow = config.get("ci_workflow")
-            train_workflow = config.get("train_workflow")
-            branch = urllib.parse.quote(runtime.default_branch(self.gh), safe="")
             if ci_workflow:
-                main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{ci_workflow}/runs?branch={branch}&per_page=5") or {}
-                reasons += run_reasons(main_runs.get("workflow_runs") or [], "main-red", f"CI on {runtime.default_branch(self.gh)}")
-            train_runs = []
+                try:
+                    branch = runtime.default_branch(self.gh)
+                    ref = urllib.parse.quote(branch, safe="")
+                    main_runs = self.gh.rest(f"repos/{{repo}}/actions/workflows/{ci_workflow}/runs?branch={ref}&per_page=5") or {}
+                    reasons += run_reasons(main_runs.get("workflow_runs") or [], "main-red", f"CI on {branch}")
+                except GitHubError as error:
+                    self.say(f"could not read CI runs: {_clip(str(error), 120)}")
+            train_workflow = config.get("train_workflow")
             if train_workflow:
-                train_runs = (self.gh.rest(f"repos/{{repo}}/actions/workflows/{train_workflow}/runs?per_page=5") or {}
-                              ).get("workflow_runs") or []
-                reasons += run_reasons(train_runs, "train-workflow", "the merge-train workflow")
+                try:
+                    train_runs = (self.gh.rest(f"repos/{{repo}}/actions/workflows/{train_workflow}/runs?per_page=5") or {}
+                                  ).get("workflow_runs") or []
+                    reasons += run_reasons(train_runs, "train-workflow", "the merge-train workflow")
+                    self.wake_train(cli.train_queue(snap), train_runs)
+                except GitHubError as error:
+                    self.say(f"could not read merge-train runs: {_clip(str(error), 120)}")
+            reasons += self.runner_checks()
+        return reasons
+
+    def runner_checks(self) -> List[Dict[str, Any]]:
+        try:
             runners = (self.gh.rest("repos/{repo}/actions/runners?per_page=100") or {}).get("runners") or []
-            variables = self.routing_variables()
-            reasons += runner_reasons(runners, self.state, self.now, routing_labels(variables))
-            control = (variables or {}).get(control_variable(), "") if control_variable() else ""
-            if variables is not None:
-                reasons += routing_reasons(variables, runners, self.state, self.now)
-            # A failed read below skips its own check this tick, never the slow tick: that
-            # would repeat every slow read on each 5-minute tick until it succeeded.
-            try:
-                jobs = self.recent_jobs(control)
-            except GitHubError as error:
-                self.say(f"could not read recent Actions jobs ({_clip(str(error), 120)}); the control-queued and "
-                         "runner-poisoned checks wait for the next slow tick")
-            else:
-                if control:
-                    reasons += control_queued_reasons(jobs, control, self.state, self.now)
-                self.alerts = poisoned_runners(jobs, runners, self.state, self.now)
-            self.wake_train(cli.train_queue(snap), train_runs)
+        except GitHubError as error:
+            self.say(f"could not read Actions runners: {_clip(str(error), 120)}")
+            return []
+        variables = self.routing_variables()
+        reasons = runner_reasons(runners, self.state, self.now, routing_labels(variables))
+        control = (variables or {}).get(control_variable(), "")
+        if variables is not None:
+            reasons += routing_reasons(variables, runners, self.state, self.now)
+        try:
+            jobs = self.recent_jobs(control)
+        except GitHubError as error:
+            self.say(f"could not read recent Actions jobs ({_clip(str(error), 120)}); the control-queued and "
+                     "runner-poisoned checks wait for the next slow tick")
+        else:
+            if control:
+                reasons += control_queued_reasons(jobs, control, self.state, self.now)
+            self.alerts = poisoned_runners(jobs, runners, self.state, self.now)
         return reasons
 
     def routing_variables(self) -> Optional[Dict[str, str]]:
@@ -1022,11 +1036,11 @@ class Watcher:
             except OSError:
                 return ["another tick is running (a model run in progress); nothing to do"]
             self.state = load_state(self.config)
+            prune(self.state, self.now)
             self.dry_run = dry_run
             try:
                 self._tick(dry_run, wake)
             finally:
-                prune(self.state, self.now)
                 if not dry_run:
                     save_state(self.config, self.state)
             return self.lines
@@ -1064,18 +1078,16 @@ class Watcher:
         if leader and not self.state.get("wasLeader"):
             self.state["inboxRescan"] = True  # retained through a low budget or failed read
         if leader and can_read:
-            self.adopt_cursor(hosts)
+            cursor, seen_ids = self.adopt_cursor(hosts)
             self.adopt_review_runs(hosts)
             try:
-                reasons += self.github_reasons(slow)
+                reasons += self.github_reasons(slow, cursor, seen_ids)
                 if slow:
                     self.state["lastSlow"] = iso(self.now)
             except GitHubError as error:
                 self.say(f"GitHub read failed ({_clip(str(error), 120)}); trying again next tick")
         elif leader:
             self.say(f"API budget {left} left, under the read floor: not reading GitHub this tick")
-        if slow and self.config.update_checkout and not dry_run:
-            self.update_checkout()
 
         if github_ok:
             self.state["wasLeader"] = leader
@@ -1174,6 +1186,11 @@ class Watcher:
             except GitHubError as error:
                 self.say(f"heartbeat failed: {_clip(str(error), 120)}")
 
+        # Use one checkout and configuration throughout a tick. The scheduler starts
+        # a fresh process for the next tick, which picks up any newly checked-out controls.
+        if slow and self.config.update_checkout:
+            self.update_checkout()
+
     def default_app_gh(self) -> Optional[GitHub]:
         """A GitHub on the reviewer app (config `reviewer_bot_login`) for posting reviews, or None when app mode is
         off on this machine (reviews are then held; they are never posted as Alex)."""
@@ -1234,16 +1251,31 @@ class Watcher:
              extra: Dict[str, Any], ended: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         waking = [r for r in reasons if r["wake"]]
         model = self.config.repair_model if any(r["repair"] for r in waking) else self.config.triage_model
+        handled = self.state.setdefault("handled", {})
+        notes = (handled.get(r["key"], {}).get("repairNote") for r in waking)
+        deferred = next((note for note in notes if note), None)
+        if deferred:
+            model = self.config.repair_model
         note = ""
         if ended:
             note = (f"Claude was out of usage from {iso(ended['start'])} to {iso(ended['until'])}; "
                     "what arrived meanwhile is below.")
+        if deferred:
+            note += f"\nThe triage run escalated to you: {deferred}"
         started = self.now
         result = self.run(reasons, model, "leader" if leader else "standby (this machine only)", note, extra)
         if result["escalate"] and model != self.config.repair_model:
             self.say(f"triage escalated: {result['summary']}")
-            result = self.run(reasons, self.config.repair_model, "leader" if leader else "standby",
-                              f"The triage run escalated to you: {result['summary']}", extra)
+            if len(self.state["wakes"]) >= self.config.max_wakes_per_day:
+                for item in waking:
+                    record = handled.setdefault(item["key"], {})
+                    record["repairNote"] = result["summary"] or "repair requested"
+                    record["at"] = iso(self.now)
+                self.say("daily wake cap reached; repair run is pending")
+                result = dict(result, ok=False)
+            else:
+                result = self.run(reasons, self.config.repair_model, "leader" if leader else "standby",
+                                  f"The triage run escalated to you: {result['summary']}", extra)
         if result["ok"]:
             mark(self.state, reasons, self.now, done=True)
             for item in reasons:
@@ -1255,8 +1287,15 @@ class Watcher:
                 if cursor is None or (_time(cursor) or started) < started:
                     cache.store_cursor(self.gh.repo, self.config.agent, iso(started - dt.timedelta(seconds=120)),
                                        cache.load_seen_ids(self.gh.repo, self.config.agent))
-        elif not result["limit"]:
-            mark(self.state, waking, self.now, done=False)
+        else:
+            # A model can read its inbox before it fails, hits a limit or hands work
+            # to repair. Reading during that run must not acknowledge unfinished work.
+            saved = self.state.get("pendingInbox", {})
+            for item in reasons:
+                if item["key"] in saved:
+                    saved[item["key"]]["retry"] = True
+            if not result["limit"] and not result["escalate"]:
+                mark(self.state, waking, self.now, done=False)
         return result
 
     def run(self, reasons: List[Dict[str, Any]], model: str, role: str, note: str,
@@ -1276,6 +1315,8 @@ class Watcher:
             completed = self.runner(model_command(self.config, prompt, model), self.config.home, env, self.config.run_timeout)
         finally:
             stop.set()
+            if beating.is_alive():
+                beating.join()
         seconds = int((snapshot.now_utc() - started).total_seconds())
         result = outcome(completed.returncode, completed.stdout, completed.stderr, self.now)
         incomplete = result["ok"] and not result["final"]
@@ -1301,7 +1342,7 @@ class Watcher:
         start calling itself leader, or the leader would adopt its cursor."""
         while not stop.wait(BEAT_DURING_RUN.total_seconds()):
             try:
-                self.beat(leader, dict(extra, live=True))
+                self.beat(leader, extra)
             except GitHubError:
                 pass
 
@@ -1415,8 +1456,12 @@ class Watcher:
         if self.git(["symbolic-ref", "-q", "HEAD"])[0] == 0:
             self.say("checkout is on a branch; not updating it (it should be detached at origin/<default branch>)")
             return
-        if self.git(["fetch", "-q", "origin", runtime.default_branch(self.gh)])[0] == 0:
-            self.git(["checkout", "-q", "--detach", "FETCH_HEAD"])
+        # Remote HEAD is resolved by git during fetch, even when the REST quota is exhausted.
+        ref = config.get("default_branch") or "HEAD"
+        if self.git(["fetch", "-q", "origin", ref])[0] != 0:
+            self.say(f"could not fetch {ref} from origin; checkout update deferred")
+        elif self.git(["checkout", "-q", "--detach", "FETCH_HEAD"])[0] != 0:
+            self.say("could not check out the fetched revision; checkout update deferred")
 
 
 def run_git(home: str, args: List[str]) -> Tuple[int, str]:
@@ -1441,5 +1486,8 @@ def parse_duration(text: str) -> dt.timedelta:
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mhd])\s*", text or "")
     if not match:
         raise ValueError(f"{text!r}: give a duration such as 45m, 2h or 1d")
-    value, unit = float(match.group(1)), match.group(2)
-    return dt.timedelta(minutes=value) if unit == "m" else dt.timedelta(hours=value) if unit == "h" else dt.timedelta(days=value)
+    seconds = float(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    # Watchers and boards read the last CLAIM_WINDOW_DAYS of control records.
+    if not 1 <= seconds <= snapshot.CLAIM_WINDOW_DAYS * 86400:
+        raise ValueError(f"pause duration must be between one second and {snapshot.CLAIM_WINDOW_DAYS} days")
+    return dt.timedelta(seconds=seconds)

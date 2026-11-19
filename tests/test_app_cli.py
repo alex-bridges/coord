@@ -98,6 +98,9 @@ class RoutingTests(AppCliTestCase):
         "outage end": (["outage", "end", "claude"],
                        {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
                         ("POST", "repos/o/r/issues/900/comments")}),
+    }
+
+    CONTROLS = {
         "conductor pause": (["conductor", "pause", "--for", "1h"],
                             {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
                              ("POST", "repos/o/r/issues/900/comments")}),
@@ -123,6 +126,27 @@ class RoutingTests(AppCliTestCase):
                 self.assertEqual({r["kind"] for r in self.reads()} - {"read"}, set(), "every read on the read token")
                 self.assertEqual(self.runner.calls, [], "nothing on Alex's gh")
         self.assertEqual(self.server.mints, 2, "one read and one ops token served every command")
+
+    def test_conductor_control_records_use_the_owner_login(self):
+        for name, (argv, expected) in self.CONTROLS.items():
+            with self.subTest(command=name):
+                self.runner.calls.clear()
+                code, _, err = self.main(argv)
+                self.assertEqual(code, EXIT_OK, err)
+                writes = {(call[call.index("--method") + 1], call[2]) for call in self.runner_writes()}
+                self.assertEqual(writes, expected)
+        self.assertEqual(self.server.requests, [])
+
+    def test_a_review_run_cannot_select_the_owner_identity(self):
+        os.environ["COORD_AGENT"] = "reviewer@test"
+        for argv in (["conductor", "pause", "--for", "1h"], ["train", "approve", "101", "--head", "a" * 40,
+                                                             "--note", "review"]):
+            with self.subTest(argv=argv):
+                code, _, err = self.main(argv)
+                self.assertEqual(code, EXIT_BACKEND)
+                self.assertIn("no GitHub credential", err)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.server.requests, [])
 
     def test_attestations_stay_on_alex(self):
         self.keychain("key")
@@ -165,7 +189,7 @@ class RoutingTests(AppCliTestCase):
             cli.run(args, gh)
         self.assertEqual({name for name, on_app in seen.items() if not on_app}, set(cli.USER_IDENTITY))
         self.assertEqual(cli.USER_IDENTITY, {"train approve", "train review", "train substitute-review", "train step",
-                                             "conductor tick"})
+                                             "conductor tick", "conductor pause", "conductor resume", "conductor escalate"})
         self.assertLessEqual({"train review", "train substitute-review"}, cli.ATTESTATIONS)
 
     def test_conductor_status_reads_on_the_app(self):
@@ -223,7 +247,8 @@ class RoutingTests(AppCliTestCase):
         code, out, _ = self.main(["whoami"])
         self.assertEqual(code, EXIT_OK)
         self.assertIn("githubIdentity: example-reviewer[bot] (installation not yet known)", out)
-        self.assertIn("user for `conductor tick`, `train approve`, `train review`, `train step`, "
+        self.assertIn("user for `conductor escalate`, `conductor pause`, `conductor resume`, `conductor tick`, "
+                      "`train approve`, `train review`, `train step`, "
                       "`train substitute-review`", out)
         self.assertIn("apiBudget: API (app): no current reading", out)
         self.assertEqual(self.server.requests, [])

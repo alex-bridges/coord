@@ -1,10 +1,8 @@
 """coord: shared awareness for agents working in a GitHub repository.
 
-Everything here reads GitHub state and computes a picture from it. The only
-writes are ordinary GitHub comments carrying a machine marker (see marker.py):
-claims, releases and messages. Nothing is locked and nothing is stored outside
-GitHub except a short-lived local cache (and, in app mode, the GitHub App's tokens:
-apptoken.py).
+The board reads GitHub state. Claims, releases and messages use comments with a
+machine marker. The optional merge train manages branches, labels and CI runs,
+and the conductor keeps its work queue and run history on the host.
 """
 
 EXIT_OK = 0

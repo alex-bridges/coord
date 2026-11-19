@@ -30,7 +30,7 @@ def at(minutes: float) -> dt.datetime:
 
 def record(comment_id: int, minutes: float, payload, text: str = ""):
     return {"id": comment_id, "createdAt": snapshot.iso(at(minutes)), "url": f"u/{comment_id}", "text": text,
-            "payload": payload, "author": {"login": "o", "type": "User"}}
+            "payload": payload, "author": {"login": "example-owner", "type": "User"}}
 
 
 def runner(name: str, status: str, *labels: str):
@@ -135,6 +135,7 @@ class OutageWindowTests(unittest.TestCase):
 class ClaimStalenessTests(unittest.TestCase):
     def claims(self, agent, outage_hours):
         claim = record(10, -60 * 60, {"kind": "claim", "issue": 5, "agent": agent, "branch": "b"})
+        claim["on"] = 5
         windows = outage.windows([record(11, -40 * 60, {"kind": "outage", "event": "start", "harness": "claude",
                                                         "until": snapshot.iso(at(-40 * 60 + outage_hours * 60))})])
         return snapshot.resolve_claims([claim], {"issues": {5: {"state": "OPEN"}}, "branches": {}}, [], NOW, windows)
@@ -171,6 +172,12 @@ class LeaseTests(unittest.TestCase):
         self.assertEqual([h["agent"] for h in hosts], ["conductor@Future:c", "conductor@Real:c"])
         self.assertEqual([h["leader"] for h in hosts], [False, True])
         self.assertEqual([h["reviewRuns"] for h in hosts], [[], [snapshot.iso(at(-5))]])
+
+    def test_configured_operator_controls_an_organization_repository(self):
+        beat = self.beat(1, "conductor@A:c", -1)
+        self.assertTrue(lease.hosts([beat], NOW, "org/tools")[0]["leader"])
+        beat["author"] = {"login": "org", "type": "Organization"}
+        self.assertEqual(lease.hosts([beat], NOW, "org/tools"), [])
 
     def test_a_malformed_beat_is_not_alive(self):
         bad = record(1, 0, {"kind": "conductor", "event": "beat", "agent": "conductor@A:c", "beat": "now"})
@@ -426,8 +433,7 @@ class FakeGitHub:
         if comment_id is None:
             self.next_id += 1
             comment_id = self.next_id
-        payload = marker.decode(body) or {}
-        author = {"login": "o", "type": "User"} if payload.get("kind") == "conductor" else {"login": "example-owner"}
+        author = {"login": "example-owner", "type": "User"}
         return {"id": comment_id, "created_at": snapshot.iso(at(minutes)), "html_url": f"c/{comment_id}", "body": body,
                 "issue_url": "https://api/repos/o/r/issues/900", "user": author}
 
@@ -539,6 +545,126 @@ class WatcherTests(unittest.TestCase):
     def message(self, minutes, to="conductor@*", text="the train looks stuck"):
         self.gh.post(55, f"**From** `claude@E:x`\n\n{text}", {"kind": "msg", "v": 1, "agent": "claude@E:x", "to": [to]},
                      minutes)
+
+    def test_default_state_is_scoped_to_the_selected_repository(self):
+        env = {"XDG_STATE_HOME": self.tmp.name, "CONDUCTOR_HOME": self.tmp.name}
+        one = conductor.Config.from_env("team/red", env)
+        two = conductor.Config.from_env("other/red", env)
+        conductor.save_state(one, {"issue": 17})
+        self.assertEqual(conductor.load_state(two), {})
+        self.assertEqual(one.state_dir, conductor.Config.from_env("TEAM/Red", env).state_dir)
+        explicit = conductor.Config.from_env("team/red", dict(env, CONDUCTOR_STATE_DIR=self.tmp.name))
+        self.assertEqual(explicit.state_dir, self.tmp.name)
+
+    def test_dry_run_takeover_previews_mail_without_changing_the_real_cursor(self):
+        previous = snapshot.iso(at(-40))
+        self.gh.post(900, "old leader", {"kind": "conductor", "v": 1, "event": "beat",
+                     "agent": "conductor@Old:c", "leader": True, "beat": previous, "seenThrough": previous}, -40)
+        self.message(-30, text="pending since the previous leader left")
+        local = snapshot.iso(at(-1))
+        cache.store_cursor(self.gh.repo, self.config.agent, local, [91])
+        lines = self.tick(0, dry_run=True)
+        self.assertTrue(any("pending since the previous leader left" in line for line in lines))
+        self.assertEqual(cache.load_cursor(self.gh.repo, self.config.agent), local)
+        self.assertEqual(cache.load_seen_ids(self.gh.repo, self.config.agent), [91])
+
+    def test_final_heartbeat_uses_completion_time_after_a_long_run(self):
+        self.tick(0)
+        self.message(1)
+        with mock.patch.object(snapshot, "now_utc", return_value=at(5)) as clock:
+            def long_run(*args):
+                clock.return_value = at(25)
+                return self.runner(*args)
+            watcher = conductor.Watcher(self.config, self.gh, now=at(5), runner=long_run, disk=lambda path: 100)
+            watcher.tick()
+        hosts = lease.hosts(conductor.coord_comments(self.gh.issue_comments), at(26), self.gh.repo)
+        self.assertEqual(hosts[0]["beat"], snapshot.iso(at(25)))
+        self.assertTrue(hosts[0]["leader"])
+
+    def test_issue_and_review_comments_with_the_same_id_stay_independent(self):
+        self.tick(0)
+        issue = self.gh.post(55, "held", {"kind": "train", "v": 1, "agent": "train@actions",
+                             "pr": 55, "event": "held", "to": ["conductor@*"]}, 1)
+        comment_id = issue["id"]
+        reply = self.gh.raw(marker.compose("review message", {"kind": "msg", "v": 1,
+                            "agent": "codex@X", "to": ["conductor@*"]}), 1, comment_id)
+        reply["pull_request_url"] = "https://api.github.com/repos/o/r/pulls/55"
+        original = self.gh.rest_paginated
+
+        def paginated(path):
+            return [reply] if "/pulls/comments?" in path else original(path)
+
+        self.gh.rest_paginated = paginated
+        self.tick(5, wake=False)
+        saved = conductor.load_state(self.config)["pendingInbox"]
+        self.assertFalse(saved[f"comment:{comment_id}"]["wake"])
+        self.assertTrue(saved[f"comment:{-comment_id}"]["wake"])
+        cache.store_cursor(self.gh.repo, self.config.agent, snapshot.iso(at(1)), [comment_id])
+        self.tick(10)
+        self.assertIn("review message", self.runs[0]["prompt"])
+        self.assertNotIn("[train] train@actions", self.runs[0]["prompt"])
+
+    def test_checkout_update_still_works_without_github_metadata_or_budget(self):
+        self.config.update_checkout = True
+        self.gh.clock_minutes = 0
+        for budget_left in (0, 1000):
+            with self.subTest(budget_left=budget_left), mock.patch.dict(os.environ, {"COORD_CONFIG": os.devnull}):
+                git_calls = []
+                def git(args):
+                    git_calls.append(args)
+                    return (1 if args[0] in ("fetch", "symbolic-ref") else 0, "")
+
+                watcher = conductor.Watcher(self.config, self.gh, now=NOW, git=git, disk=lambda _: 1.0)
+                with mock.patch.object(watcher, "budget_left", return_value=budget_left):
+                    lines = watcher.tick(wake=False)
+                self.assertIn(["fetch", "-q", "origin", "HEAD"], git_calls)
+                self.assertTrue(any("[disk-low]" in line for line in lines))
+                self.assertTrue(any("checkout update deferred" in line for line in lines))
+                self.assertNotIn(("GET", "repos/{repo}"), self.gh.calls)
+                if budget_left == 0:
+                    self.assertEqual(self.gh.calls, [])
+                else:
+                    self.assertTrue(self.gh.records("conductor", "beat"))
+
+    def test_ci_branch_lookup_failure_does_not_discard_a_read_message(self):
+        self.tick(0)
+        self.message(1)
+        with mock.patch.object(conductor.runtime, "default_branch", side_effect=conductor.GitHubError("unavailable")):
+            lines = self.tick(16)
+        self.assertTrue(any("could not read CI runs" in line for line in lines))
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+
+    def test_runners_permission_failure_does_not_starve_inbox_or_train(self):
+        self.tick(0)
+        self.message(1)
+        self.asleep()
+        original = self.gh.rest
+        def forbidden(path, *args, **kwargs):
+            if "/actions/runners?" in path:
+                raise conductor.GitHubError("HTTP 403: insufficient permissions")
+            return original(path, *args, **kwargs)
+        self.gh.rest = forbidden
+        lines = self.tick(16)
+        self.assertIn("the train looks stuck", self.runs[0]["prompt"])
+        self.assertTrue(any("could not read Actions runners" in line for line in lines))
+        self.assertEqual(self.gh.dispatches, [("merge-train.yml", "main", None)])
+        self.assertEqual(conductor.load_state(self.config)["lastSlow"], snapshot.iso(at(16)))
+
+    def test_escalation_at_daily_cap_waits_then_runs_repair_directly(self):
+        self.config.max_wakes_per_day = 1
+        self.tick(0)
+        self.message(1)
+        self.replies = [claude_result("ESCALATE: red build")]
+        self.tick(5)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL])
+        comment = self.gh.repo_comments[-1]
+        cache.store_cursor(self.gh.repo, self.config.agent, snapshot.iso(at(5)), [comment["id"]])
+        self.tick(10)
+        self.assertEqual(len(self.runs), 1)
+        self.tick(24 * 60 + 5)
+        self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL, conductor.REPAIR_MODEL])
+        self.assertIn("red build", self.runs[-1]["prompt"])
+        self.assertFalse(conductor.load_state(self.config)["pendingInbox"])
 
     def test_an_idle_tick_beats_and_wakes_nobody(self):
         self.tick(0)
@@ -1937,6 +2063,10 @@ class DurationTests(unittest.TestCase):
         self.assertEqual(conductor.parse_duration("2h"), dt.timedelta(hours=2))
         with self.assertRaises(ValueError):
             conductor.parse_duration("soon")
+        self.assertEqual(conductor.parse_duration("14d"), dt.timedelta(days=14))
+        for text in ["0m", "0.0001m", "337h", "9" * 400 + "d"]:
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "between"):
+                conductor.parse_duration(text)
 
 
 _EXAMPLE_CONFIG_PATH = None

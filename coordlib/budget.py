@@ -175,7 +175,9 @@ def record(repo: str, headers: Mapping[str, str], default_resource: str = "core"
     if found is None or os.environ.get("GITHUB_ACTIONS") == "true":
         return None
     resource, reading = found
-    with cache.budget_lock(repo, principal=principal):
+    with cache.budget_lock(repo, principal=principal) as acquired:
+        if not acquired:
+            return reading
         data = cache.load_principal(repo, principal)
         if is_app(principal):
             data[resource] = merge_window(data.get(resource), reading, reading["at"])
