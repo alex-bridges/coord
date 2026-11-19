@@ -4,7 +4,7 @@ Budgets are kept per PRINCIPAL, the account whose counter a call spends, not per
 (#1035):
 - `user`: Alex's counter. His `gh`, every agent's `gh`, coord outside app mode, and the
   Claude cloud proxy's token all spend it.
-- `app:<installation id>`: the inisa-sidechain GitHub App's installation, which coord
+- `app:<installation id>`: the repo's GitHub App installation, which coord
   uses in app mode (apptoken.py). Its hourly tokens are one budget, not several.
 - Actions (the train's GITHUB_TOKEN) is a third, and is not recorded here.
 

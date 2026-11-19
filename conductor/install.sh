@@ -2,44 +2,52 @@
 # Install (or remove) the conductor's watcher on this Mac: a launchd agent that runs
 # `coord conductor tick` every few minutes from a checkout kept at origin/main.
 #
-#   Tools/coord/conductor/install.sh              install or refresh
-#   Tools/coord/conductor/install.sh --uninstall  stop and remove the launchd agent
+#   conductor/install.sh --repo owner/name              install or refresh
+#   conductor/install.sh --repo owner/name --uninstall  stop and remove the launchd agent
 #
-# Options: --home DIR (the conductor's checkout; default ~/conductor/INISA, made as a
-# detached worktree of this repository), --interval SECONDS (default 300).
+# Options: --repo OWNER/NAME (required), --home DIR (the conductor's checkout; default
+# ~/conductor/NAME, cloned from the repository and kept detached at origin/main),
+# --interval SECONDS (default 300). coord runs from this script's own directory.
 # --no-wake installs model-free ticks and does not require Claude; --wake enables
 # model wakes. Refreshes preserve the installed choice; new installs enable wakes.
 # Every CI box runs one; the lease in coord makes exactly one of them the conductor.
-# See Docs/agent-coordination.md, "The conductor".
+# See README.md, "Conductor".
 set -euo pipefail
 
-LABEL="com.inisa.conductor"
-PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-LOG="$HOME/Library/Logs/inisa-conductor.log"
-HOME_DIR="$HOME/conductor/INISA"
+REPO=""
+HOME_DIR=""
 INTERVAL=300
 UNINSTALL=0
 WAKE_MODE=preserve
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --home|--interval)
+    --repo|--home|--interval)
       [ $# -ge 2 ] || { echo "install.sh: $1 needs a value" >&2; exit 1; }
-      if [ "$1" = --home ]; then HOME_DIR="$2"; else INTERVAL="$2"; fi
+      case "$1" in --repo) REPO="$2" ;; --home) HOME_DIR="$2" ;; *) INTERVAL="$2" ;; esac
       shift 2 ;;
     --no-wake) WAKE_MODE=no-wake; shift ;;
     --wake) WAKE_MODE=wake; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
-    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown option $1" >&2; exit 1 ;;
   esac
 done
+
+[[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "install.sh: --repo owner/name is required" >&2; exit 1; }
+REPO_NAME="${REPO#*/}"
+REPO_SLUG="${REPO//\//-}"
+LABEL="com.coord.conductor.$REPO_SLUG"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/coord-conductor-$REPO_SLUG.log"
+[ -n "$HOME_DIR" ] || HOME_DIR="$HOME/conductor/$REPO_NAME"
+COORD="$(cd "$(dirname "$0")/.." && pwd)/coord"
 
 DOMAIN="gui/$(id -u)"
 if [ "$UNINSTALL" = 1 ]; then
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
-  echo "removed $LABEL (the checkout at $HOME_DIR and the state in ~/.local/state/inisa-conductor are kept)"
+  echo "removed $LABEL (the checkout at $HOME_DIR and the conductor's state directory are kept)"
   exit 0
 fi
 
@@ -63,11 +71,11 @@ PY
 )"
 gh auth status >/dev/null 2>&1 || { echo "install.sh: gh is not authenticated" >&2; exit 1; }
 
-REPO="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+[ -x "$COORD" ] || [ -f "$COORD" ] || { echo "install.sh: cannot find coord next to this script ($COORD)" >&2; exit 1; }
 if [ ! -d "$HOME_DIR/.git" ] && [ ! -f "$HOME_DIR/.git" ]; then
   mkdir -p "$(dirname "$HOME_DIR")"
-  git -C "$REPO" fetch -q origin main
-  git -C "$REPO" worktree add -q --detach "$HOME_DIR" origin/main
+  gh repo clone "$REPO" "$HOME_DIR" -- -q
+  git -C "$HOME_DIR" checkout -q --detach origin/main
   echo "made the conductor's checkout: $HOME_DIR (detached at origin/main)"
 fi
 
@@ -91,19 +99,19 @@ echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --shor
 mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
 TMP_PLIST="$(mktemp "$PLIST.XXXXXX")"
 trap 'rm -f "$TMP_PLIST"' EXIT
-"$PY" - "$PLIST" "$TMP_PLIST" "$LABEL" "$PY" "$HOME_DIR" "$JOB_PATH" "$HOME" "$AGENT" "$INTERVAL" "$LOG" "$WAKE_MODE" <<'PY'
+"$PY" - "$PLIST" "$TMP_PLIST" "$LABEL" "$PY" "$HOME_DIR" "$JOB_PATH" "$HOME" "$AGENT" "$INTERVAL" "$LOG" "$WAKE_MODE" "$COORD" "$REPO" <<'PY'
 import os
 import pathlib
 import plistlib
 import shutil
 import sys
 
-old_path, new_path, label, python, checkout, path, home, agent, interval, log, mode = sys.argv[1:]
+old_path, new_path, label, python, checkout, path, home, agent, interval, log, mode, coord, repo = sys.argv[1:]
 old = pathlib.Path(old_path)
 installed = plistlib.loads(old.read_bytes()) if old.exists() else {}
 # Keep operator settings (including CONDUCTOR_WAKE/CONDUCTOR_TRAIN) on refresh.
 environment = dict(installed.get("EnvironmentVariables", {}))
-environment.update(PATH=path, HOME=home, COORD_AGENT=agent, CONDUCTOR_HOME=checkout)
+environment.update(PATH=path, HOME=home, COORD_AGENT=agent, CONDUCTOR_HOME=checkout, COORD_REPO=repo)
 if mode == "wake":
     # Validate the command selected by the candidate's preserved configuration,
     # without running it. Resolve relative paths from the job's working directory.
@@ -117,7 +125,7 @@ if mode == "wake":
     # A configured command name may live outside the other tools' directories.
     # Persist its resolved directory so launchd selects the same executable.
     environment["PATH"] = os.path.dirname(os.path.abspath(executable)) + os.pathsep + path
-arguments = [python, str(pathlib.Path(checkout) / "Tools/coord/coord"), "conductor", "tick"]
+arguments = [python, coord, "conductor", "tick"]
 if mode == "no-wake":
     arguments.append("--no-wake")
 candidate = {
@@ -155,4 +163,4 @@ mv "$TMP_PLIST" "$PLIST"
 
 launchctl bootstrap "$DOMAIN" "$PLIST"
 echo "installed $LABEL: every ${INTERVAL}s ($WAKE_MODE), log $LOG"
-echo "status: Tools/coord/coord conductor status   stop: $0 --uninstall"
+echo "status: coord conductor status   stop: $0 --uninstall"

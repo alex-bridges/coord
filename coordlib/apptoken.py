@@ -1,12 +1,12 @@
 """GitHub App installation tokens for coord's own calls on the Mac (#1035).
 
-The app `inisa-sidechain` is installed on example-owner/example-repo only. Its installation has
+The GitHub App named in the app config is installed on the one repository it names. Its installation has
 its own hourly budget, separate from Alex's user counter, so coord's reads and its
 operational writes (claims, messages, train records, CI dispatches) stop spending the
 budget Alex's `gh` and every agent share.
 
 **When app mode is on** (`detect`): the non-secret config exists
-(`~/.config/inisa-coord/github-app.json`, or COORD_APP_CONFIG), the command does not run
+(`~/.config/<state_dir_name>/github-app.json`, or COORD_APP_CONFIG), the command does not run
 in GitHub Actions (the train keeps GITHUB_TOKEN), COORD_APP is not `off`, GITHUB_API_URL
 is unset or https://api.github.com (app credentials go to GitHub only), and the
 repository is the one the app is installed on. Cloud sessions have no config, so they
@@ -18,14 +18,14 @@ identity for everything.
 - `ops`: what coord's operational writes need and nothing more (OPS_PERMISSIONS).
 
 **Minting** (`AppTokens._mint`): the private key is read from the login Keychain
-(service KEYCHAIN_SERVICE, account = the client id; the value is the base64 of the PEM)
+(service from config 'keychain_service', account = the client id; the value is the base64 of the PEM)
 with /usr/bin/security, and reaches /usr/bin/openssl through an inherited pipe
 (`/dev/fd/N`), never a file. openssl signs an RS256 JWT (iat = now - 60, exp = now +
 540, iss = the client id). The installation is found with GET /repos/{repo}/installation
 and the token minted with POST /app/installations/{id}/access_tokens, narrowed to the
 one repository and the kind's permissions. GitHub must grant exactly what was asked.
 
-**Cache**: one file per kind (`read.json`, `ops.json`) in ~/Library/Caches/inisa-coord
+**Cache**: one file per kind (`read.json`, `ops.json`) in ~/Library/Caches/<state_dir_name>
 (or COORD_TOKEN_CACHE_DIR), mode 0600, holding the token, its expiry, the installation
 id and the permissions. A token is reused while more than REUSE_MARGIN_SECONDS remain,
 and never when its permissions differ from its kind's. The cached path never runs
@@ -62,14 +62,22 @@ import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence
 
-from . import gh, review
+from . import cache, config, gh, review
 from .gh import GITHUB_API, AppAuthError, redact
 
 SWITCH_ENV = "COORD_APP"
 CONFIG_ENV = "COORD_APP_CONFIG"
 TOKEN_CACHE_ENV = "COORD_TOKEN_CACHE_DIR"
 SECURITY_ENV = "COORD_SECURITY_BIN"
-KEYCHAIN_SERVICE = "example-coord-github-app"
+
+
+def keychain_services() -> Sequence[str]:
+    """Keychain service names to try: config 'keychain_service', then (read-only) the
+    '<legacy state dir name>-github-app' of each legacy name."""
+    names = [config.get("keychain_service") or "coord-github-app"]
+    names += [f"{legacy}-github-app" for legacy in cache.legacy_state_dir_names()]
+    return tuple(dict.fromkeys(names))
+
 
 # Absolute paths, never looked up on PATH. The PEM goes INTO openssl, so whoever could
 # choose that binary could read the key: OPENSSL is never taken from the environment.
@@ -131,12 +139,22 @@ class Mode:
 
 
 def default_config_path() -> str:
-    return os.path.join(os.path.expanduser("~"), ".config", "inisa-coord", "github-app.json")
+    return os.path.join(os.path.expanduser("~"), ".config", cache.state_dir_name(), "github-app.json")
 
 
 def config_path(env: Optional[Dict[str, str]] = None) -> str:
     env = os.environ if env is None else env
-    return env.get(CONFIG_ENV) or default_config_path()
+    explicit = env.get(CONFIG_ENV)
+    if explicit:
+        return explicit
+    default = default_config_path()
+    if not os.path.exists(default):
+        # Read-only fallback to a config kept under a legacy state dir name.
+        for name in cache.legacy_state_dir_names():
+            legacy = os.path.join(os.path.expanduser("~"), ".config", name, "github-app.json")
+            if os.path.exists(legacy):
+                return legacy
+    return default
 
 
 def real_home() -> str:
@@ -149,12 +167,16 @@ def real_home() -> str:
 
 
 def real_default_config_path() -> str:
-    return os.path.join(real_home(), ".config", "inisa-coord", "github-app.json")
+    return os.path.join(real_home(), ".config", cache.state_dir_name(), "github-app.json")
 
 
 def _default_configs() -> Sequence[str]:
     """The default config under $HOME and under the real home (the same path unless HOME moved)."""
-    return tuple(dict.fromkeys((default_config_path(), real_default_config_path())))
+    paths = [default_config_path(), real_default_config_path()]
+    for name in cache.legacy_state_dir_names():
+        for home in (os.path.expanduser("~"), real_home()):
+            paths.append(os.path.join(home, ".config", name, "github-app.json"))
+    return tuple(dict.fromkeys(paths))
 
 
 def _is_default_config(path: str) -> bool:
@@ -214,7 +236,7 @@ def security_binary(env: Optional[Dict[str, str]] = None, client_id: Optional[st
 
 def token_cache_dir(env: Optional[Dict[str, str]] = None) -> str:
     env = os.environ if env is None else env
-    return env.get(TOKEN_CACHE_ENV) or os.path.join(os.path.expanduser("~"), "Library", "Caches", "inisa-coord")
+    return env.get(TOKEN_CACHE_ENV) or os.path.join(os.path.expanduser("~"), "Library", "Caches", cache.state_dir_name())
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -612,10 +634,15 @@ class AppTokens:
     def _private_key(self) -> bytes:
         """The PEM from the login Keychain. Only minting calls this."""
         binary = security_binary(client_id=self.config["client_id"])
-        command = [binary, "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", self.config["client_id"], "-w"]
+        services = list(keychain_services())
+        result = None
         try:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
-                                    timeout=SUBPROCESS_TIMEOUT_SECONDS)
+            for service in services:
+                command = [binary, "find-generic-password", "-s", service, "-a", self.config["client_id"], "-w"]
+                result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                        timeout=SUBPROCESS_TIMEOUT_SECONDS)
+                if result.returncode == 0:
+                    break
         except FileNotFoundError:
             raise AppAuthError(f"{binary} is not available (the app key lives in the macOS login Keychain)") from None
         except subprocess.TimeoutExpired:

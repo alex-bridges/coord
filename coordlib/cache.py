@@ -21,11 +21,27 @@ import tempfile
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
+from . import config
+
+
+def state_dir_name() -> str:
+    """The per-user state directory name (config 'state_dir_name', default 'coord')."""
+    return config.get("state_dir_name") or "coord"
+
+
+def legacy_state_dir_names() -> List[str]:
+    """Older names whose files are still read (never written): config 'legacy_state_dir_names'."""
+    return [name for name in (config.get("legacy_state_dir_names") or []) if name != state_dir_name()]
+
+
+def base_cache_dir(name: Optional[str] = None) -> str:
+    """COORD_CACHE_DIR, else $XDG_CACHE_HOME or ~/.cache joined with the state dir name."""
+    return os.environ.get("COORD_CACHE_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), name or state_dir_name())
+
 
 def cache_dir(repo: str) -> str:
-    base = os.environ.get("COORD_CACHE_DIR") or os.path.join(
-        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "inisa-coord"
-    )
+    base = base_cache_dir()
     return os.path.join(base, re.sub(r"[^A-Za-z0-9._-]", "_", repo))
 
 

@@ -1,4 +1,4 @@
-"""coord: shared awareness for agents working in example-owner/example-repo.
+"""coord: shared awareness for agents working in a GitHub repository.
 
 Everything here reads GitHub state and computes a picture from it. The only
 writes are ordinary GitHub comments carrying a machine marker (see marker.py):

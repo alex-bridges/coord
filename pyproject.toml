@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coord"
+version = "0.1.0"
+description = "Shared awareness for agents working in one GitHub repository: board, claims, messages, merge train."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+coord = "coordlib.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coordlib*"]

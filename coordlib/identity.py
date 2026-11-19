@@ -17,6 +17,8 @@ import tempfile
 import uuid
 from typing import Mapping, Optional
 
+from . import cache
+
 
 class IdentityError(RuntimeError):
     """A stable agent address could not be established."""
@@ -39,7 +41,7 @@ def detect_harness(env: Mapping[str, str], toplevel: str) -> str:
 
 
 def detect_host() -> str:
-    """The Mac's LocalHostName (Eidolon, Tycho) when available; hostname otherwise."""
+    """The Mac's LocalHostName when available; hostname otherwise."""
     try:
         name = subprocess.run(
             ["scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=2
@@ -87,7 +89,7 @@ def agent_id(env: Optional[Mapping[str, str]] = None, cwd: Optional[str] = None)
     if explicit:
         return explicit
     toplevel = git_toplevel(cwd)
-    # Codex worktrees often all end in /INISA; that basename is a label, not an id.
+    # Codex worktrees often share one basename; that basename is a label, not an id.
     # Normalize aliases before both naming and hashing the checkout.
     checkout = os.path.normcase(os.path.realpath(toplevel or cwd or os.getcwd()))
     worktree = os.path.basename(checkout) if toplevel else "nogit"
@@ -113,9 +115,11 @@ def container_id() -> str:
     Only a completely written file becomes visible at container-id. A contender
     reads the winner; an unavailable cache must never yield a one-command identity.
     """
-    base = os.environ.get("COORD_CACHE_DIR") or os.path.join(
-        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "inisa-coord")
+    base = cache.base_cache_dir()
     path = os.path.join(base, "container-id")
+    # Read-only fallback: an id published under a legacy state dir name stays the identity.
+    legacy_paths = [] if os.environ.get("COORD_CACHE_DIR") else [
+        os.path.join(cache.base_cache_dir(name), "container-id") for name in cache.legacy_state_dir_names()]
     message = "cannot read or persist a stable cloud identity; set COORD_AGENT or COORD_SESSION_ID"
 
     def read() -> str:
@@ -131,6 +135,14 @@ def container_id() -> str:
         pass
     except (OSError, UnicodeError):
         raise IdentityError(message) from None
+    for legacy in legacy_paths:
+        try:
+            with open(legacy, encoding="utf-8") as handle:
+                existing = handle.read().strip()
+            if existing:
+                return existing
+        except (OSError, UnicodeError):
+            continue
     temporary = None
     try:
         os.makedirs(base, exist_ok=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""coord: shared awareness for agents in example-owner/example-repo. See Docs/agent-coordination.md."""
+"""coord: shared awareness for agents working in one GitHub repository. See README.md."""
 
 import os
 import sys

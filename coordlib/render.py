@@ -224,7 +224,7 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
             lines.append(f"  {overlap['a']} and {overlap['b']}: {shown}")
         lines.append("")
 
-    lines.append("CI (Tycho runners)")
+    lines.append("CI")
     runs = snapshot["runs"]
     if not runs["running"] and not runs["queued"]:
         lines.append("  idle")
@@ -285,5 +285,5 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     for claim in open_claims[: max(0, limit - len(snapshot["prs"]))]:
         lines.append(f"  claim #{claim['issue']} {_brief_identity(claim['branch'])} "
                      f"[{_brief_identity(claim['agent'], agent=True)}]" + (" stale" if claim["stale"] else ""))
-    lines.append("  details: Tools/coord/coord board · messages: Tools/coord/coord inbox")
+    lines.append("  details: coord board · messages: coord inbox")
     return "\n".join(lines) + "\n"

@@ -1,12 +1,12 @@
 """GitHub access: the `gh` CLI when it is installed, plain HTTPS with a token when not.
 
 Every agent environment that can push already has `gh` authenticated or a token
-(GH_TOKEN/GITHUB_TOKEN: Actions jobs, containers). Tycho's runners do not all
+(GH_TOKEN/GITHUB_TOKEN: Actions jobs, containers). CI runners do not all
 have `gh`, so the HTTPS path is what the merge-train workflow uses there.
 
 Two identities (#1035):
 - **The app.** On a Mac with the app config, outside Actions and unless COORD_APP=off
-  (apptoken.detect), coord's own calls use the inisa-sidechain GitHub App: reads with a
+  (apptoken.detect), coord's own calls use the repo's GitHub App: reads with a
   read-only installation token, operational writes (claims, messages, train records,
   CI dispatches) with a narrow write token. Each call goes over HTTPS with the token set
   on that one request. GH_TOKEN is never exported, so `git push` and every other
@@ -36,9 +36,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import budget
+from . import budget, cache
 
-DEFAULT_REPO = "example-owner/example-repo"
 # The one place the app's JWT and tokens may go (apptoken.detect turns app mode off when
 # GITHUB_API_URL names anything else).
 GITHUB_API = "https://api.github.com"
@@ -122,7 +121,7 @@ def repo_from_remote_url(url: str) -> Optional[str]:
 
 
 def detect_repo(cwd: Optional[str] = None) -> str:
-    """COORD_REPO, else the origin remote of the current checkout, else the default.
+    """COORD_REPO, else the origin remote of the current checkout; GitHubError when neither names a repo.
 
     Parsing the remote costs no API call; `gh repo view` would.
     """
@@ -136,7 +135,12 @@ def detect_repo(cwd: Optional[str] = None) -> str:
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         url = ""
-    return repo_from_remote_url(url) or DEFAULT_REPO
+    repo = repo_from_remote_url(url)
+    if not repo:
+        raise GitHubError(
+            "cannot tell which GitHub repository this is: no origin remote of a github.com repo "
+            "here and COORD_REPO is not set (run from a checkout, or pass --repo owner/name)")
+    return repo
 
 
 def _next_link(header: Optional[str]) -> Optional[str]:
@@ -197,7 +201,7 @@ def app_request(method: str, url: str, credential: str, data: Optional[bytes] = 
 def _api_headers(request: urllib.request.Request, data: Optional[bytes]) -> None:
     request.add_header("Accept", "application/vnd.github+json")
     request.add_header("X-GitHub-Api-Version", "2022-11-28")
-    request.add_header("User-Agent", "inisa-coord")
+    request.add_header("User-Agent", cache.state_dir_name())
     if data is not None:
         request.add_header("Content-Type", "application/json")
 

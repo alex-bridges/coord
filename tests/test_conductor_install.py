@@ -29,7 +29,7 @@ class ConductorInstallTests(unittest.TestCase):
         self.bin.mkdir()
         self.checkout.mkdir()
         (self.checkout / ".git").write_text("fake checkout")
-        self.plist = self.home / "Library/LaunchAgents/com.inisa.conductor.plist"
+        self.plist = self.home / "Library/LaunchAgents/com.coord.conductor.owner-repo.plist"
         self.events = self.root / "events.jsonl"
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin),
                         FAKE_EVENTS=str(self.events), FAKE_CHECKOUT=str(self.checkout))
@@ -62,8 +62,12 @@ class ConductorInstallTests(unittest.TestCase):
         for name in ("git", "gh", "launchctl", "scutil"):
             (self.bin / name).symlink_to(fake_tool)
         self.fake_tool = fake_tool
-        coord = self.checkout / "Tools/coord/coord"
-        coord.parent.mkdir(parents=True)
+        # The installer runs the coord that sits beside its own conductor/ directory.
+        self.coord_root = self.root / "coord-src"
+        (self.coord_root / "conductor").mkdir(parents=True)
+        self.installer = self.coord_root / "conductor" / "install.sh"
+        shutil.copy(INSTALLER, self.installer)
+        coord = self.coord_root / "coord"
         coord.write_text(textwrap.dedent("""\
             import json, os, sys
             event = {'tool': 'tick', 'args': sys.argv[1:], 'cwd': os.getcwd(),
@@ -76,7 +80,7 @@ class ConductorInstallTests(unittest.TestCase):
             """))
 
     def run_install(self, *args):
-        return subprocess.run(["/bin/bash", str(INSTALLER), "--home", str(self.checkout), *args],
+        return subprocess.run(["/bin/bash", str(self.installer), "--repo", "owner/repo", "--home", str(self.checkout), *args],
                               cwd=self.root, env=self.env, text=True, capture_output=True, timeout=10)
 
     def read_events(self):
@@ -107,10 +111,13 @@ class ConductorInstallTests(unittest.TestCase):
         self.assertEqual("--no-wake" in candidate["ProgramArguments"], no_wake)
         self.assertEqual(candidate["WorkingDirectory"], str(self.checkout))
         self.assertEqual(candidate["ProgramArguments"][:4],
-                         [str(self.bin / "python3"), str(self.checkout / "Tools/coord/coord"), "conductor", "tick"])
+                         [str(self.bin / "python3"), str(self.coord_root / "coord"), "conductor", "tick"])
         environment = candidate["EnvironmentVariables"]
         self.assertEqual(environment["HOME"], str(self.home))
         self.assertEqual(environment["CONDUCTOR_HOME"], str(self.checkout))
+        self.assertEqual(environment["COORD_REPO"], "owner/repo")
+        self.assertEqual(candidate["Label"], "com.coord.conductor.owner-repo")
+        self.assertTrue(candidate["StandardOutPath"].endswith("coord-conductor-owner-repo.log"))
         self.assertEqual(environment["COORD_AGENT"], "conductor@FakeHost:conductor")
         self.assertNotEqual(environment["PATH"], "/old/bin")
         events = self.read_events()
@@ -168,7 +175,7 @@ class ConductorInstallTests(unittest.TestCase):
         self.existing(CONDUCTOR_CLAUDE="/missing/claude-is-unneeded-with-no-wake")
         before = self.read_plist()["EnvironmentVariables"]
         candidate = self.assert_installed(self.run_install(), True)
-        managed = {"HOME", "PATH", "COORD_AGENT", "CONDUCTOR_HOME"}
+        managed = {"HOME", "PATH", "COORD_AGENT", "CONDUCTOR_HOME", "COORD_REPO"}
         for key, value in before.items():
             if key not in managed:
                 self.assertEqual(candidate["EnvironmentVariables"][key], value)
@@ -242,6 +249,15 @@ class ConductorInstallTests(unittest.TestCase):
                 self.assertEqual(self.plist.read_bytes(), before)
                 self.assertFalse(any(event["tool"] == "launchctl" for event in self.read_events()))
                 self.assertEqual(list(self.plist.parent.glob("*.plist.*")), [])
+
+    def test_repo_is_required_and_validated(self):
+        for args in ((), ("--repo", "not-a-repo")):
+            with self.subTest(args=args):
+                result = subprocess.run(["/bin/bash", str(self.installer), "--home", str(self.checkout), *args],
+                                        cwd=self.root, env=self.env, text=True, capture_output=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--repo owner/name is required", result.stderr)
+        self.assertFalse(any(event["tool"] in ("tick", "launchctl") for event in self.read_events()))
 
     def test_malformed_plist_and_invalid_interval_leave_job_untouched(self):
         self.existing()
