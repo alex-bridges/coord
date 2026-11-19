@@ -565,10 +565,10 @@ class HookTests(BudgetTestCase):
         for directory in ("/usr/bin", "/bin"):
             for name in os.listdir(directory):
                 target = os.path.join(bin_dir, name)
-                if name != "gh" and not os.path.exists(target):
+                if name != "gh" and not os.path.lexists(target):
                     os.symlink(os.path.join(directory, name), target)
         python = shutil.which("python3")
-        if python and not os.path.exists(os.path.join(bin_dir, "python3")):
+        if python and not os.path.lexists(os.path.join(bin_dir, "python3")):
             os.symlink(python, os.path.join(bin_dir, "python3"))
         # No gh and a token: the HTTPS transport, which has nothing to probe; the API URL
         # is a closed local port, so any call would fail rather than reach GitHub.
