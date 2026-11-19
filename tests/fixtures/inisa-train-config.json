@@ -1,0 +1,23 @@
+{
+  "default_branch": "main",
+  "owner_login": "alex-bridges",
+  "owner_mention": "@alex-bridges",
+  "ci_workflow": "ci.yml",
+  "train_workflow": "merge-train.yml",
+  "notify_workflow": "notify-owner.yml",
+  "verdict_job": "CI verdict",
+  "wake_job": "Wake the merge train",
+  "ci_lanes": "changed",
+  "owner_only_paths": [
+    ".claude/agents/",
+    ".claude/settings.json",
+    ".claude/hooks/",
+    "Tools/coord/",
+    "CLAUDE.md",
+    "Tools/ci-runner/"
+  ],
+  "lane_classifier": {
+    "script": ".github/scripts/select-ci-lanes.py",
+    "rules": ".github/ci-lanes.json"
+  }
+}

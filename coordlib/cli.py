@@ -16,7 +16,7 @@ import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import apptoken, budget, cache, doctor, identity, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
+from . import apptoken, budget, cache, config, doctor, identity, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
 from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
 
 # Which identity each command uses in app mode. Every command not in USER_IDENTITY runs on
@@ -256,9 +256,9 @@ def find_or_create_mailbox(gh: GitHub) -> int:
     issue = gh.rest("repos/{repo}/issues", method="POST", body={
         "title": "Agent mailbox (coord)",
         "body": (
-            "Broadcast and direct messages between agents, posted by `Tools/coord/coord send`.\n\n"
+            "Broadcast and direct messages between agents, posted by `coord send`.\n\n"
             "Each comment ends with a `<!-- coord:v1 ... -->` marker naming the sending agent and "
-            "the recipients. Read yours with `Tools/coord/coord inbox`. Keep this issue open; "
+            "the recipients. Read yours with `coord inbox`. Keep this issue open; "
             "`coord` finds it by the `coord:mailbox` label."
         ),
         "labels": [snapshot.MAILBOX_LABEL],
@@ -347,7 +347,7 @@ def _issue_claims(gh: GitHub, number: int, prs: List[Dict[str, Any]]) -> List[Di
 def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     branch = args.branch or identity.git_branch()
-    if not branch or branch in ("main", "master"):
+    if not branch or branch in ("main", "master", config.get("default_branch")):
         raise UsageError("name the branch you will work on with --branch (you are not on a feature branch)")
     targets = snapshot.fetch_targets(gh, [args.issue], [])
     target = targets["issues"].get(args.issue)
@@ -433,10 +433,24 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
-def _commits_ahead_of_main() -> Optional[int]:
-    """Commits HEAD has that origin/main lacks; None when git cannot say."""
+def _local_default_branch() -> str:
+    """The default branch from config, else origin's HEAD as the clone recorded it, else main."""
+    configured = config.get("default_branch")
+    if configured:
+        return configured
     try:
-        done = subprocess.run(["git", "rev-list", "--count", "origin/main..HEAD"],
+        done = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return "main"
+    ref = done.stdout.strip()
+    return ref[len("origin/"):] if done.returncode == 0 and ref.startswith("origin/") else "main"
+
+
+def _commits_ahead_of_main() -> Optional[int]:
+    """Commits HEAD has that origin/<default branch> lacks; None when git cannot say."""
+    try:
+        done = subprocess.run(["git", "rev-list", "--count", f"origin/{_local_default_branch()}..HEAD"],
                               capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -673,19 +687,20 @@ def cmd_ci(args: argparse.Namespace, gh: GitHub) -> int:
         raise UsageError("no branch: pass --ref")
     if ref.startswith(train.BATCH_PREFIX):
         raise UsageError(f"{ref} is a merge-train batch; only the train dispatches its gate")
-    gh.dispatch_workflow("ci.yml", ref, {"lanes": args.lanes})
+    workflow = train.ci_workflow()
+    gh.dispatch_workflow(workflow, ref, train.ci_dispatch_inputs(args.lanes))
     low = getattr(gh, "budget_low", None)
     if low:
         # The dispatch is the point and one call; reading the queue back would be several.
-        print(f"requested ci.yml lanes={args.lanes} on {ref}. Not reading the Tycho queue back: {low}.")
+        print(f"requested {workflow} lanes={args.lanes} on {ref}. Not reading the CI queue back: {low}.")
         return EXIT_OK
     cache.invalidate_snapshot(gh.repo)
     try:
         runs = snapshot.fetch_runs(gh)
     except AppAuthError as error:
-        print(f"requested ci.yml lanes={args.lanes} on {ref}. Not reading the Tycho queue back: {app_words(error)}.")
+        print(f"requested {workflow} lanes={args.lanes} on {ref}. Not reading the CI queue back: {app_words(error)}.")
         return EXIT_OK
-    print(f"requested ci.yml lanes={args.lanes} on {ref}. Tycho now: "
+    print(f"requested {workflow} lanes={args.lanes} on {ref}. CI now: "
           f"{len(runs['running'])} running, {len(runs['queued'])} queued (yours is among the queued once GitHub registers it).")
     return EXIT_OK
 
@@ -697,7 +712,8 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     if pr is None:
         print(f"coord: #{args.pr} is not an open pull request", file=sys.stderr)
         return EXIT_NOT_FOUND
-    verdict, reason = train.eligibility(pr, workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+    verdict, reason = train.eligibility(pr, workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN,
+                                        base_branch=train.default_branch(gh))
     if verdict == train.DROP:
         print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
         return EXIT_CONFLICT
@@ -716,7 +732,7 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
     cache.invalidate_snapshot(gh.repo)
     try:
-        gh.dispatch_workflow("merge-train.yml", "main")
+        gh.dispatch_workflow(train.train_workflow(), train.default_branch(gh))
     except AppAuthError:
         raise
     except GitHubError:
@@ -817,6 +833,8 @@ def train_batches(gh: GitHub) -> List[Dict[str, Any]]:
     # No trailing slash: the cloud proxy rejects `…/heads/train/` ("Request path could not
     # be canonicalized", probe 4). Without it GitHub also matches `training…`, so keep
     # only refs under refs/heads/train/.
+    if not train.is_configured():
+        return []  # no merge train here: no batches
     refs = gh.rest("repos/{repo}/git/matching-refs/heads/" + train.BATCH_PREFIX.rstrip("/")) or []
     refs = [ref for ref in refs if ref.get("ref", "").startswith("refs/heads/" + train.BATCH_PREFIX)]
     batches = []
@@ -1171,10 +1189,10 @@ def cmd_conductor_escalate(args: argparse.Namespace, gh: GitHub) -> int:
 def parser() -> argparse.ArgumentParser:
     top = ArgumentParser(
         prog="coord",
-        description="Shared awareness for agents in example-owner/example-repo: what is in flight, who works on what, "
+        description="Shared awareness for agents working in a GitHub repository: what is in flight, who works on what, "
                     "CI and train state, and messages. Reads GitHub; writes only marked comments.",
     )
-    top.add_argument("--repo", help="owner/name (default: origin remote, else example-owner/example-repo)")
+    top.add_argument("--repo", help="owner/name (default: the origin remote)")
     sub = top.add_subparsers(dest="command", required=True)
 
     board = sub.add_parser("board", help="everything in flight: PRs, claims, overlaps, CI queue, train, inbox count")
@@ -1228,7 +1246,7 @@ def parser() -> argparse.ArgumentParser:
     inbox.set_defaults(func=cmd_inbox)
 
     ci = sub.add_parser("ci", help="queue CI lanes on a branch (heavy lanes do not run on PR pushes)")
-    ci.add_argument("lanes", help="comma-separated ci.yml lanes: all, mk4, mk4-debug, mk4-release, apps, ...")
+    ci.add_argument("lanes", help="comma-separated lanes for the CI workflow's `lanes` input (names are the repo's own)")
     ci.add_argument("--ref", help="default: the current branch")
     ci.set_defaults(func=cmd_ci)
 
@@ -1378,6 +1396,8 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
         gh = gh.as_user()
     gh.cache_read = command in budget.CACHE_READS  # type: ignore[attr-defined]
     try:
+        if command.startswith("train") and not train.is_configured():
+            raise train.NotConfigured(train.NOT_CONFIGURED_MESSAGE)
         refused = gate(args, gh)
         if refused is not None:
             return refused
@@ -1388,6 +1408,8 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
         return report_error(args, EXIT_BACKEND, "authentication", str(error))
     except UsageError as error:
         return report_error(args, EXIT_USAGE, "usage", str(error))
+    except train.NotConfigured as error:
+        return report_error(args, EXIT_USAGE, "configuration", str(error))
     except identity.IdentityError as error:
         return report_error(args, EXIT_USAGE, "identity", str(error))
     except train_metrics.BudgetConfigurationError as error:

@@ -20,6 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from coordlib import cli, identity, marker, render, review, snapshot  # noqa: E402
 from coordlib.gh import GitHub, GitHubError, repo_from_remote_url  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
 
 NOW = dt.datetime(2026, 9, 24, 17, 0, tzinfo=dt.timezone.utc)
 BOT = "chatgpt-codex-connector[bot]"
@@ -45,6 +48,7 @@ def isolate_from_rest_env() -> None:
 
 
 def setUpModule():
+    inisa_config.use()
     isolate_from_rest_env()
 
 

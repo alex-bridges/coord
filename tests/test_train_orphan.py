@@ -8,6 +8,13 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from coordlib import marker, train, train_step  # noqa: E402
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+
+
+def setUpModule():
+    inisa_config.use()
 
 HEAD = "a" * 40
 NOW = dt.datetime(2026, 9, 28, 4, 0, tzinfo=dt.timezone.utc)

@@ -42,7 +42,7 @@ def train_record(record: Dict[str, Any]) -> bool:
 
 def recent_runs(gh: GitHub, since: dt.datetime) -> Tuple[List[Dict[str, Any]], bool]:
     pages = gh.rest_paginated(
-        f"repos/{{repo}}/actions/workflows/{train.CI_WORKFLOW}/runs?event=workflow_dispatch"
+        f"repos/{{repo}}/actions/workflows/{train.ci_workflow()}/runs?event=workflow_dispatch"
         f"&created={urllib.parse.quote('>=' + snapshot.iso(since), safe='')}&per_page=100")
     listed = [run for page in pages for run in page.get("workflow_runs", [])]
     # This filtered GitHub endpoint caps results at 1,000 even with pagination.

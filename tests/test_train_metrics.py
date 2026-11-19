@@ -13,6 +13,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from coordlib import marker, snapshot, train, train_metrics as metrics
 from coordlib.gh import GitHubError
+import inisa_config  # noqa: E402
+
+inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+
+
+def setUpModule():
+    inisa_config.use()
 
 NOW = dt.datetime(2026, 9, 27, 14, tzinfo=dt.timezone.utc)
 SINCE = NOW - dt.timedelta(hours=24)
