@@ -176,7 +176,7 @@ POISON_JOBS = 3
 ISSUE_TITLE = "Conductor (coord): heartbeats, pauses, escalations and outages"
 ISSUE_BODY = (
     "Records of the coord conductor (`coordlib/conductor.py` in coord). Each CI box's watcher keeps ONE "
-    "heartbeat comment here and edits it every tick; pauses, escalations to Alex and harness outages are "
+    "heartbeat comment here and edits it every tick; pauses, escalations to the owner and harness outages are "
     "ordinary comments. Every comment ends with a `<!-- coord:v1 ... -->` marker. `coord board` shows the "
     "result. Keep this issue open; coord finds it by the `coord:conductor` label."
 )
@@ -253,13 +253,13 @@ class Config:
 
 
 def default_state_dir(env: Dict[str, str]) -> str:
-    """$XDG_STATE_HOME/<state_dir_name>-conductor; a legacy directory (`inisa-conductor`, or
-    the legacy names with `-coord` read as `-conductor`) is kept while the new one does not exist."""
+    """$XDG_STATE_HOME/<state_dir_name>-conductor; configured `legacy_state_dir_names`
+    (with `-coord` read as `-conductor`) are kept while the new one does not exist."""
     root = env.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
     names = state_dir_names()
     current = os.path.join(root, names[0] + "-conductor")
     legacy = [n[:-len("-coord")] + "-conductor" if n.endswith("-coord") else n + "-conductor" for n in names[1:]]
-    for name in legacy + ["inisa-conductor"]:
+    for name in legacy:
         candidate = os.path.join(root, name)
         if not os.path.exists(current) and os.path.isdir(candidate):
             return candidate
@@ -435,7 +435,7 @@ def routing_reasons(variables: Dict[str, str], runners: List[Dict[str, Any]], st
             out.append(reason(f"routing:{key}:{first}", "routing",
                               f"repository variable {name} routes jobs to the runner label `{value}`, which no online "
                               f"runner has carried since {first}: those jobs queue, or go to GitHub-hosted runners. "
-                              "Only Alex changes repository variables and runner registration"))
+                              "Only the owner changes repository variables and runner registration"))
     for key in list(missing):
         if key not in seen:
             missing.pop(key)
@@ -724,11 +724,11 @@ def post_record(gh: GitHub, issue: int, text: str, payload: Dict[str, Any]) -> D
     return gh.rest(f"repos/{{repo}}/issues/{issue}/comments", method="POST", body={"body": marker.compose(text, payload)})
 
 
-def notify_alex(gh: GitHub, issue: int, text: str) -> bool:
-    """Put `text` on Alex's phone: the repo's notify workflow (config `notify_workflow`; none
-    configured, nothing is sent) @-mentions him as
-    github-actions[bot] (agents post as Alex, and GitHub does not notify you of your own
-    comments). Best effort: the board has the escalation either way."""
+def notify_owner(gh: GitHub, issue: int, text: str) -> bool:
+    """Notify the owner via the repo's notify workflow (config `notify_workflow`; none
+    configured, nothing is sent) which @-mentions them as github-actions[bot] (agents
+    may post as the owner, and GitHub does not notify you of your own comments). Best
+    effort: the board has the escalation either way."""
     workflow = config.get("notify_workflow")
     if not workflow:
         return False
@@ -737,6 +737,9 @@ def notify_alex(gh: GitHub, issue: int, text: str) -> bool:
         return True
     except GitHubError:
         return False
+
+
+notify_alex = notify_owner  # compatibility alias
 
 
 def outage_text(until: dt.datetime, reason_text: str, agent: str) -> str:
@@ -1163,13 +1166,13 @@ class Watcher:
             reading = can_read and self.issue_comments is not None
             self.review_step(windows, down, pause, wake, extra,
                              "a conductor wake ran this tick" if woke else
-                             "" if reading else "Alex's API budget is under the read floor, or this tick's read failed")
+                             "" if reading else "the user's API budget is under the read floor, or this tick's read failed")
         elif not github_ok and self.state.get("wasLeader"):
-            # Below the hard floor nothing is read with Alex's budget, so leadership cannot be
+            # Below the hard floor nothing is read with the user's budget, so leadership cannot be
             # checked; the host that led last goes on posting finished reviews with the app's
-            # own token (Codex on #1049). No new run starts until leadership is known again.
+            # own token. No new run starts until leadership is known again.
             self.review_step(windows, down, pause, wake, extra,
-                             "Alex's API budget is under the hard floor (leadership unknown)", user_ok=False)
+                             "the user's API budget is under the hard floor (leadership unknown)", user_ok=False)
         if github_ok and can_write:
             try:
                 runs = self.state.get("reviewRuns") or []
@@ -1387,14 +1390,14 @@ class Watcher:
             told[keys[item["key"]]] = iso(self.now)
 
     def escalate_text(self, text: str, handoff_keys: Optional[List[str]] = None) -> None:
-        self.say(f"escalating to Alex: {_clip(text, 120)}")
+        self.say(f"escalating to owner: {_clip(text, 120)}")
         payload = {"kind": "conductor", "v": 1, "event": "escalate", "agent": self.config.agent}
         if handoff_keys:
             payload["handoffKeys"] = handoff_keys
         posted = post_record(self.gh, self.issue, text,
                              payload)
         link = (posted or {}).get("html_url") or ""
-        if not notify_alex(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
+        if not notify_owner(self.gh, self.issue, f"The conductor needs you: {_clip(text, 800)} {link}"):
             self.say("could not dispatch the notify workflow; the escalation is on the board only")
 
     def tampered(self) -> str:

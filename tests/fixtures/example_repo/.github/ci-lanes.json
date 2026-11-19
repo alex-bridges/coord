@@ -1,0 +1,97 @@
+{
+  "about": [
+    "Example CI lane rules for tests/fixtures/example_repo/.github/scripts/select-ci-lanes.py.",
+    "Pattern syntax is GitHub's path-filter syntax: `*` stays inside one path segment, `**` crosses",
+    "segments, a leading `!` excludes, and the LAST matching pattern decides."
+  ],
+  "everything": {
+    "why": "A change to the CI graph itself, its lane rules, or its scripts must exercise every lane.",
+    "paths": [
+      ".github/workflows/ci.yml",
+      ".github/ci-lanes.json",
+      ".github/scripts/**",
+      ".github/actions/**"
+    ]
+  },
+  "lanes": {
+    "docs": {
+      "why": "Documentation, tooling and CI self-tests. Light lane.",
+      "paths": [
+        "Docs/**",
+        ".claude/skills/**",
+        "Packages/CoreKit/Docs/**",
+        "Tools/coord/**",
+        "Packages/CoreKit/Sources/**",
+        "Packages/CoreKit/Tests/**",
+        "Packages/CoreKit/Package.swift",
+        ".github/**"
+      ]
+    },
+    "core": {
+      "why": "Core package debug and release gates.",
+      "paths": [
+        "Packages/CoreKit/Package.swift",
+        "Packages/CoreKit/Package.resolved",
+        "Packages/CoreKit/Sources/**",
+        "!Packages/CoreKit/Sources/**/*.docc/**",
+        "Packages/CoreKit/Tests/**",
+        "Packages/CoreKit/scripts/**"
+      ]
+    },
+    "ui": {
+      "why": "Shared UI design system tests.",
+      "paths": [
+        "Packages/DesignKit/Package.swift",
+        "Packages/DesignKit/Sources/**",
+        "!Packages/DesignKit/Sources/**/*.docc/**",
+        "Packages/DesignKit/Tests/**"
+      ]
+    },
+    "apps": {
+      "why": "Native app builds.",
+      "paths": [
+        "Apps/**",
+        "Packages/**",
+        "!**/*.md",
+        "!**/*.docc/**",
+        "!Apps/AppAlpha/Marketing/**",
+        "!Packages/*/Docs/**"
+      ]
+    },
+    "android": {
+      "why": "Android tests and APK build.",
+      "paths": [
+        "Packages/CoreKit/Package.swift",
+        "Packages/CoreKit/Sources/**",
+        "!Packages/CoreKit/Sources/**/*.docc/**",
+        "Packages/CoreKit/Tests/**",
+        ".github/workflows/core-android.yml"
+      ]
+    },
+    "wasm": {
+      "why": "WebAssembly smoke and offline checks.",
+      "paths": [
+        "Packages/CoreKit/Package.swift",
+        "Packages/CoreKit/Sources/**",
+        "!Packages/CoreKit/Sources/**/*.docc/**",
+        "Packages/CoreKit/Web/**"
+      ]
+    },
+    "plugins": {
+      "why": "Plugin package release build.",
+      "paths": [
+        "Packages/CorePlugins/**",
+        "Packages/CoreKit/Package.swift",
+        "Packages/CoreKit/Sources/**",
+        "!Packages/CoreKit/Sources/**/*.docc/**"
+      ]
+    },
+    "screenshots": {
+      "why": "App screenshot campaign. Light lane.",
+      "paths": [
+        "Apps/AppAlpha/Marketing/Screenshots/**",
+        "Apps/AppAlpha/QA/SimulatorUI/**"
+      ]
+    }
+  }
+}

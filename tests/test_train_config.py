@@ -10,8 +10,8 @@ from unittest import mock
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import inisa_config  # noqa: E402
-from coordlib import EXIT_USAGE, cli, config, train  # noqa: E402
+import example_config  # noqa: E402
+from coordlib import EXIT_USAGE, cli, config, review, snapshot, train  # noqa: E402
 from coordlib.gh import GitHub  # noqa: E402
 
 
@@ -38,7 +38,7 @@ class UnconfiguredRepoTests(unittest.TestCase):
 
     def tearDown(self):
         self.dir.cleanup()
-        inisa_config.use()
+        example_config.use()
 
     def test_nothing_is_guarded_and_no_one_is_mentioned_by_default(self):
         self.assertEqual(train.owner_only_paths(), ())
@@ -90,16 +90,67 @@ class UnconfiguredRepoTests(unittest.TestCase):
 
 class ConfiguredRepoTests(unittest.TestCase):
     def setUp(self):
-        inisa_config.use()
+        example_config.use()
 
-    def test_the_inisa_values_reproduce_the_old_constants(self):
+    def test_the_example_values_populate_the_lazy_constants(self):
         self.assertEqual(train.ci_workflow(), "ci.yml")
         self.assertEqual(train.train_workflow(), "merge-train.yml")
         self.assertEqual(train.ci_dispatch_inputs(), {"lanes": "changed"})
         self.assertEqual(train.final_jobs(), ("CI verdict", "Wake the merge train"))
-        self.assertEqual(train.owner_mention(), "@alex-bridges")
+        self.assertEqual(train.owner_mention(), "@example-owner")
         self.assertIn("Tools/coord/", train.owner_only_paths())
         self.assertEqual(train.default_branch(), "main")
+        self.assertEqual(train.needs_owner_label(), "needs-owner")
+        self.assertEqual(train.owner_approved_label(), "owner-approved")
+        self.assertEqual(review.ignored_check_prefixes(), ("LegacyCI | ",))
+
+
+class ConfigurableLabelsAndChecksTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "config.json")
+        os.environ["COORD_CONFIG"] = self.path
+        config._cache.clear()
+
+    def tearDown(self):
+        self.dir.cleanup()
+        example_config.use()
+
+    def test_defaults_have_generic_labels_and_no_ignored_check_prefixes(self):
+        self.assertEqual(train.needs_owner_label(), "needs-owner")
+        self.assertEqual(train.owner_approved_label(), "owner-approved")
+        self.assertEqual(review.ignored_check_prefixes(), ())
+        self.assertFalse(review.is_ignored_check("LegacyCI | Test"))
+
+    def test_custom_labels_and_ignored_check_prefixes_are_honoured(self):
+        with open(self.path, "w") as handle:
+            json.dump({
+                "default_branch": "main",
+                "needs_owner_label": "needs-lead",
+                "owner_approved_label": "lead-approved",
+                "ignored_check_prefixes": ["ExternalCI | "],
+            }, handle)
+        config._cache.clear()
+        self.assertIn("needs-lead", train.LABELS)
+        self.assertIn("lead-approved", train.LABELS)
+        self.assertTrue(review.is_ignored_check("ExternalCI | Build"))
+        self.assertFalse(review.is_ignored_check("GitHub Actions"))
+        head = "a" * 40
+        pr = {"number": 1, "base": "main", "head": head, "files": [], "labels": ["train", "needs-lead"],
+              "codex": {"approved": True}, "ci": {"failing": []}}
+        self.assertEqual(train.assess(pr)[:2], (train.HOLD, train.HOLD_NEEDS_OWNER))
+        approved = dict(pr, labels=["train", "needs-lead", "lead-approved"], ownerApprovedHead=head)
+        self.assertEqual(train.assess(approved)[0], train.READY)
+
+    def test_both_owner_approve_and_legacy_alex_approve_markers_populate_head(self):
+        head = "b" * 40
+        for kind in ("owner-approve", "alex-approve"):
+            prs = [{"number": 7}]
+            comments = [{"on": 7, "author": {"login": "acme", "type": "User"},
+                         "payload": {"kind": kind, "v": 1, "agent": "a", "pr": 7, "head": head}}]
+            snapshot.attach_head_records(prs, comments, "acme/widgets")
+            self.assertEqual(prs[0]["ownerApprovedHead"], head, kind)
+            self.assertEqual(prs[0]["alexApprovedHead"], head, kind)
 
 
 if __name__ == "__main__":

@@ -13,13 +13,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from coordlib import marker, snapshot, train, train_metrics as metrics
 from coordlib.gh import GitHubError
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 NOW = dt.datetime(2026, 9, 27, 14, tzinfo=dt.timezone.utc)
 SINCE = NOW - dt.timedelta(hours=24)
@@ -32,7 +32,7 @@ def plan(batch="train/one", kind=train.LIGHT):
     return {"version": 1, "batch": batch, "base": BASE, "batchCap": 3,
             "builtAt": snapshot.iso(NOW - dt.timedelta(minutes=5)),
             "members": [{"pr": 1, "head": HEAD, "queuedAt": snapshot.iso(NOW - dt.timedelta(minutes=15))}],
-            "lanePlan": {"class": kind, "lanes": ["docs"] if kind == train.LIGHT else ["mk4-release"],
+            "lanePlan": {"class": kind, "lanes": ["docs"] if kind == train.LIGHT else ["core-release"],
                          "source": "main", "at": BASE}}
 
 
@@ -197,14 +197,14 @@ class ReceiptAndReportTests(unittest.TestCase):
 
     def test_report_joins_receipts_and_exposes_real_cost_and_event_counts(self):
         records = [event("testing"), event("split"), event("split"),
-                   event("held", head=HEAD, hold="needs-alex"), event("held", head=HEAD, hold="needs-alex"),
+                   event("held", head=HEAD, hold="needs-owner"), event("held", head=HEAD, hold="needs-owner"),
                    event("merged")]
         gh = FakeGitHub([run(count=2)], records, {1: [job(1, 0, 10), job(2, 15, 20)]})
         report = metrics.report(gh, now=NOW)
         self.assertEqual((report["schema"], report["status"], report["apiCalls"]), (1, "ok", 3))
         total = report["totals"]
         self.assertEqual((total["measuredRunnerMinutes"], total["retryAttempts"], total["splitBatches"], total["mergedPRs"]), (15, 1, 1, 1))
-        self.assertEqual(total["holdNoticesByClass"], {"needs-alex": 1})
+        self.assertEqual(total["holdNoticesByClass"], {"needs-owner": 1})
         self.assertAlmostEqual(total["meanBatchOccupancy"], 1 / 3)
         self.assertEqual(total["meanQueueWaitMinutes"], 10)
         self.assertTrue(any("filter=all" in path for path in gh.paths), "failed attempts are included")

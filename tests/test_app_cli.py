@@ -21,13 +21,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from apptestkit import INSTALLATION, REPO, AppTestCase, FakeResponse  # noqa: E402
 from coordlib import EXIT_BACKEND, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE, apptoken, budget, cache, cli, conductor  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow names, state dir and weekly reset are config
+example_config.use()  # example-repo workflow names, state dir and weekly reset are config
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 
 USER_TOKEN = "user-token-that-must-never-be-sent"
@@ -107,7 +107,7 @@ class RoutingTests(AppCliTestCase):
         "conductor escalate": (["conductor", "escalate", "look at #101"],
                                {("POST", "repos/o/r/labels"), ("POST", "repos/o/r/issues"),
                                 ("POST", "repos/o/r/issues/900/comments"),
-                                ("POST", "repos/o/r/actions/workflows/notify-alex.yml/dispatches")}),
+                                ("POST", "repos/o/r/actions/workflows/notify-owner.yml/dispatches")}),
     }
 
     def test_operational_writes_use_the_ops_token_and_reads_the_read_token(self):
@@ -126,7 +126,7 @@ class RoutingTests(AppCliTestCase):
 
     def test_attestations_stay_on_alex(self):
         self.keychain("key")
-        for argv, label in ((["train", "approve", "101", "--head", "a" * 40, "--note", "Alex said so"], "alex-approved"),
+        for argv, label in ((["train", "approve", "101", "--head", "a" * 40, "--note", "Alex said so"], "owner-approved"),
                             (["train", "review", "101", "--head", "a" * 40, "--by", "agy@h:gemini", "--note", "n"], "reviewed"),
                             (["train", "substitute-review", "101", "--head", "a" * 40, "--note", "reviewed by X"], "reviewed")):
             with self.subTest(argv=argv[:2]):
@@ -222,8 +222,8 @@ class RoutingTests(AppCliTestCase):
     def test_whoami_names_the_identity_and_mints_nothing(self):
         code, out, _ = self.main(["whoami"])
         self.assertEqual(code, EXIT_OK)
-        self.assertIn("githubIdentity: inisa-sidechain[bot] (installation not yet known)", out)
-        self.assertIn("Alex for `conductor tick`, `train approve`, `train review`, `train step`, "
+        self.assertIn("githubIdentity: example-reviewer[bot] (installation not yet known)", out)
+        self.assertIn("user for `conductor tick`, `train approve`, `train review`, `train step`, "
                       "`train substitute-review`", out)
         self.assertIn("apiBudget: API (app): no current reading", out)
         self.assertEqual(self.server.requests, [])
@@ -253,7 +253,7 @@ class ModeOffTests(AppCliTestCase):
                 self.assertEqual(self.server.requests, [])
                 self.assertEqual(self.security_calls(), [])
                 code, out, _ = self.main(["whoami"])
-                self.assertIn("githubIdentity: Alex's gh/keyring login", out)
+                self.assertIn("githubIdentity: user's gh/keyring login", out)
                 for name in ("GITHUB_ACTIONS", "COORD_APP"):
                     os.environ.pop(name, None)
                 os.environ["COORD_APP_CONFIG"] = self.config_path
@@ -309,7 +309,7 @@ class NoFallbackTests(AppCliTestCase):
                     self.assertEqual(code, EXIT_BACKEND, err)
                     self.assertIn("GitHub App token unavailable", err)
                     self.assertIn("COORD_APP=off", err)
-                    self.assertIn("nothing was sent as Alex", err)
+                    self.assertIn("nothing was sent as user", err)
                     self.assert_nothing_as_alex()
 
     def test_the_board_serves_its_cache_with_a_notice(self):
@@ -435,7 +435,7 @@ class TrainStatusBatchTests(AppCliTestCase):
                         self.assertIn("1. #101", out)
                     self.assertEqual(self.runner.calls, [], "the gh runner was never called")
                     self.assertEqual([r for r in self.server.requests if r["bearer"] == USER_TOKEN], [],
-                                     "nothing was sent as Alex")
+                                     "nothing was sent as user")
 
 
 class ConfigPathTests(AppCliTestCase):
@@ -740,7 +740,7 @@ class TokenStatusTests(AppCliTestCase):
         code, out, _ = self.main(["token", "status"])
         self.assertIn("app mode: off (GITHUB_API_URL is http://127.0.0.1:9, not https://api.github.com; "
                       "app credentials go to GitHub only)", out)
-        self.assertIn("githubIdentity: Alex's gh/keyring login", self.main(["whoami"])[1])
+        self.assertIn("githubIdentity: user's gh/keyring login", self.main(["whoami"])[1])
 
     def test_status_shows_a_held_mint_failure(self):
         self.keychain("missing")

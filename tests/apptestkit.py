@@ -49,7 +49,7 @@ REPO = "o/r"
 CLIENT_ID = "Iv23test0client"
 INSTALLATION = 1000001
 API = "https://api.github.com"  # the fake urlopen answers for it; nothing leaves the process
-TOKEN_LENGTH = 390  # observed 2026-09-25; nothing may rely on it
+TOKEN_LENGTH = 390  # representative GitHub token length; nothing may rely on it
 
 OPENSSLS = [path for path in ("/usr/bin/openssl", "/opt/homebrew/bin/openssl") if os.path.exists(path)]
 
@@ -326,7 +326,7 @@ class AppTestCase(unittest.TestCase):
         self.config_path = os.path.join(self.root, "config", "github-app.json")
         self.token_dir = os.path.join(self.root, "tokens")
         self.write_config({"app_id": 100001, "client_id": CLIENT_ID, "repo": REPO,
-                           "app_login": "inisa-sidechain[bot]"})
+                           "app_login": "example-reviewer[bot]"})
         os.environ.update({
             "COORD_APP_CONFIG": self.config_path, "COORD_TOKEN_CACHE_DIR": self.token_dir,
             "COORD_CACHE_DIR": os.path.join(self.root, "cache"), "COORD_REPO": REPO,

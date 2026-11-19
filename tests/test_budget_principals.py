@@ -322,7 +322,7 @@ class FakeApp:
     def __init__(self, server, installation=INSTALLATION):
         self.server = server
         self.installation = installation
-        self.config = {"app_login": "inisa-sidechain[bot]", "client_id": "c", "repo": REPO}
+        self.config = {"app_login": "example-reviewer[bot]", "client_id": "c", "repo": REPO}
         self.issued = {}
 
     def token(self, kind):
@@ -419,9 +419,9 @@ class HeaderTests(PrincipalTestCase):
         clock = budget.clock(now + 1800)
         self.assertEqual(budget.header_words(REPO), f"API: 4000 left (resets {clock})")
         self.assertEqual(budget.header_words(REPO, principal=APP),
-                         f"API (app): 4950 left (resets {clock}) · Alex: 4000 left (resets {clock})")
+                         f"API (app): 4950 left (resets {clock}) · user: 4000 left (resets {clock})")
         self.assertEqual(budget.header_words(REPO, principal=None),
-                         f"API (app): no current reading · Alex: 4000 left (resets {clock})")
+                         f"API (app): no current reading · user: 4000 left (resets {clock})")
 
 
 if __name__ == "__main__":

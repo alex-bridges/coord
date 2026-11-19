@@ -1,0 +1,3 @@
+#!/bin/bash
+# Test shim: runs this repository's coord from the example fixture checkout.
+exec "$(cd "$(dirname "$0")" && pwd)/../../../../../coord" "$@"

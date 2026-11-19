@@ -12,7 +12,7 @@ Two identities (#1035):
   on that one request. GH_TOKEN is never exported, so `git push` and every other
   process stay on Alex's login. A token that cannot be had raises AppAuthError, and
   nothing falls back to Alex's token.
-- **Alex's login** (alex-bridges) for everything else: all of coord when app mode is off
+- **User login** for everything else: all of coord when app mode is off
   (cloud sessions, other machines, COORD_APP=off), and, in app mode, the attestations
   (`train approve`, `train review` and its old name `train substitute-review`) and a
   hand-run `train step` (`GitHub.as_user`).

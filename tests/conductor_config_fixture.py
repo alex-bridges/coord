@@ -1,7 +1,7 @@
-"""INISA's per-repo config for the conductor, reviewer, outage and snapshot tests.
+"""Example per-repo config for the conductor, reviewer, outage and snapshot tests.
 
-Each test module calls `use_inisa_config` from setUpModule and `restore` from tearDownModule,
-so COORD_CONFIG points at a temp file holding the values INISA configures.
+Each test module calls `use_example_config` from setUpModule and `restore` from tearDownModule,
+so COORD_CONFIG points at a temp file holding the configured values.
 """
 
 import json
@@ -14,23 +14,27 @@ sys_path = os.path.join(HERE, "..")
 if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
-INISA_CONFIG = {
+EXAMPLE_CONFIG = {
     "default_branch": "main",
-    "owner_login": "alex-bridges",
-    "reviewer_bot_login": "inisa-sidechain[bot]",
-    "reviewer_trigger": "@inisa-sidechain review",
+    "owner_login": "example-owner",
+    "owner_mention": "@example-owner",
+    "needs_owner_label": "needs-owner",
+    "owner_approved_label": "owner-approved",
+    "reviewer_bot_login": "example-reviewer[bot]",
+    "reviewer_trigger": "@example-reviewer review",
     "ci_workflow": "ci.yml",
     "train_workflow": "merge-train.yml",
-    "notify_workflow": "notify-alex.yml",
+    "notify_workflow": "notify-owner.yml",
+    "ignored_check_prefixes": ["LegacyCI | "],
     "owner_only_paths": [".claude/agents/", ".claude/settings.json", ".claude/hooks/", "Tools/coord/", "CLAUDE.md",
                          "Tools/ci-runner/"],
-    "runner_variables": ["MK4_RUNNER_MACOS", "MK4_RUNNER_MACOS_LIGHT", "MK4_RUNNER_CONTROL", "MK4_RUNNER_LINUX_ARM64"],
-    "runner_control_variable": "MK4_RUNNER_CONTROL",
+    "runner_variables": ["CI_RUNNER_MACOS", "CI_RUNNER_MACOS_LIGHT", "CI_RUNNER_CONTROL", "CI_RUNNER_LINUX_ARM64"],
+    "runner_control_variable": "CI_RUNNER_CONTROL",
     "conductor": {"agent_file": ".claude/agents/conductor.md", "instructions_file": "CLAUDE.md",
                   "guard_hook": ".claude/hooks/conductor-guard.py", "deny": []},
     "reviewer": {"agent_file": ".claude/agents/reviewer.md", "guard_hook": ".claude/hooks/conductor-guard.py"},
     "claude_weekly_reset": "Thu 12:00 America/New_York",
-    "state_dir_name": "inisa-coord",
+    "state_dir_name": "example-coord",
     "keychain_service": "example-coord-github-app",
     "legacy_state_dir_names": [],
 }
@@ -38,11 +42,11 @@ INISA_CONFIG = {
 _saved = {}
 
 
-def use_inisa_config(extra=None):
-    """Point COORD_CONFIG at a temp file with INISA's values (merged with `extra`)."""
+def use_example_config(extra=None):
+    """Point COORD_CONFIG at a temp file with example values (merged with `extra`)."""
     from coordlib import config
     handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
-    json.dump(dict(INISA_CONFIG, **(extra or {})), handle)
+    json.dump(dict(EXAMPLE_CONFIG, **(extra or {})), handle)
     handle.close()
     _saved[handle.name] = os.environ.get("COORD_CONFIG")
     os.environ["COORD_CONFIG"] = handle.name

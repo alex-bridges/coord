@@ -30,13 +30,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_train as base  # noqa: E402
 from coordlib import snapshot, train, train_step  # noqa: E402
 from test_coord import BOT, NOW, codex_summary, isolate_from_rest_env, reaction  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
     isolate_from_rest_env()  # the fakes answer GraphQL; see test_coord.REST_ENV (#1085)
 
 
@@ -92,7 +92,7 @@ class RuleTests(unittest.TestCase):
         # An ALEX_ONLY_PATHS change, approved at the head by Alex, still waits for Codex
         # unless a clean review of the head is recorded; with one it goes ahead.
         approved = dict(self.pr(files=["Tools/coord/coordlib/train.py"]),
-                        labels=["train", "alex-approved"], alexApprovedHead=HEAD)
+                        labels=["train", "owner-approved"], alexApprovedHead=HEAD)
         self.assertEqual(train.assess(approved)[:2], (train.HOLD, train.HOLD_NO_REVIEW))
         self.assertEqual(train.assess(dict(approved, reviewedHead=HEAD)), (train.READY, "", "ready"))
 
@@ -102,9 +102,9 @@ class RuleTests(unittest.TestCase):
         reviewed = self.pr(reviewedHead=HEAD)
         holds = [
             ("an unverified GitHub conflict report", dict(reviewed, mergeable="CONFLICTING"), train.HOLD_MERGE_CHECK),
-            ("needs-alex, not approved", dict(reviewed, labels=["train", "needs-alex"]), train.HOLD_NEEDS_ALEX),
+            ("needs-alex, not approved", dict(reviewed, labels=["train", "needs-owner"]), train.HOLD_NEEDS_ALEX),
             ("needs-alex, an older head approved",
-             dict(reviewed, labels=["train", "needs-alex", "alex-approved"], alexApprovedHead=OLDER),
+             dict(reviewed, labels=["train", "needs-owner", "owner-approved"], alexApprovedHead=OLDER),
              train.HOLD_NEEDS_ALEX),
             ("an Alex-only path, not approved", dict(reviewed, files=["Tools/coord/coordlib/train.py"]),
              train.HOLD_NEEDS_ALEX),

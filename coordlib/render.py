@@ -170,7 +170,7 @@ def conductor_lines(snapshot: Dict[str, Any], now: dt.datetime) -> List[str]:
         pause = info["pause"]
         lines.append(f"  PAUSED until {pause['until']} by {pause['agent']}" + (f": {_clip(pause['note'], 80)}" if pause.get("note") else ""))
     for escalation in info.get("escalations") or []:
-        lines.append(f"  needs Alex ({ago(escalation['at'], now)} ago): {_clip(escalation['text'], 90)} {escalation['url']}")
+        lines.append(f"  needs owner ({ago(escalation['at'], now)} ago): {_clip(escalation['text'], 90)} {escalation['url']}")
     return lines
 
 

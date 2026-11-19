@@ -41,7 +41,7 @@ from .gh import AppAuthError, GitHub, GitHubError, NotFound
 
 BOT_NAME = "github-actions[bot]"
 # The Actions train's agent id (COORD_AGENT in merge-train.yml). A step run by hand
-# posts as alex-bridges under its own id.
+# posts as the user's login under its own id.
 TRAIN_AGENT = "train@actions"
 BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
 DISPATCH_GRACE_MINUTES = 10
@@ -93,7 +93,7 @@ class Step:
         self.sleep = sleep
         # Who posts `@codex review` (#1101): the step's own identity unless told otherwise.
         self.requester = requester or gh
-        # The inisa-sidechain app's installation token (train.WORKFLOW_TOKEN_ENV), or None.
+        # The GitHub App's installation token (train.WORKFLOW_TOKEN_ENV), or None.
         # It moves refs only for a batch that changes .github/workflows/: comments, labels
         # and CI dispatches stay on the Actions token (so `is_gate_run` still recognises
         # the train's own gate runs), and ordinary batches never touch it.
@@ -350,7 +350,10 @@ class Step:
                 pr["overtakenBy"] = None  # a new queue entry: its own one overtake
             elif payload.get("kind") in snapshot.HEAD_RECORDS:
                 if snapshot.trusted_attestation(snapshot.comment_author(comment), self.gh.repo):
-                    pr[snapshot.HEAD_RECORDS[payload["kind"]]] = payload.get("head")
+                    field = snapshot.HEAD_RECORDS[payload["kind"]]
+                    pr[field] = payload.get("head")
+                    if field == "ownerApprovedHead":
+                        pr["alexApprovedHead"] = payload.get("head")
             elif payload.get("event") == "held" and self.own_record(comment, payload):
                 held.add((payload.get("head"), payload.get("hold")))
             elif payload.get("event") == train.OVERTAKEN_EVENT and self.own_record(comment, payload):
@@ -369,7 +372,7 @@ class Step:
         """Whether a `kind: train` record counts as already said (a held notice, a receipt).
 
         (a) The Actions train's record: the marker names TRAIN_AGENT AND GitHub lists
-            github-actions[bot] as its author. Every agent posts as alex-bridges (or, in
+            github-actions[bot] as its author. Every agent posts as the user (or, in
             app mode, as the GitHub App) and can write any marker, so neither half alone
             proves anything (review of #1037).
         (b) On a hand run only (this step's agent is not TRAIN_AGENT): the run's own
@@ -1012,7 +1015,7 @@ class Step:
         self.git.out("push", "--quiet", "origin", f"{tip}:refs/heads/{name}",
                      env=self.app_push_env() if workflow_batch else None)
         if workflow_batch:
-            self.note(f"{name}: it changes .github/workflows/; pushed with the inisa-sidechain app token")
+            self.note(f"{name}: it changes .github/workflows/; pushed with the GitHub App token")
         try:
             self.gh.dispatch_workflow(train.ci_workflow(), name, train.ci_dispatch_inputs())
         except GitHubError as error:

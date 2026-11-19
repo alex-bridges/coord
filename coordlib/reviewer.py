@@ -964,9 +964,9 @@ class Reviews:
         head = posting["head"]
         if posting["counts"] and not posting.get("recorded"):
             if not getattr(self, "user_ok", True):
-                # Alex's budget is under the hard floor: his identity posts nothing until it
-                # recovers; the app-backed steps wait with it (Codex on #1049).
-                self.w.say(f"review of #{request['pr']} waits to record its clean review: Alex's API budget is low")
+                # The user's budget is under the hard floor: user identity posts nothing until it
+                # recovers; the app-backed steps wait with it.
+                self.w.say(f"review of #{request['pr']} waits to record its clean review: the user's API budget is low")
                 return
             self.attest(request, head, f"**Clean review** of head `{head[:9]}` by `{self.agent()}` "
                                        f"({request['model']}), requested in {request.get('url') or 'a comment'}. "
@@ -985,7 +985,7 @@ class Reviews:
         link = posting["url"]
         if posting.get("revoke") and not posting.get("revoked"):
             if not getattr(self, "user_ok", True):
-                self.w.say(f"review of #{request['pr']} waits to withdraw a clean review: Alex's API budget is low")
+                self.w.say(f"review of #{request['pr']} waits to withdraw a clean review: the user's API budget is low")
                 return  # the blocking review is out and holds the head meanwhile
             self.attest(request, head, f"**Clean review withdrawn** for head `{head[:9]}`: a later review "
                                        f"requested changes ({link}). A new push needs a new review.",

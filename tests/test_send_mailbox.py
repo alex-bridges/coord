@@ -12,13 +12,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from coordlib import EXIT_OK, EXIT_USAGE, cache, cli, marker, snapshot
 from coordlib.gh import GitHub
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 MAILBOX = 1001
 PLAIN = 1070

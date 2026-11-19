@@ -39,8 +39,8 @@ message naming the key.
 ## 4. Configure: `.coord/config.json`
 
 Commit it at the repository root (`COORD_CONFIG` names another path). All keys are listed with
-their defaults in the Configuration section of agent-coordination.md and in
-`coordlib/config.py`.
+their defaults in the Configuration section of [agent-coordination.md](agent-coordination.md)
+and in `coordlib/config.py`.
 
 Minimal, enabling the merge train:
 
@@ -51,13 +51,15 @@ Minimal, enabling the merge train:
 }
 ```
 
-Full, INISA-style (illustrative values; the paths and names are yours to choose):
+Full example (illustrative values; paths and names are yours to choose):
 
 ```json
 {
   "default_branch": "main",
   "owner_login": "your-login",
   "owner_mention": "@your-login",
+  "needs_owner_label": "needs-owner",
+  "owner_approved_label": "owner-approved",
   "reviewer_bot_login": "my-bot[bot]",
   "reviewer_trigger": "@my-bot review",
   "ci_workflow": "ci.yml",
@@ -66,6 +68,7 @@ Full, INISA-style (illustrative values; the paths and names are yours to choose)
   "verdict_job": "CI verdict",
   "wake_job": "Wake the merge train",
   "ci_lanes": "changed",
+  "ignored_check_prefixes": [],
   "owner_only_paths": [".coord/", "CLAUDE.md", ".claude/", ".github/scripts/"],
   "lane_classifier": {"script": "scripts/select-ci-lanes.py", "rules": "scripts/ci-lanes.json"},
   "runner_variables": ["RUNNER_MACOS", "RUNNER_LINUX"],
@@ -100,19 +103,14 @@ time, for example with `gh label create <name> --color <hex> --description "<tex
 | `train` | `0e8a16` | queued for the merge train (`coord train add`) |
 | `train:solo` | `fbca04` | the train tests this PR on its own (it was in a red batch) |
 | `reviewed` | `c2e0c6` | informational; a clean review is recorded |
-| `needs-alex` | `b60205` | a carve-out; held until the owner approves its head |
-| `alex-approved` | `0e8a16` | the owner approved a head (`coord train approve`) |
-
-The `needs-alex` and `alex-approved` names are fixed in the code whatever `owner_login` is.
+| `needs-owner` | `b60205` | a carve-out; held until the owner approves its head (configurable via `needs_owner_label`) |
+| `owner-approved` | `0e8a16` | the owner approved a head (`coord train approve`, configurable via `owner_approved_label`) |
 
 ## 6. The merge-train workflow
 
-The train advances one step per workflow run (see Merge train in agent-coordination.md). Your
-`train_workflow` file checks out the target repository with push access and a pinned copy of coord
-next to it, then runs one step. `COORD_REPO_TOKEN` is a repository secret holding a read-only token
-(a fine-grained PAT with Contents: read on `alex-bridges/coord`) so the private repository can be
-cloned; omit `token` if coord's repository is public to your runner. Pin `COORD_SHA` to a reviewed
-commit and bump it deliberately.
+The train advances one step per workflow run (see Merge train in [agent-coordination.md](agent-coordination.md)).
+Your `train_workflow` file checks out the target repository with push access and a pinned copy of
+`coord` next to it, then runs one step. Pin `COORD_SHA` to a reviewed commit and bump it deliberately.
 
 ```yaml
 name: Merge train
@@ -155,7 +153,6 @@ jobs:
         with:
           repository: alex-bridges/coord
           ref: ${{ env.COORD_SHA }}
-          token: ${{ secrets.COORD_REPO_TOKEN }}
           path: coord-tool
       - name: Advance the train by one step
         working-directory: target        # so coord finds .coord/config.json
@@ -164,15 +161,15 @@ jobs:
 
 Notes. The default mode is a dry run (batches are tested, nothing merges); set the repository
 variable `COORD_TRAIN_MODE=live` when the dry runs look right. `actions/checkout` leaves its
-credential in the clone, which is what lets the step push `train/*` branches and fast-forward main
+credential in the clone, which is what lets the step push `train/*` branches and fast-forward `main`
 with the Actions token; if your default branch is protected so that token cannot push, see Limits
-under Merge train in agent-coordination.md. In your CI workflow, add a job that dispatches or
-wakes this workflow after each batch (INISA's is `wake-train`), because runs started by the
-Actions token do not trigger `workflow_run`.
+under Merge train in [agent-coordination.md](agent-coordination.md). In your CI workflow, add a job
+that dispatches or wakes this workflow after each batch, because runs started by the Actions token
+do not trigger `workflow_run`.
 
 ## 7. The conductor (optional, macOS)
 
-The conductor is a launchd agent that wakes an agent only when there is work. On the CI Mac:
+The conductor is a launchd agent that wakes an agent only when there is work. On your CI Mac:
 
 ```sh
 git clone https://github.com/alex-bridges/coord ~/tools/coord
@@ -180,7 +177,7 @@ git clone https://github.com/alex-bridges/coord ~/tools/coord
 ```
 
 It installs `com.coord.conductor.<owner>-<name>` (log `~/Library/Logs/coord-conductor-<owner>-<name>.log`),
-keeps a checkout of the repository detached at origin/main (default `~/conductor/<name>`), and runs
+keeps a checkout of the repository detached at `origin/main` (default `~/conductor/<name>`), and runs
 `coord conductor tick` from it every `--interval` seconds. `--no-wake` installs model-free ticks;
 `--uninstall` removes the agent. It needs `git`, `python3` and `gh` on PATH. Set the `conductor`
 keys (prompt, instructions file, guard hook) in the repository's `.coord/config.json` first; every CI

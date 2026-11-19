@@ -2,7 +2,7 @@
 
 Sources, and why each is trustworthy without anyone maintaining it:
 - open PRs (GraphQL): branch, head, files, CI, Codex state, train label — GitHub's own state
-- Actions runs (REST): what Tycho is running and what waits — GitHub's own state
+- Actions runs (REST): what CI runners are running and what waits — GitHub's own state
 - coord comments (REST, repo-wide since a window): claims, releases, messages —
   the only hand-written records, and each is an ordinary comment
 - claimed issues and branches (GraphQL, one aliased query): whether a claim's
@@ -280,7 +280,7 @@ def complete_pr_node(gh: GitHub, node: Dict[str, Any]) -> None:
     number = node["number"]
     incomplete: List[str] = []
     # GitHub can return a null node inside a connection with no `errors` entry (a null
-    # reaction crashed the train step on 2026-09-30, run 10000098). Dropping it leaves
+    # reaction crashed a train step on a real PR). Dropping it leaves
     # the connection shorter than its totalCount, so the completions below re-read that
     # list over REST. Where a null cannot be re-read or its position matters (the head
     # commit, a review thread or its starter), the PR is held on partial data instead.
@@ -427,7 +427,7 @@ def fetch_runs(gh: GitHub) -> Dict[str, List[Dict[str, Any]]]:
         return item
 
     # A run's own status says "queued" while any of its jobs still wait, even when
-    # others are running on Tycho (observed 2026-09-24: main's run, 2 h old, one job
+    # others are running on CI (observed when a 2 h old run on main had one job
     # in progress, listed as queued). So read the jobs of every active run and call a
     # run running when one of its jobs is.
     out_running, out_queued = [], []
@@ -516,7 +516,7 @@ def fetch_targets_graphql(gh: GitHub, numbers: List[int], branches: List[str]) -
 # used only where GraphQL is unavailable.
 #
 # The two need not see the same checks: on #1026's head (probed 2026-09-25) GraphQL's
-# statusCheckRollup listed 18 contexts and left out the CoreKit Plugins suite, a
+# statusCheckRollup listed 18 contexts and left out a plugin test suite, a
 # `workflow_dispatch` run, whose check runs REST's commits/{sha}/check-runs does list.
 
 
@@ -1011,10 +1011,15 @@ def overlaps(prs: List[Dict[str, Any]], claims: List[Dict[str, Any]]) -> List[Di
 #
 # Anyone who can comment can write a marker, bots included: the Codex connector, whose
 # text a PR can steer, and coord's own app, which has issues:write. So an attestation
-# counts only when GitHub names a trusted user as its comment's author (Codex P1 on
-# #1054). The attestation commands always post as Alex (cli.ATTESTATIONS never run on
-# the app), so every real record passes.
-HEAD_RECORDS = {"review-clean": "reviewedHead", "review-substitute": "reviewedHead", "alex-approve": "alexApprovedHead"}
+# counts only when GitHub names a trusted user as its comment's author. The attestation
+# commands always post on the user identity (cli.ATTESTATIONS never run on the app), so
+# every real record passes.
+HEAD_RECORDS = {
+    "review-clean": "reviewedHead",
+    "review-substitute": "reviewedHead",
+    "owner-approve": "ownerApprovedHead",
+    "alex-approve": "ownerApprovedHead",
+}
 # Shown for the reviewer app's login when config `reviewer_bot_login` is unset: not a valid
 # GitHub login, so nothing (not even an author with no login) ever equals it.
 NO_SIDECHAIN_LOGIN = "<reviewer-not-configured>"
@@ -1069,9 +1074,9 @@ def trusted_attestation(author: Optional[Dict[str, Any]], repo: str) -> bool:
 
 
 def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]], repo: str) -> None:
-    """Set each PR's `reviewedHead` and `alexApprovedHead`: the head its newest
-    review-clean or review-substitute / alex-approve comment names, counting only
-    comments a trusted user posted (trusted_attestation) on the PR the record names,
+    """Set each PR's `reviewedHead` and `ownerApprovedHead`: the head its newest
+    review-clean/review-substitute or owner-approve/alex-approve comment names, counting
+    only comments a trusted user posted (trusted_attestation) on the PR the record names,
     as train_step.train_added does."""
     latest: Dict[Tuple[int, str], str] = {}
     for comment in comments:  # oldest first
@@ -1090,6 +1095,7 @@ def attach_head_records(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]
     for pr in prs:
         for field in set(HEAD_RECORDS.values()):
             pr[field] = latest.get((pr["number"], field))
+        pr["alexApprovedHead"] = pr["ownerApprovedHead"]
         pr["sidechainBlockedHeads"] = sorted(blocked.get(pr["number"], ()))
 
 
@@ -1116,17 +1122,18 @@ def train_queue(prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> Li
     return queue
 
 
-# The label that says a PR has a record, and the record's kind (any of them).
-LABELLED_RECORDS = {
-    train.REVIEWED_LABEL: ("review-clean", "review-substitute"),
-    train.ALEX_APPROVED_LABEL: ("alex-approve",),
-    TRAIN_LABEL: ("train-add",),
-}
+def labelled_records() -> Dict[str, Tuple[str, ...]]:
+    """The label that says a PR has a record, and the record's kind (any of them)."""
+    return {
+        train.REVIEWED_LABEL: ("review-clean", "review-substitute"),
+        train.owner_approved_label(): ("owner-approve", "alex-approve"),
+        TRAIN_LABEL: ("train-add",),
+    }
 
 
 def with_aged_head_records(gh: GitHub, prs: List[Dict[str, Any]], comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """`comments` plus the whole history of each PR whose label promises a record the
-    window does not hold (#1055): `reviewed`, `alex-approved` or `train` on a PR whose
+    window does not hold: `reviewed`, `<owner_approved_label>` or `train` on a PR whose
     review, approval or train-add was last touched more than CLAIM_WINDOW_DAYS ago.
 
     API cost: one paginated call per such PR per snapshot, and none for a PR whose
@@ -1140,7 +1147,7 @@ def with_aged_head_records(gh: GitHub, prs: List[Dict[str, Any]], comments: List
     for pr in prs:
         number = pr["number"]
         if not any(label in pr["labels"] and not any((number, kind) in seen for kind in kinds)
-                   for label, kinds in LABELLED_RECORDS.items()):
+                   for label, kinds in labelled_records().items()):
             continue
         for raw in gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             comment = coord_comment(raw)

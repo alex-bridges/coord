@@ -85,7 +85,7 @@ class CloudIdentityTests(unittest.TestCase):
 
     def test_explicit_addresses_and_sessions_bypass_unavailable_cloud_cache(self):
         with patch.object(identity, "container_id", side_effect=identity.IdentityError("unavailable")), \
-                patch.object(identity, "git_toplevel", return_value="/workspace/INISA"), \
+                patch.object(identity, "git_toplevel", return_value="/workspace/example-repo"), \
                 patch.object(identity, "detect_host", return_value="cloud"):
             flags = {"CLAUDE_CODE_REMOTE": "true"}
             self.assertEqual(identity.agent_id(dict(flags, COORD_AGENT="worker@cloud:fixed")), "worker@cloud:fixed")
@@ -93,22 +93,22 @@ class CloudIdentityTests(unittest.TestCase):
                 with self.subTest(key=key):
                     first = identity.agent_id(dict(flags, **{key: "session-one"}))
                     self.assertEqual(first, identity.agent_id(dict(flags, **{key: "session-one"})))
-                    self.assertTrue(re.fullmatch(r"claude-cloud@cloud:INISA-[0-9a-f]{16}", first))
+                    self.assertTrue(re.fullmatch(r"claude-cloud@cloud:example-repo-[0-9a-f]{16}", first))
 
 
-_INISA_CONFIG_PATH = None
+_EXAMPLE_CONFIG_PATH = None
 
 
 def setUpModule():
-    global _INISA_CONFIG_PATH
+    global _EXAMPLE_CONFIG_PATH
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import conductor_config_fixture
-    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+    _EXAMPLE_CONFIG_PATH = conductor_config_fixture.use_example_config()
 
 
 def tearDownModule():
     import conductor_config_fixture
-    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
+    conductor_config_fixture.restore(_EXAMPLE_CONFIG_PATH)
 
 
 if __name__ == "__main__":

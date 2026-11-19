@@ -35,7 +35,7 @@ import unicodedata
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GUARD = os.path.join(HERE, "fixtures", "inisa", ".claude", "hooks", "conductor-guard.py")
+GUARD = os.path.join(HERE, "fixtures", "example_repo", ".claude", "hooks", "conductor-guard.py")
 LEGACY_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard.py")
 MAIN_GUARD = os.path.join(HERE, "legacy_guard", "conductor-guard-59e25cc6f.py")
 MAIN_BLOB = "d0441c4ecc072255a06b189566b7afbbef524f5b"  # `git hash-object` of main's guard at 59e25cc6f
@@ -465,12 +465,12 @@ CONDUCTOR_COMMANDS = [
     'Tools/coord/coord conductor escalate "#1046: apptoken tests fail under python3.9; it\'s the cached line"',
     'Tools/coord/coord conductor pause --for 2h', 'Tools/coord/coord conductor resume', 'Tools/coord/coord conductor status',
     'Tools/coord/coord token status', 'Tools/coord/coord outage', 'du -xhd1 /Users/dev 2>/dev/null | sort -h | tail -20',
-    'tail -50 ~/Library/Logs/inisa/ci-health.log', 'gh pr checks 1046', 'gh run view 123456 --log-failed | tail -80',
+    'tail -50 ~/Library/Logs/example-repo/ci-health.log', 'gh pr checks 1046', 'gh run view 123456 --log-failed | tail -80',
     'gh run list --workflow ci.yml --limit 5',
     'gh pr view 1046 --json reviews,comments | python3 -c \'import json,sys; d=json.load(sys.stdin);'
     ' print(len(d["comments"]))\'',
     'gh pr diff 1046 -- Tools/coord/coordlib/apptoken.py | head -100',
-    'git -C ~/Projects/INISA-worktrees/conductor status --short', 'git fetch -q origin && git log --oneline origin/main -5',
+    'git -C ~/Projects/example-repo-worktrees/conductor status --short', 'git fetch -q origin && git log --oneline origin/main -5',
     'cd Tools/coord && python3 -m unittest test_apptoken 2>&1 | tail -3',
     'cd Tools/coord && /usr/bin/python3 -m unittest discover -s tests 2>&1 | tail -3',
     'git worktree add ../w-fix -b fix/apptoken origin/main && cd ../w-fix && git status',
@@ -486,7 +486,7 @@ CONDUCTOR_COMMANDS = [
     # after a `<<` that is not a heredoc: the other rules
     'echo "<<X"\ngh pr merge 5', 'echo "<<X"\ngit push --force origin HEAD',
     'echo "<<X"\nTools/coord/coord token exec -- gh api user', 'echo "<<X"\nsecurity find-generic-password -s x -w',
-    'echo "<<X"\ncat ~/Library/Caches/inisa-coord/token.json', 'echo "<<X"\nTools/coord/coord train approve 5',
+    'echo "<<X"\ncat ~/Library/Caches/example-coord/token.json', 'echo "<<X"\nTools/coord/coord train approve 5',
     "echo '<<X'\necho x > .claude/settings.json", 'echo "<<X"\npython3 -c "import coordlib.apptoken"',
     'echo "<<X"\necho "import coordlib.apptoken" | python3 -',
 ]
@@ -547,8 +547,8 @@ PYTHON_NAMES = ["python", "python3", "python3.14", "/usr/bin/python3", "Python3"
                 "python2", "python310"]
 OTHER_RULES_AND_WORK = [
     'Tools/coord/coord token exec -- gh api user', 'coord --repo o/r token exec -- env', 'x; Tools/coord/coord token exec -- sh',
-    'security find-generic-password -s x -w', '(security dump-keychain)', 'cat ~/Library/Caches/inisa-coord/t.json',
-    'ls $HOME/Library/Caches/inisa-coord',
+    'security find-generic-password -s x -w', '(security dump-keychain)', 'cat ~/Library/Caches/example-coord/t.json',
+    'ls $HOME/Library/Caches/example-coord',
     'python3 -c "import subprocess; subprocess.run([\'security\',\'find-generic-password\',\'-s\',\'example-coord-github-app\'])"',
     'Tools/coord/coord train approve 5', './Tools/coord/coord --repo o/r train approve 5',
     "bash -c 'Tools/coord/coord train approve 5'", 'git push origin --force HEAD', 'git push -f', 'git push origin +HEAD:x',
@@ -603,10 +603,10 @@ ROUND_TWELVE = [
     "security find-internet-password -s x -w", "security find-i -w", "security dump-keychain -d", "security dump-k -d",
     "security export -k login.keychain -t privKeys", "security -v find-generic-password -s x", "security -i find-g",
     "echo | security find-generic-password", "env security find-generic-password", "'security' find-generic-password",
-    "cat ~/Library/Caches/inisa-coord/tokens.json", "ls $HOME/Library/Caches/inisa-coord",
-    "cat ~/library/caches/INISA-COORD/x", "cat ~/Library/Caches/Inisa-Coord/x",
-    "cp /Users/dev/Library/Caches/inisa-coord/t /tmp",
-    "security find-generic-password -s example-coord-github-app -w", "echo EXAMPLE-COORD-GITHUB-APP",
+    "cat ~/Library/Caches/example-coord/tokens.json", "ls $HOME/Library/Caches/example-coord",
+    "cat ~/library/caches/example-COORD/x", "cat ~/Library/Caches/Example-Coord/x",
+    "cp /Users/dev/Library/Caches/example-coord/t /tmp",
+    "security find-generic-password -s example-coord-github-app -w", "echo example-COORD-GITHUB-APP",
     "echo Example-Coord-GitHub-App",
     "python3 -c 'import subprocess; subprocess.run([\"security\",\"find-generic-password\",\"-s\",\"example-coord-github-app\"])'",
     "python3 -c 'import coordlib.apptoken'", "echo 'import coordlib.apptoken' | python3 -",
@@ -634,10 +634,10 @@ ROUND_TWELVE = [
     "security f -s x -w", "security fi -s x -w", "security find -s x -w", "security find- -s x -w", "security du -d",
     "security dump -d", "security dump- -d", "security e -k login.keychain -t privKeys -o /tmp/k",
     "security expor -t privKeys", "python3 -m test_apptoken", "cd /tmp/x && python3 -m test_apptoken",
-    "python3 -c 'from test_apptoken import *; print(AppTokens)'", "cat ~/Library//Caches/inisa-coord/x",
-    "cat ~/Library/Caches/./inisa-coord/x", "cat ~/Library/Caches/inisa-coor?/x", "cd ~/Library/Caches && cat inisa-coord/x",
-    "cat ~/Library/Caches/inisa-c*/x", "security find-generic-password -s inisa-coord-github-'app' -w",
-    "security f -s inisa-coord-github-'app' -w",
+    "python3 -c 'from test_apptoken import *; print(AppTokens)'", "cat ~/Library//Caches/example-coord/x",
+    "cat ~/Library/Caches/./example-coord/x", "cat ~/Library/Caches/example-coor?/x", "cd ~/Library/Caches && cat example-coord/x",
+    "cat ~/Library/Caches/example-c*/x", "security find-generic-password -s example-coord-github-'app' -w",
+    "security f -s example-coord-github-'app' -w",
 ]
 # Its insert-only mutant (`if command.endswith(" #r12"): return ""` in bash_verdict) kept every
 # line of main's guard and every test green. Commands main blocks, with trailing comments:
@@ -672,7 +672,7 @@ MINIMUM = {"test_conductor.py": 245, "rounds five and six": 151, "round seven's 
            "not heredoc openers": 67, "wrappers and shapes": 216, "stdin forms": 76, "prose": 180, "heredoc shapes": 29,
            "conductor commands": 45, "fuzz grammar": 2520, "round eight's review": 120,
            "round twelve's review": 106, "trailing comments": 36}
-LEGACY_BLOB = "c7a05e3547d96008cf3c59885576616519c9e08d"  # `git hash-object` of 4f7d4a4fd's guard
+LEGACY_BLOB = "67aff399d6891fa5dec3a15fbff5a68fef921537"  # `git hash-object` of 4f7d4a4fd's guard
 
 # Commands the old guard blocked that this one allows on purpose. Each needs a reason. None since
 # round eight, which blocks python and apptoken anywhere in one command.
@@ -748,19 +748,19 @@ class GuardDifferentialTests(unittest.TestCase):
             self.assertFalse(self.blocked(self.guard, command), command)
 
 
-_INISA_CONFIG_PATH = None
+_EXAMPLE_CONFIG_PATH = None
 
 
 def setUpModule():
-    global _INISA_CONFIG_PATH
+    global _EXAMPLE_CONFIG_PATH
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import conductor_config_fixture
-    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+    _EXAMPLE_CONFIG_PATH = conductor_config_fixture.use_example_config()
 
 
 def tearDownModule():
     import conductor_config_fixture
-    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
+    conductor_config_fixture.restore(_EXAMPLE_CONFIG_PATH)
 
 
 if __name__ == "__main__":

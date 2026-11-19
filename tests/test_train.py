@@ -28,25 +28,25 @@ from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from coordlib.gh import GitHubError  # noqa: E402
 from test_coord import (ALEX, BOT, NOW, REAL_FAILURE, REPO, check, codex_summary, coord_comment, pr_node,  # noqa: E402
                         isolate_from_rest_env, reaction, refused_check)
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
     isolate_from_rest_env()  # the fakes answer GraphQL; see test_coord.REST_ENV (#1085)
 
 # The repository checkout these tests run in: the light/heavy tests use its REAL lane
 # selector and rules, so a change to either is exercised here too.
-REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa")  # frozen INISA snapshot
+REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo")  # frozen example-repo snapshot
 HEAVY_PATH = "Packages/CoreKit/Sources/A.swift"
 LIGHT_PATH = ".claude/skills/x.md"  # the docs lane only, and not one of train.ALEX_ONLY_PATHS
 # Who posted an attestation record, and whether it counts (snapshot.trusted_attestation):
 # only the repository's owner, never a bot or another user (Codex P1 on #1054).
 ATTESTERS = ((ALEX, True),
              ({"login": "chatgpt-codex-connector[bot]", "type": "Bot"}, False),
-             ({"login": "inisa-sidechain[bot]", "type": "Bot"}, False),
+             ({"login": "example-reviewer[bot]", "type": "Bot"}, False),
              ({"login": "mallory", "type": "User"}, False))
 FAKE_OWNER = {"login": "o", "type": "User"}  # the owner of FakeGitHub's repository, o/r
 
@@ -107,15 +107,15 @@ class EligibilityTests(unittest.TestCase):
         self.assertEqual(train.assess(pr, merge_verified=True), (train.READY, "", "ready"))
         self.assertEqual(train.assess(dict(pr, codex={}), merge_verified=True)[:2],
                          (train.HOLD, train.HOLD_NO_REVIEW))
-        self.assertEqual(train.assess(dict(pr, labels=["train", "needs-alex"]), merge_verified=True)[:2],
+        self.assertEqual(train.assess(dict(pr, labels=["train", "needs-owner"]), merge_verified=True)[:2],
                          (train.HOLD, train.HOLD_NEEDS_ALEX))
         self.assertEqual(train.eligibility(dict(pr, mergeable="UNKNOWN")), (train.READY, "ready"))
 
     def test_holds(self):
         pr = self.summary()
         self.assertEqual(train.eligibility(dict(pr, isDraft=True))[0], train.HOLD)
-        self.assertEqual(train.eligibility(dict(pr, labels=["train", "needs-alex"]))[0], train.HOLD)
-        approved = dict(pr, labels=["train", "needs-alex", "alex-approved"])
+        self.assertEqual(train.eligibility(dict(pr, labels=["train", "needs-owner"]))[0], train.HOLD)
+        approved = dict(pr, labels=["train", "needs-owner", "owner-approved"])
         self.assertEqual(train.eligibility(dict(approved, alexApprovedHead=pr["head"]))[0], train.READY)
         self.assertEqual(train.eligibility(dict(approved, alexApprovedHead="0" * 40))[0], train.HOLD,
                          "Alex's approval of an older head does not cover a new push")
@@ -181,7 +181,7 @@ class EligibilityTests(unittest.TestCase):
                     1, 1, 5, {"kind": "review-clean", "pr": 1, "head": head}, author)], REPO)
                 self.assertEqual(train.eligibility(review)[0], train.READY if counts else train.HOLD)
                 # Alex's approval: the same code path, and the same rule.
-                approval = dict(self.summary(), labels=["train", "needs-alex", "alex-approved"])
+                approval = dict(self.summary(), labels=["train", "needs-owner", "owner-approved"])
                 snapshot.attach_head_records([approval], [coord_comment(
                     1, 1, 5, {"kind": "alex-approve", "pr": 1, "head": head}, author)], REPO)
                 self.assertEqual(train.assess(approval)[:2], (train.READY, "") if counts else
@@ -190,7 +190,7 @@ class EligibilityTests(unittest.TestCase):
     def test_a_record_counts_only_on_the_pr_it_names(self):
         # A trusted record posted on #5 that names #7 is not a record on #7 (the step
         # reads only #7's own comments, so the snapshot must agree).
-        for kind, labels in (("review-clean", ["train"]), ("alex-approve", ["train", "needs-alex", "alex-approved"])):
+        for kind, labels in (("review-clean", ["train"]), ("alex-approve", ["train", "needs-owner", "owner-approved"])):
             with self.subTest(kind=kind):
                 pr = self.unreviewed(number=7, labels=labels)
                 if kind == "alex-approve":
@@ -252,10 +252,10 @@ class PlanAndRunTests(unittest.TestCase):
         bot = {"head_sha": "t", "event": "workflow_dispatch", "actor": {"login": "github-actions[bot]"}}
         self.assertTrue(train.is_gate_run(bot, "t"))
         self.assertFalse(train.is_gate_run(bot, "other tip"))
-        self.assertFalse(train.is_gate_run(dict(bot, actor={"login": "alex-bridges"}), "t"))
+        self.assertFalse(train.is_gate_run(dict(bot, actor={"login": "example-owner"}), "t"))
         self.assertFalse(train.is_gate_run(dict(bot, event="push"), "t"))
         # A re-run changes triggering_actor, never actor.
-        self.assertTrue(train.is_gate_run(dict(bot, triggering_actor={"login": "alex-bridges"}), "t"))
+        self.assertTrue(train.is_gate_run(dict(bot, triggering_actor={"login": "example-owner"}), "t"))
 
     def test_run_action(self):
         self.assertEqual(train.run_action(None, 2), "dispatch")
@@ -313,7 +313,7 @@ TIMED_OUT = ("The job has exceeded the maximum execution time of 15m0s", "The op
 
 def failed_job(name="Android", conclusion="failure", annotations=("Process completed with exit code 1.",), **fields):
     """train.job_detail of a failed job: by default a real one (a runner, steps, an exit code)."""
-    job = {"id": 1, "name": name, "conclusion": conclusion, "runner_id": 21, "runner_name": "Tycho",
+    job = {"id": 1, "name": name, "conclusion": conclusion, "runner_id": 21, "runner_name": "ci-box",
            "steps": [{"name": "Set up job", "conclusion": "success"}, {"name": "Build", "conclusion": conclusion}]}
     job.update(fields)
     return train.job_detail(job, [{"message": message} for message in annotations])
@@ -342,7 +342,7 @@ class ClassifyTests(unittest.TestCase):
             size, seen[(run_id, str(runs[run_id]["run_attempt"]))])
         self.assertEqual(latest("10000002"), "rerun", "the docs timeout of train/20261007-010141 is re-run once")
         self.assertEqual(latest("10000003"), "rerun", "a job billing never started is retried")
-        self.assertEqual(latest("10000004", 2), "split", "Android's real failure on Eidolon still splits")
+        self.assertEqual(latest("10000004", 2), "split", "Android's real failure on workstation still splits")
         # 10000001: rerun-failed-jobs re-ran the CANCELLED (timed-out) docs job, which went green.
         self.assertEqual(runs["10000001"]["attempts"]["2"][0]["conclusion"], "success")
         self.assertEqual(latest("10000001"), "merge")
@@ -357,7 +357,7 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(train.classify([failed_job(conclusion="cancelled", annotations=("The operation was canceled.",))]),
                          train.REAL, "a running job stopped with no other sign: real, so it is re-run before any split")
         self.assertEqual(train.classify([failed_job(conclusion="cancelled",
-                                                    annotations=("The run was canceled by @alex-bridges.",))]),
+                                                    annotations=("The run was canceled by @example-owner.",))]),
                          train.USER_CANCEL)
         infrastructure = [
             failed_job(runner_id=0),
@@ -366,7 +366,7 @@ class ClassifyTests(unittest.TestCase):
             failed_job(runner_id=0, steps=[], annotations=(BILLING,)),
             failed_job(annotations=("The runner has received a shutdown signal. This can happen when the runner "
                                     "service is stopped, or a manually started runner is canceled.",)),
-            failed_job(annotations=("The self-hosted runner: Eidolon-heavy lost communication with the server.",)),
+            failed_job(annotations=("The self-hosted runner: workstation-heavy lost communication with the server.",)),
         ]
         for job in infrastructure:
             with self.subTest(job=job):
@@ -375,7 +375,7 @@ class ClassifyTests(unittest.TestCase):
     def test_precedence_and_what_is_set_aside(self):
         real, infra = failed_job("Android"), failed_job("Linux", runner_id=0, steps=[], annotations=(BILLING,))
         timeout = failed_job("Docs", conclusion="cancelled", annotations=TIMED_OUT)
-        cancel = failed_job("Docs", conclusion="cancelled", annotations=("The run was canceled by @alex-bridges.",))
+        cancel = failed_job("Docs", conclusion="cancelled", annotations=("The run was canceled by @example-owner.",))
         queued = failed_job("Release", conclusion="cancelled", runner_id=0, steps=[], annotations=())
         verdict = failed_job(train.VERDICT_JOB)
         self.assertEqual(train.classify([infra, real]), train.REAL, "any mix with a real failure is real")
@@ -478,14 +478,14 @@ class LaneClassifierTests(unittest.TestCase):
 
     def test_docs_tools_and_prose_are_light(self):
         for path in ("Docs/agent-coordination.md", LIGHT_PATH, "Packages/CoreKit/Docs/Plan.md",
-                     "Packages/CoreKit/Sources/CoreKitCore/CoreKitCore.docc/A.md", "Apps/AppBeta/README.md",
+                     "Packages/CoreKit/Sources/CoreKit/CoreKit.docc/A.md", "Apps/AppBeta/README.md",
                      "Apps/AppAlpha/Marketing/Screenshots/shot.png"):
             self.assertEqual(self.classify(path)[0], L, path)
 
     def test_one_heavy_path_makes_the_pr_heavy(self):
         kind, reason = self.classify("Docs/agent-coordination.md", LIGHT_PATH, HEAVY_PATH)
         self.assertEqual(kind, H)
-        self.assertIn("mk4-debug", reason)
+        self.assertIn("core-debug", reason)
 
     def test_an_unknown_or_empty_diff_is_heavy(self):
         classifier = train.LaneClassifier(checkout_file)
@@ -504,7 +504,7 @@ class LaneClassifierTests(unittest.TestCase):
             if path != train.LANE_RULES:
                 return checkout_file(path)
             rules = json.loads(checkout_file(path))
-            del rules["lanes"]["mk4"]
+            del rules["lanes"]["core"]
             return json.dumps(rules)
 
         for show in (missing, lambda path: "def (", broken_rules, rules_missing_a_lane):
@@ -561,7 +561,7 @@ class FakeGitHub:
         By default a real failure: a runner, steps, a failing step, an exit code."""
         self.next_job += 1
         job = {"id": self.next_job, "name": name, "status": "completed", "conclusion": conclusion,
-               "runner_id": 21, "runner_name": "Tycho",
+               "runner_id": 21, "runner_name": "ci-box",
                "steps": [{"name": "Set up job", "conclusion": "success"}, {"name": f"Run {name}", "conclusion": conclusion}]}
         job.update(fields)
         self.jobs.setdefault(run_id, []).append(job)
@@ -608,7 +608,7 @@ class FakeGitHub:
         self.writes.append((method, path, body))
         if method == "POST" and match:
             # GitHub names the token's user as the author: the bot for the Actions train,
-            # alex-bridges for a step run by hand (set `login`).
+            # example-owner for a step run by hand (set `login`).
             self.issue_comments.setdefault(int(match.group(1)), []).append(
                 {"created_at": (marker.decode(body["body"]) or {}).get("at", snapshot.iso(NOW)),
                  "body": body["body"], "user": {"login": self.login}})
@@ -914,7 +914,7 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         # Someone's green narrow dispatch at the same tip, newer than any train run.
-        self.run_on(fake, name, tip, id=99, conclusion="success", actor={"login": "alex-bridges"})
+        self.run_on(fake, name, tip, id=99, conclusion="success", actor={"login": "example-owner"})
         lines = self.step(fake, now=snapshot.now_utc()).run()
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
         self.assertEqual(fake.posted("merged"), [])
@@ -1000,7 +1000,7 @@ class StepTests(unittest.TestCase):
 
     def test_a_bot_s_record_at_the_head_is_held(self):
         h1 = self.pr_branch(1, "c.txt", "c\n")
-        lines = self.step(self.queue_reviewed(h1, h1, {"login": "inisa-sidechain[bot]", "type": "Bot"})).run()
+        lines = self.step(self.queue_reviewed(h1, h1, {"login": "example-reviewer[bot]", "type": "Bot"})).run()
         self.assertEqual(self.batch_on_origin(), ("", ""), lines)
         self.assertTrue(any("#1 held: no Codex" in line and "no clean review" in line for line in lines), lines)
 
@@ -1019,7 +1019,7 @@ class StepTests(unittest.TestCase):
     def test_the_final_check_trusts_the_same_authors_as_the_snapshot(self):
         head = "a" * 40
         for kind, labels in (("review-clean", ("train",)), ("review-substitute", ("train",)),
-                             ("alex-approve", ("train", "needs-alex", "alex-approved"))):
+                             ("alex-approve", ("train", "needs-owner", "owner-approved"))):
             for author, counts in ATTESTERS:
                 with self.subTest(kind=kind, author=author["login"]):
                     node = ready_node(1, head, "pr1", labels=labels)
@@ -1027,7 +1027,7 @@ class StepTests(unittest.TestCase):
                         node["reactions"] = {"nodes": []}  # the record is its only review
                     payload = {"kind": kind, "pr": 1, "head": head}
                     fake = FakeGitHub([node], self.main)
-                    fake.repo = REPO  # trusted_attesters(REPO) is {alex-bridges}
+                    fake.repo = REPO  # trusted_attesters(REPO) is {example-owner}
                     fake.issue_comments[1] = [{"created_at": snapshot.iso(NOW), "user": dict(author),
                                                "body": compose_record("record", payload)}]
                     fresh = snapshot.summarize_pr(node)
@@ -1217,7 +1217,7 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="failure", run_attempt=2)
-        fake.add_job(77, "Android", runner_name="Eidolon-heavy",
+        fake.add_job(77, "Android", runner_name="workstation-heavy",
                      annotations=("The runner has received a shutdown signal. This can happen when the runner service "
                                   "is stopped, or a manually started runner is canceled.",))
         self.step(fake).run()
@@ -1565,7 +1565,7 @@ class StepTests(unittest.TestCase):
 
     # MARK: - Held notices (#1034)
 
-    AGENT = "claude-cloud@abc12345:INISA"
+    AGENT = "claude-cloud@abc12345:example-repo"
     H1, H2 = "1" * 40, "2" * 40
 
     def add(self, fake, number, head, minutes_ago, agent=AGENT):
@@ -1587,7 +1587,7 @@ class StepTests(unittest.TestCase):
 
     def held_node(self, number, head, hold, *failing):
         """A queued PR node held for `hold` (one of train.HOLD_CLASSES, from eligibility)."""
-        labels = ("train", "needs-alex") if hold == train.HOLD_NEEDS_ALEX else ("train",)
+        labels = ("train", "needs-owner") if hold == train.HOLD_NEEDS_ALEX else ("train",)
         node = ready_node(number, head, f"pr{number}", labels=labels)
         if hold == train.HOLD_NO_REVIEW:
             node["reactions"] = {"nodes": []}
@@ -1601,7 +1601,7 @@ class StepTests(unittest.TestCase):
                 "totalCount": 1, "nodes": [{"author": {"login": BOT}, "body": "P1: a finding"}]}}]}
         elif hold == train.HOLD_PARTIAL_DATA:
             node["reviewThreads"] = {"totalCount": 1, "nodes": [{"isResolved": True, "comments": {
-                "totalCount": 60, "nodes": [{"author": {"login": "alex-bridges"}, "body": "a long thread"}]}}]}
+                "totalCount": 60, "nodes": [{"author": {"login": "example-owner"}, "body": "a long thread"}]}}]}
         return node
 
     def test_a_held_pr_is_told_once_addressed_to_its_agent_and_the_conductor(self):
@@ -1613,9 +1613,9 @@ class StepTests(unittest.TestCase):
         self.assertEqual(sorted(fake.posted("held")), [1, 2], "one comment per held PR, no more")
         [(payload, text)] = self.held(fake, 1)
         self.assertEqual(payload["to"], [self.AGENT, "conductor@*"])
-        self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-alex", 1))
-        self.assertIn("waits for Alex", text, "the reason")
-        self.assertIn("coord train approve 1 --head <full-sha-Alex-approved>", text, "the action that clears it")
+        self.assertEqual((payload["head"], payload["hold"], payload["pr"]), (self.H1, "needs-owner", 1))
+        self.assertIn("waits for the owner", text, "the reason")
+        self.assertIn("coord train approve 1 --head <full-approved-sha>", text, "the action that clears it")
         self.assertIn(f"at head `{self.H1[:9]}`", text, "the held head is named, outside the command")
         self.assertNotIn(f"--head {self.H1[:7]}", text, "never pre-filled with the current head")
         [(payload, _)] = self.held(fake, 2)
@@ -1645,7 +1645,7 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.step(fake).run()
         self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)],
-                         [(self.H1, "needs-alex"), (self.H2, "needs-alex")])
+                         [(self.H1, "needs-owner"), (self.H2, "needs-owner")])
 
     def test_a_different_hold_at_the_same_head_is_a_new_notice(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NO_REVIEW)], self.main)
@@ -1667,8 +1667,8 @@ class StepTests(unittest.TestCase):
         for number, hold in enumerate(holds, start=1):
             [(payload, text)] = self.held(fake, number)
             self.assertEqual(payload["hold"], hold)
-            self.assertEqual("@alex-bridges" in text, hold in train.OWNER_HOLDS, hold)
-        self.assertEqual(train.OWNER_HOLDS, {"needs-alex", "partial-data"})
+            self.assertEqual("@example-owner" in text, hold in train.OWNER_HOLDS, hold)
+        self.assertEqual(train.OWNER_HOLDS, {"needs-owner", "partial-data"})
 
     def test_no_notice_pre_fills_the_current_head_into_an_attestation(self):
         # Copying a pre-filled current head would attest whatever is there now, not the
@@ -1679,7 +1679,7 @@ class StepTests(unittest.TestCase):
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
         for number, head, command in ((1, self.H1, "coord train review 1 --head <full-reviewed-sha> --by <agent>"),
-                                      (2, self.H2, "coord train approve 2 --head <full-sha-Alex-approved>")):
+                                      (2, self.H2, "coord train approve 2 --head <full-approved-sha>")):
             with self.subTest(pr=number):
                 [(_, text)] = self.held(fake, number)
                 self.assertIn(command, text)
@@ -1700,19 +1700,19 @@ class StepTests(unittest.TestCase):
         fake.nodes = [stale]
         self.add(fake, 2, self.H2, 20)
         self.step(fake).run()
-        stale["labels"]["nodes"].append({"name": "alex-approved"})
+        stale["labels"]["nodes"].append({"name": "owner-approved"})
         fake.issue_comments[2].append({"created_at": snapshot.iso(NOW), "user": FAKE_OWNER, "body": compose_record(
             "approved", {"kind": "alex-approve", "pr": 2, "head": self.H1})})
         lines = self.step(fake).run()
         self.assertTrue(any("does not name the current head" in line for line in lines), lines)
-        self.assertEqual([p["hold"] for p, _ in self.held(fake, 2)], ["needs-alex"])
+        self.assertEqual([p["hold"] for p, _ in self.held(fake, 2)], ["needs-owner"])
 
     def test_every_eligibility_hold_has_a_class_and_an_action(self):
         for hold in train.HOLD_CLASSES:
             self.assertIn(hold, train.HOLD_ACTIONS)
         base = snapshot.summarize_pr(ready_node(1, "a" * 40, "b"))
         cases = [(dict(base, isDraft=True), "draft"), (dict(base, incomplete=["x"]), "partial-data"),
-                 (dict(base, labels=["train", "needs-alex"]), "needs-alex"),
+                 (dict(base, labels=["train", "needs-owner"]), "needs-owner"),
                  (dict(base, codex={"reviewing": True}), "no-review"),
                  (dict(base, codex={}), "no-review"),
                  (dict(base, codex={}, reviewedHead="0" * 40), "no-review"),
@@ -1749,13 +1749,13 @@ class StepTests(unittest.TestCase):
         self.assertEqual([(p["head"], p["hold"]) for p, _ in self.held(fake, 1)], [(moved, "head-moved")])
 
     def test_only_the_trains_own_held_record_counts_as_told(self):
-        # Every agent posts as alex-bridges and can write any marker (review of #1037).
+        # Every agent posts as example-owner and can write any marker (review of #1037).
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
         self.add(fake, 1, self.H1, 30)
-        record = {"kind": "train", "v": 1, "event": "held", "pr": 1, "head": self.H1, "hold": "needs-alex"}
-        forged = [(dict(record, agent="claude@Eidolon:wt"), "alex-bridges"),  # another agent's marker
-                  (dict(record, agent="train@actions"), "alex-bridges"),      # the train's name, not the bot
-                  (dict(record, agent="claude@Eidolon:wt"), train_step.BOT_NAME)]
+        record = {"kind": "train", "v": 1, "event": "held", "pr": 1, "head": self.H1, "hold": "needs-owner"}
+        forged = [(dict(record, agent="claude@workstation:wt"), "example-owner"),  # another agent's marker
+                  (dict(record, agent="train@actions"), "example-owner"),      # the train's name, not the bot
+                  (dict(record, agent="claude@workstation:wt"), train_step.BOT_NAME)]
         for payload, login in forged:
             fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
                                            "body": compose_record("held?", payload)})
@@ -1769,13 +1769,13 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "example-owner"},
                                        "body": compose_record("merged?", {"kind": "train", "agent": "train@actions",
                                                                          "event": "merged", "pr": 1, "batch": name})})
         self.step(fake).run()
         self.assertEqual(fake.posted("merged"), [1])
 
-    HAND = "claude@Eidolon:INISA"  # `coord train step` run by hand: posts as alex-bridges under its own id
+    HAND = "claude@workstation:example-repo"  # `coord train step` run by hand: posts as example-owner under its own id
 
     def test_hand_runs_never_repeat_what_the_actions_train_said(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
@@ -1783,7 +1783,7 @@ class StepTests(unittest.TestCase):
         self.step(fake).run()
         self.assertEqual(fake.posted("held"), [1])
         fake.writes.clear()
-        fake.login = "alex-bridges"
+        fake.login = "example-owner"
         self.step(fake, agent=self.HAND).run()
         self.step(fake, agent=self.HAND).run()
         self.assertEqual(fake.posted("held"), [], "two hand runs after the Actions train")
@@ -1814,10 +1814,10 @@ class StepTests(unittest.TestCase):
     def test_a_train_marker_from_another_login_never_silences_the_actions_train(self):
         fake = FakeGitHub([self.held_node(1, self.H1, train.HOLD_NEEDS_ALEX)], self.main)
         self.add(fake, 1, self.H1, 30)
-        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "alex-bridges"},
+        fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": "example-owner"},
                                        "body": compose_record("held?", {
                                            "kind": "train", "agent": "train@actions", "event": "held", "pr": 1,
-                                           "head": self.H1, "hold": "needs-alex"})})
+                                           "head": self.H1, "hold": "needs-owner"})})
         self.step(fake).run()
         self.assertEqual(fake.posted("held"), [1])
 
@@ -1859,7 +1859,7 @@ class StepTests(unittest.TestCase):
                 self.drop_batches()
                 fake, name, tip = self.build_batch([(1, h1)])
                 self.run_on(fake, name, tip, conclusion="success")
-                fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+                fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-owner"))]
                 fake.fail_held = error
                 lines = self.step(fake).run()
                 self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes), lines)
@@ -1887,7 +1887,7 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-owner"))]
         original = fake.rest
 
         def rest(path, method="GET", body=None):
@@ -1904,13 +1904,13 @@ class StepTests(unittest.TestCase):
         h1 = self.pr_branch(1, "c.txt", "c\n")
         fake, name, tip = self.build_batch([(1, h1)])
         self.run_on(fake, name, tip, conclusion="success")
-        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-alex"))]  # labelled during the batch's CI
+        fake.nodes = [ready_node(1, h1, "pr1", labels=("train", "needs-owner"))]  # labelled during the batch's CI
         self.step(fake).run()
         self.step(fake).run()
         self.assertFalse(any(method == "PATCH" for method, _, _ in fake.writes))
         [(payload, text)] = self.held(fake, 1)
-        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-alex", ["codex@test:train", "conductor@*"]))
-        self.assertIn("@alex-bridges", text)
+        self.assertEqual((payload["head"], payload["hold"], payload["to"]), (h1, "needs-owner", ["codex@test:train", "conductor@*"]))
+        self.assertIn("@example-owner", text)
 
     # MARK: Bounded light priority
 
@@ -2016,11 +2016,11 @@ class StepTests(unittest.TestCase):
         step = train_step.Step(gh, None, "dry-run", agent="claude@host:manual", log=lambda _: None)
         payload = {"kind": "train", "agent": step.agent}
         self.assertFalse(step.own_record({"user": {"login": "outsider", "type": "User"}}, payload))
-        self.assertTrue(step.own_record({"user": {"login": "alex-bridges", "type": "User"}}, payload))
+        self.assertTrue(step.own_record({"user": {"login": "example-owner", "type": "User"}}, payload))
         self.assertTrue(step.own_record({"user": {"login": snapshot.SIDECHAIN_LOGIN, "type": "Bot"}}, payload))
 
     def test_only_the_trains_own_overtake_record_counts(self):
-        # Every agent posts as alex-bridges and can write any marker (own_record, #1037): a
+        # Every agent posts as example-owner and can write any marker (own_record, #1037): a
         # forged record must not give heavy its turn early, and the train's own must hold.
         self.install_selector()
         h1 = self.pr_branch(1, HEAVY_PATH, "heavy\n")
@@ -2030,9 +2030,9 @@ class StepTests(unittest.TestCase):
         self.queue(fake, 1, h1, 50)
         self.queue(fake, 2, h2, 40)
         record = {"kind": "train", "v": 1, "event": train.OVERTAKEN_EVENT, "pr": 1, "batch": "train/forged"}
-        for agent, login in (("claude@Eidolon:wt", "alex-bridges"),          # another agent's marker
-                             (train_step.TRAIN_AGENT, "alex-bridges"),        # the train's name, not the bot
-                             ("claude@Eidolon:wt", train_step.BOT_NAME)):     # the bot, not the train's name
+        for agent, login in (("claude@workstation:wt", "example-owner"),          # another agent's marker
+                             (train_step.TRAIN_AGENT, "example-owner"),        # the train's name, not the bot
+                             ("claude@workstation:wt", train_step.BOT_NAME)):     # the bot, not the train's name
             fake.issue_comments[1].append({"created_at": snapshot.iso(NOW), "user": {"login": login},
                                            "body": compose_record("overtaken?", dict(record, agent=agent))})
         self.step(fake).run()
@@ -2202,7 +2202,7 @@ class StepTests(unittest.TestCase):
 
 
 class WorkflowTokenEligibilityTests(unittest.TestCase):
-    """With the inisa-sidechain app token, a workflow PR waits for Alex instead of leaving."""
+    """With the example-reviewer app token, a workflow PR waits for Alex instead of leaving."""
 
     def summary(self, files=(".github/workflows/ci.yml",), labels=("train",)):
         return snapshot.summarize_pr(ready_node(1, "a" * 40, "b", files=files, labels=labels))
@@ -2222,7 +2222,7 @@ class WorkflowTokenEligibilityTests(unittest.TestCase):
                                       workflow_token=True)[:2], (train.HOLD, train.HOLD_NEEDS_ALEX))
 
     def test_alex_approval_of_the_head_releases_it_and_only_that_head(self):
-        approved = self.summary(labels=("train", "alex-approved"))
+        approved = self.summary(labels=("train", "owner-approved"))
         self.assertEqual(train.assess(dict(approved, alexApprovedHead="a" * 40), workflow_token=True)[0], train.READY)
         self.assertEqual(train.assess(dict(approved, alexApprovedHead="0" * 40), workflow_token=True)[:2],
                          (train.HOLD, train.HOLD_NEEDS_ALEX), "a new push needs a new approval")
@@ -2276,7 +2276,7 @@ class WorkflowTokenStepTests(unittest.TestCase):
     def approved_workflow_pr(self, number=1):
         head = self.pr_branch(number, ".github/workflows/x.yml", "on: push\n")
         node = ready_node(number, head, f"pr{number}", files=(".github/workflows/x.yml",),
-                          labels=("train", "alex-approved"))
+                          labels=("train", "owner-approved"))
         return head, node
 
     def approve(self, fake, number, head):
@@ -2393,7 +2393,7 @@ class WorkflowTokenStepTests(unittest.TestCase):
         # PR 1 renames ci.yml away (Alex approved it); PR 2 is ordinary. GitHub refuses
         # the dispatch at the batch ref, which no longer has ci.yml (Codex P1 on #1311).
         head, node = self.renamed_out(1, ".github/workflows/ci.yml", "old/ci.yml")
-        node["labels"]["nodes"].append({"name": "alex-approved"})
+        node["labels"]["nodes"].append({"name": "owner-approved"})
         h2 = self.pr_branch(2, "c.txt", "c\n")
         fake = FakeGitHub([node, ready_node(2, h2, "pr2")], self.main)
         self.queue(fake, 1, head, 20)

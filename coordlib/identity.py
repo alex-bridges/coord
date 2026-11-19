@@ -170,8 +170,8 @@ def matches(address: str, agent: str) -> bool:
     """Does a message address reach this agent?
 
     "all" reaches everyone; an exact id reaches that agent; a trailing "*" is a
-    prefix match ("codex@*" reaches every Codex agent, "claude@Eidolon:*" every
-    Claude session on Eidolon).
+    prefix match ("codex@*" reaches every Codex agent, "claude@workstation:*" every
+    Claude session on workstation).
     """
     if address == "all" or address == agent:
         return True

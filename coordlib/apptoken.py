@@ -120,7 +120,7 @@ HTTP_TIMEOUT_SECONDS = 30
 # locked Keychain or a refused mint costs one prompt or one stall, not one per command.
 FAILURE_HOLD_SECONDS = 300
 
-OVERRIDE = "COORD_APP=off runs coord on Alex's gh identity instead, deliberately"
+OVERRIDE = "COORD_APP=off runs coord on the user's gh identity instead, deliberately"
 
 
 # MARK: - Mode
@@ -275,7 +275,7 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
         return Mode(True, "a review run holds no GitHub credential", path,
                     error="a review run (COORD_AGENT=reviewer@…) holds no GitHub credential")
     if env.get(SWITCH_ENV) == "off":
-        return Mode(False, "COORD_APP=off: the deliberate override, Alex's gh/keyring identity", path)
+        return Mode(False, "COORD_APP=off: the deliberate override, user's gh/keyring identity", path)
     if env.get("GITHUB_ACTIONS") == "true":
         return Mode(False, "in GitHub Actions, where the train keeps GITHUB_TOKEN", path)
     api = (env.get("GITHUB_API_URL") or GITHUB_API).rstrip("/")

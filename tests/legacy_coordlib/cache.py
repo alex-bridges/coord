@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 
 def cache_dir(repo: str) -> str:
     base = os.environ.get("COORD_CACHE_DIR") or os.path.join(
-        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "inisa-coord"
+        os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "example-coord"
     )
     return os.path.join(base, re.sub(r"[^A-Za-z0-9._-]", "_", repo))
 

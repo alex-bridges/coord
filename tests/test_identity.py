@@ -15,16 +15,16 @@ from coordlib import cache, cli, identity, marker, snapshot  # noqa: E402
 
 
 class ConcurrentIdentityTests(unittest.TestCase):
-    def agent(self, env, checkout="/Users/dev/.codex/worktrees/16e5/INISA", host="Eidolon"):
+    def agent(self, env, checkout="/Users/dev/.codex/worktrees/16e5/example-repo", host="workstation"):
         with patch.object(identity, "git_toplevel", return_value=checkout), \
                 patch.object(identity, "detect_host", return_value=host):
             return identity.agent_id(env)
 
     def test_same_basename_worktrees_have_distinct_addresses_and_cursors(self):
         first = self.agent({})
-        second = self.agent({}, "/Users/dev/.codex/worktrees/abcd/INISA")
+        second = self.agent({}, "/Users/dev/.codex/worktrees/abcd/example-repo")
         self.assertNotEqual(first, second)
-        self.assertTrue(first.startswith("codex@Eidolon:INISA-"), first)
+        self.assertTrue(first.startswith("codex@workstation:example-repo-"), first)
         self.assertTrue(identity.matches("codex@*", first))
         self.assertNotEqual(cache._cursor_path("owner/repo", first), cache._cursor_path("owner/repo", second))
 
@@ -38,13 +38,13 @@ class ConcurrentIdentityTests(unittest.TestCase):
         first = self.agent({"COORD_SESSION_ID": "task-one", "CODEX_THREAD_ID": "provider-one"})
         same = self.agent({"COORD_SESSION_ID": "task-one", "CODEX_THREAD_ID": "provider-two"})
         self.assertEqual(first, same)
-        unknown = self.agent({"COORD_SESSION_ID": "task-one"}, "/workspace/INISA")
-        other = self.agent({"COORD_SESSION_ID": "task-two"}, "/workspace/INISA")
+        unknown = self.agent({"COORD_SESSION_ID": "task-one"}, "/workspace/example-repo")
+        other = self.agent({"COORD_SESSION_ID": "task-two"}, "/workspace/example-repo")
         self.assertNotEqual(unknown, other)
 
     def test_explicit_address_preserves_conductor_and_migration_identity(self):
-        env = {"COORD_AGENT": "conductor@Tycho:conductor", "COORD_SESSION_ID": "ignored"}
-        self.assertEqual(self.agent(env), "conductor@Tycho:conductor")
+        env = {"COORD_AGENT": "conductor@ci-box:conductor", "COORD_SESSION_ID": "ignored"}
+        self.assertEqual(self.agent(env), "conductor@ci-box:conductor")
         self.assertEqual(self.agent(env, "/elsewhere/checkout", "OtherHost"), env["COORD_AGENT"])
 
     def test_claude_local_and_cloud_session_ids_are_not_truncated(self):
@@ -56,8 +56,8 @@ class ConcurrentIdentityTests(unittest.TestCase):
                 self.assertEqual(first, self.agent(dict(flags, CLAUDE_CODE_SESSION_ID="same1234-one")))
 
     def test_cloud_sessions_with_same_host_and_path_are_distinct(self):
-        first = self.agent({"CODEX_THREAD_ID": "cloud-one"}, "/workspace/INISA", "vm")
-        second = self.agent({"CODEX_THREAD_ID": "cloud-two"}, "/workspace/INISA", "vm")
+        first = self.agent({"CODEX_THREAD_ID": "cloud-one"}, "/workspace/example-repo", "vm")
+        second = self.agent({"CODEX_THREAD_ID": "cloud-two"}, "/workspace/example-repo", "vm")
         self.assertNotEqual(first, second)
         self.assertTrue(identity.matches("codex@*", first))
 
@@ -72,13 +72,13 @@ class ConcurrentIdentityTests(unittest.TestCase):
 
     def test_checkout_fallback_normalizes_path_aliases_and_needs_no_state(self):
         with tempfile.TemporaryDirectory() as directory:
-            actual = os.path.join(directory, "INISA")
+            actual = os.path.join(directory, "example-repo")
             alias = os.path.join(directory, "alias")
             os.mkdir(actual)
             os.symlink(actual, alias)
             with patch.object(identity, "container_id", side_effect=AssertionError("local identity must not persist state")):
                 first = self.agent({"CODEX_SANDBOX": "seatbelt"}, actual)
-                self.assertEqual(first, self.agent({"CODEX_SANDBOX": "seatbelt"}, actual + "/../INISA/."))
+                self.assertEqual(first, self.agent({"CODEX_SANDBOX": "seatbelt"}, actual + "/../example-repo/."))
                 self.assertEqual(first, self.agent({"CODEX_SANDBOX": "seatbelt"}, alias))
 
     def test_peer_message_is_delivered_and_own_message_is_filtered(self):

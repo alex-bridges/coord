@@ -7,8 +7,12 @@ name = "coord"
 version = "0.1.0"
 description = "Shared awareness for agents working in one GitHub repository: board, claims, messages, merge train."
 readme = "README.md"
+license = {file = "LICENSE"}
 requires-python = ">=3.9"
 dependencies = []
+
+[project.urls]
+Repository = "https://github.com/alex-bridges/coord"
 
 [project.scripts]
 coord = "coordlib.cli:main"

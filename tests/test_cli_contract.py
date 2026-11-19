@@ -12,13 +12,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from coordlib import EXIT_BACKEND, EXIT_BUDGET, EXIT_NOT_FOUND, EXIT_USAGE, budget, cli, identity, train_metrics
 from coordlib.gh import AppAuthError, GitHub, GitHubError, NotFound
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 
 class JsonContractTests(unittest.TestCase):

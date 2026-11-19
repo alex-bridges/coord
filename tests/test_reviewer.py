@@ -1,4 +1,4 @@
-"""Tests for `@inisa-sidechain review` (coordlib/reviewer.py).
+"""Tests for `@example-reviewer review` (coordlib/reviewer.py).
 Run: python3 -m unittest discover -s Tools/coord/tests
 """
 
@@ -35,34 +35,34 @@ def review_reply(findings=(), summary="looks careful"):
 class TagTests(unittest.TestCase):
     def test_the_tag_and_its_model(self):
         cases = {
-            "@inisa-sidechain review": "opus",
-            "Please @inisa-sidechain review this when you can": "opus",
-            "@inisa-sidechain review fable": "fable",
-            "@INISA-SIDECHAIN Review Sonnet": "sonnet",
-            "@inisa-sidechain review model=haiku": "haiku",
-            "@inisa-sidechain review model: fable": "fable",
+            "@example-reviewer review": "opus",
+            "Please @example-reviewer review this when you can": "opus",
+            "@example-reviewer review fable": "fable",
+            "@EXAMPLE-REVIEWER Review Sonnet": "sonnet",
+            "@example-reviewer review model=haiku": "haiku",
+            "@example-reviewer review model: fable": "fable",
         }
         for body, model in cases.items():
             self.assertEqual(reviewer.find_tag(body), {"model": model, "error": None}, body)
 
     def test_an_unknown_explicit_model_is_an_error(self):
-        self.assertIn("unknown model", reviewer.find_tag("@inisa-sidechain review model=gpt9")["error"])
+        self.assertIn("unknown model", reviewer.find_tag("@example-reviewer review model=gpt9")["error"])
 
     def test_quotes_code_and_lookalikes_are_not_requests(self):
-        for body in ("> @inisa-sidechain review", "```\n@inisa-sidechain review\n```", "`@inisa-sidechain review`",
-                     "mail me at x@inisa-sidechain review", "@inisa-sidechain reviewed it already",
-                     "@inisa-sidechain-bot review", ""):
+        for body in ("> @example-reviewer review", "```\n@example-reviewer review\n```", "`@example-reviewer review`",
+                     "mail me at x@example-reviewer review", "@example-reviewer reviewed it already",
+                     "@example-reviewer-bot review", ""):
             self.assertIsNone(reviewer.find_tag(body), body)
 
     def test_requests_are_pr_comments_by_people_or_agents(self):
         comments = [
-            {"id": 1, "html_url": "https://github.com/o/r/pull/7#issuecomment-1", "user": {"login": "alex-bridges"},
-             "body": marker.compose("@inisa-sidechain review fable", {"kind": "msg", "v": 1, "agent": "codex@E:x", "to": ["#7"]}),
+            {"id": 1, "html_url": "https://github.com/o/r/pull/7#issuecomment-1", "user": {"login": "example-owner"},
+             "body": marker.compose("@example-reviewer review fable", {"kind": "msg", "v": 1, "agent": "codex@E:x", "to": ["#7"]}),
              "created_at": snapshot.iso(at(-5))},
-            {"id": 2, "html_url": "https://github.com/o/r/issues/8#issuecomment-2", "user": {"login": "alex-bridges"},
-             "body": "@inisa-sidechain review", "created_at": snapshot.iso(at(-4))},
+            {"id": 2, "html_url": "https://github.com/o/r/issues/8#issuecomment-2", "user": {"login": "example-owner"},
+             "body": "@example-reviewer review", "created_at": snapshot.iso(at(-4))},
             {"id": 3, "html_url": "https://github.com/o/r/pull/7#issuecomment-3",
-             "user": {"login": reviewer.APP_LOGIN, "type": "Bot"}, "body": "@inisa-sidechain review",
+             "user": {"login": reviewer.APP_LOGIN, "type": "Bot"}, "body": "@example-reviewer review",
              "created_at": snapshot.iso(at(-3))},
         ]
         found = reviewer.requests(comments)
@@ -85,7 +85,7 @@ class ResultTests(unittest.TestCase):
 
 
 class FakeApp:
-    """The inisa-sidechain side: what the app posts and reads."""
+    """The example-reviewer side: what the app posts and reads."""
     repo = "o/r"
 
     def __init__(self, pr_comments=None, state="open", head=HEAD):
@@ -216,7 +216,7 @@ class ReviewFlowTests(unittest.TestCase):
         watcher.user_gh_factory = lambda: self.user
         return watcher.tick(**kwargs)
 
-    def ask(self, minutes, text="@inisa-sidechain review", agent="codex@Eidolon:x"):
+    def ask(self, minutes, text="@example-reviewer review", agent="codex@workstation:x"):
         comment = self.gh.raw(marker.compose(text, {"kind": "msg", "v": 1, "agent": agent, "to": ["#7"]}), minutes)
         comment["html_url"] = f"https://github.com/o/r/pull/7#issuecomment-{comment['id']}"
         comment["issue_url"] = "https://api/repos/o/r/issues/7"
@@ -242,7 +242,7 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual(self.app.reactions, [(f"repos/{{repo}}/issues/comments/{request['id']}/reactions", "eyes")])
         review = self.app.markers("review")[0]
         self.assertEqual((review["pr"], review["head"], review["verdict"], review["countsForTrain"], review["to"]),
-                         (7, HEAD, "pass", True, ["codex@Eidolon:x"]))
+                         (7, HEAD, "pass", True, ["codex@workstation:x"]))
         clean = self.user.markers("review-clean")[0]
         self.assertEqual((clean["pr"], clean["head"], clean["model"], clean["request"]), (7, HEAD, "opus", request["id"]))
         self.assertTrue(clean["by"].startswith("reviewer@"))
@@ -378,7 +378,7 @@ class ReviewFlowTests(unittest.TestCase):
 
     def test_an_unknown_model_gets_a_reply_and_no_run(self):
         self.tick(0)
-        self.ask(1, "@inisa-sidechain review model=gpt9")
+        self.ask(1, "@example-reviewer review model=gpt9")
         self.tick(5)
         self.assertEqual(self.reviews(), [])
         self.assertIn("unknown model", self.app.posts[0])
@@ -699,7 +699,7 @@ class ReviewFixTests(ReviewFlowTests):
         self.tick(5)
         self.assertEqual((len(self.reviews()), self.app.markers("review")), (1, []))
         clean = self.user.posts[0]
-        self.assertIn("## Review by inisa-sidechain: PASS", clean)
+        self.assertIn("## Review by example-reviewer: PASS", clean)
         self.assertIn("looks careful", clean)
         self.assertIn("No findings.", clean)
         self.assertEqual((marker.decode(clean) or {}).get("kind"), "review-clean")
@@ -735,12 +735,12 @@ class ReviewFixTests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 3)
 
 
-REVIEWER_GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks",
+REVIEWER_GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "hooks",
                               "conductor-guard.py")
 
 
 class ReviewerGuardTests(unittest.TestCase):
-    def guard(self, command, agent="reviewer@Tycho:review"):
+    def guard(self, command, agent="reviewer@ci-box:review"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
         env.update({"COORD_AGENT": agent, "CONDUCTOR_WAKE": "1", "CLAUDE_PROJECT_DIR": "/tmp/home"})
         payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": "/tmp/home"})
@@ -763,7 +763,7 @@ class ReviewerGuardTests(unittest.TestCase):
             self.assertEqual(self.guard(command), 0, command)
 
     def test_the_conductor_keeps_its_own_rules(self):
-        self.assertEqual(self.guard("gh pr comment 7 -b hi", agent="conductor@Tycho:conductor"), 0)
+        self.assertEqual(self.guard("gh pr comment 7 -b hi", agent="conductor@ci-box:conductor"), 0)
 
 
 class CodexRoundTests(ReviewFlowTests):
@@ -776,17 +776,17 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(reviewer.verdict(found["findings"]), "changes")
 
     def test_c2_every_markdown_code_form_hides_the_tag(self):
-        for body in ("``@inisa-sidechain review``", "see ``x `@inisa-sidechain review` y``",
-                     "~~~\n@inisa-sidechain review\n~~~", "````\n```\n@inisa-sidechain review\n````",
-                     "text\n\n    @inisa-sidechain review\n", "\t@inisa-sidechain review"):
+        for body in ("``@example-reviewer review``", "see ``x `@example-reviewer review` y``",
+                     "~~~\n@example-reviewer review\n~~~", "````\n```\n@example-reviewer review\n````",
+                     "text\n\n    @example-reviewer review\n", "\t@example-reviewer review"):
             self.assertIsNone(reviewer.find_tag(body), body)
-        self.assertEqual(reviewer.find_tag("~~~\ncode\n~~~\n@inisa-sidechain review haiku")["model"], "haiku")
-        self.assertEqual(reviewer.find_tag("`x` then @inisa-sidechain review")["model"], "opus")
+        self.assertEqual(reviewer.find_tag("~~~\ncode\n~~~\n@example-reviewer review haiku")["model"], "haiku")
+        self.assertEqual(reviewer.find_tag("`x` then @example-reviewer review")["model"], "opus")
 
     def test_c3_a_blocking_review_withdraws_a_recorded_clean_review_of_the_head(self):
         self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "by": "claude@X:y"})]
         self.tick(0)
-        self.ask(1, "@inisa-sidechain review sonnet")
+        self.ask(1, "@example-reviewer review sonnet")
         self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
         self.tick(5)
         withdrawn = self.user.markers("review-clean")
@@ -816,9 +816,9 @@ class CodexRoundTests(ReviewFlowTests):
         env = self.reviews()[0]["env"]
         self.assertFalse(os.path.exists(env["COORD_APP_CONFIG"]))
         from coordlib import apptoken
-        mode = apptoken.detect("example-org/example-repo", env)
+        mode = apptoken.detect("example-owner/example-repo", env)
         self.assertTrue(mode.error, "on, and refusing: no token and no fallback to Alex")
-        mode = apptoken.detect("example-org/example-repo", dict(env, COORD_APP="off"))
+        mode = apptoken.detect("example-owner/example-repo", dict(env, COORD_APP="off"))
         self.assertTrue(mode.error, "COORD_APP=off does not turn a review run into Alex")
 
     def test_c5_a_review_already_posted_by_another_host_is_not_run_again(self):
@@ -832,14 +832,14 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(self.reviews(), [])
         self.assertIn("already reviewed", self.app.posts[-1])
         self.assertIn("issuecomment-1", self.app.posts[-1])
-        self.ask(6, "@inisa-sidechain review sonnet")
+        self.ask(6, "@example-reviewer review sonnet")
         self.replies = [review_reply()]
         self.tick(10)
         self.assertEqual(len(self.reviews()), 1, "another model is another review")
 
     def test_c5_only_the_apps_own_record_counts(self):
         payload = {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus", "verdict": "pass"}
-        self.assertIsNone(reviewer.posted_review([{"user": {"login": "alex-bridges"},
+        self.assertIsNone(reviewer.posted_review([{"user": {"login": "example-owner"},
                                                    "body": marker.compose("x", payload)}], 7, HEAD, "opus", "o/r"))
 
     def test_c6_a_huge_review_still_fits_a_comment(self):
@@ -915,7 +915,7 @@ class CodexRound2Tests(ReviewFlowTests):
                          (True, True, False))
         self.assertNotIn("network", sandbox, "no allowed domains: nothing reaches GitHub")
         self.assertIn(os.path.realpath(self.config.home), sandbox["filesystem"]["denyWrite"])
-        self.assertTrue(any(p.endswith(os.path.join("Library", "Caches", "inisa-coord"))
+        self.assertTrue(any(p.endswith(os.path.join("Library", "Caches", "example-coord"))
                             for p in sandbox["filesystem"]["denyRead"]))
         self.assertIn("Bash(git push:*)", self.settings()["permissions"]["deny"])
 
@@ -932,7 +932,7 @@ class CodexRound2Tests(ReviewFlowTests):
             {"user": {"login": reviewer.APP_LOGIN}, "created_at": snapshot.iso(at(-30)),
              "html_url": "https://github.com/o/r/pull/7#issuecomment-99", "body": marker.compose("Review", blocking)}]
         self.tick(0)
-        self.ask(1, "@inisa-sidechain review sonnet")
+        self.ask(1, "@example-reviewer review sonnet")
         self.replies = [review_reply()]
         self.tick(5)
         review = self.app.markers("review")[-1]
@@ -1027,7 +1027,7 @@ class CodexRound3Tests(ReviewFlowTests):
     def test_e1_the_blocking_review_goes_first_then_the_withdrawal(self):
         self.app.pr_comments = [trusted({"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD})]
         self.tick(0)
-        self.ask(1, "@inisa-sidechain review sonnet")
+        self.ask(1, "@example-reviewer review sonnet")
         self.replies = [review_reply([{"severity": "P1", "summary": "loses data"}])]
         self.user.fail_posts = 1
         self.tick(5)
@@ -1063,7 +1063,7 @@ class CodexRound3Tests(ReviewFlowTests):
         self.assertEqual(pr["sidechainBlockedHeads"], [HEAD])
         decision = train.eligibility(pr)
         self.assertEqual(decision[0], train.HOLD)
-        self.assertIn("inisa-sidechain", decision[1])
+        self.assertIn("sidechain review", decision[1])
         pr["head"] = "n" * 40
         self.assertEqual(train.eligibility(pr)[0], train.READY, "a new push answers it")
 
@@ -1079,7 +1079,7 @@ class CodexRound4Tests(ReviewFlowTests):
         fake.gh.rest_paginated.return_value = [
             {"user": {"login": reviewer.APP_LOGIN}, "created_at": "2026-01-01T00:00:00Z",  # months old
              "body": marker.compose("Review", blocking)},
-            {"user": {"login": "alex-bridges"}, "created_at": "2026-09-26T00:00:00Z",
+            {"user": {"login": "example-owner"}, "created_at": "2026-09-26T00:00:00Z",
              "body": marker.compose("Review", forged)}]
         fake.own_record.return_value = False
         pr = {"number": 7}
@@ -1254,11 +1254,11 @@ class CodexRound7Tests(ReviewFlowTests):
     """Codex's review of 7b12a561 (#1049)."""
 
     def test_i1_the_sandbox_reads_nothing_under_home_but_the_review(self):
-        settings = reviewer.run_settings("/Users/x/conductor/INISA", [], "/Users/x/.local/state/c/reviews")
+        settings = reviewer.run_settings("/Users/x/conductor/example-repo", [], "/Users/x/.local/state/c/reviews")
         files = settings["sandbox"]["filesystem"]
         self.assertIn(os.path.realpath(os.path.expanduser("~")), files["denyRead"])
         self.assertEqual(files["allowRead"], [os.path.realpath("/Users/x/.local/state/c/reviews"),
-                                              os.path.realpath("/Users/x/conductor/INISA")])
+                                              os.path.realpath("/Users/x/conductor/example-repo")])
 
     def test_i3_a_withdrawal_does_not_answer_the_request(self):
         withdrawal = {"kind": "review-clean", "v": 1, "agent": "t@h:x", "pr": 7, "head": "", "revokes": HEAD, "request": 5}
@@ -1305,7 +1305,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         than the margin, and the lease was dated from the tick's start."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        host = self.host("Tycho", request, 5)
+        host = self.host("ci-box", request, 5)
         host.began = at(5)
         self.replies = [review_reply()]
         with mock.patch.object(snapshot, "now_utc", return_value=at(35)):  # 30 min of pre-review work
@@ -1315,7 +1315,7 @@ class CrossHostClaimTests(ReviewFlowTests):
     def test_review_waits_when_posted_claim_is_not_visible_on_verification_read(self):
         self.app.echo_posts = False
         request = reviewer.requests([self.ask(1)])[0]
-        host = self.host("Tycho", request, 5)
+        host = self.host("ci-box", request, 5)
         host.review_step([], None, None, True, {})
         self.assertEqual(self.reviews(), [])
         self.assertEqual(host.state["reviews"][str(request["id"])]["status"], "pending")
@@ -1334,11 +1334,11 @@ class CrossHostClaimTests(ReviewFlowTests):
     def test_a_second_host_does_not_run_a_review_the_first_is_running(self):
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        first, second = self.host("Tycho", request, 5), self.host("Eidolon", request, 6)
+        first, second = self.host("ci-box", request, 5), self.host("workstation", request, 6)
         runner, overlapped = self.runner, []
 
         def overlapping(cmd, cwd, env, timeout):
-            if not overlapped:  # while Tycho's run is in flight, Eidolon's tick comes
+            if not overlapped:  # while ci-box's run is in flight, workstation's tick comes
                 overlapped.append(True)
                 second.review_step([], None, None, True, {})
             return runner(cmd, cwd, env, timeout)
@@ -1347,7 +1347,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         first.review_step([], None, None, True, {})
         self.assertEqual(len(self.reviews()), 1, "the second host saw the first's claim and did not run")
         self.assertEqual(len(self.app.markers("review")), 1)
-        self.assertEqual([marker.decode(b)["agent"] for b in self.app.claims], ["reviewer@Tycho:review"])
+        self.assertEqual([marker.decode(b)["agent"] for b in self.app.claims], ["reviewer@ci-box:review"])
         self.assertEqual(second.state["reviews"][str(request["id"])]["status"], "pending", "it waits, it does not give up")
         posts = len(self.app.posts)
         second.review_step([], None, None, True, {})
@@ -1355,7 +1355,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.assertEqual((len(self.reviews()), len(self.app.posts)), (1, posts), "no second run, no second reply")
 
 
-    def other_claim(self, until_minutes, comment_id=1, host="Eidolon", posted_minutes=0):
+    def other_claim(self, until_minutes, comment_id=1, host="workstation", posted_minutes=0):
         payload = {"kind": "review-claim", "v": 1, "agent": f"reviewer@{host}:review", "pr": 7, "head": HEAD,
                    "model": "opus", "request": 1, "until": snapshot.iso(at(until_minutes))}
         return {"id": comment_id, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"}, "body": marker.compose("claim", payload),
@@ -1368,7 +1368,7 @@ class CrossHostClaimTests(ReviewFlowTests):
     def test_the_lease_follows_the_configured_timeout(self):
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        host = self.host("Tycho", request, 5)
+        host = self.host("ci-box", request, 5)
         host.config.review_timeout = 2 * 60 * 60
         self.replies = [review_reply()]
         host.review_step([], None, None, True, {})
@@ -1376,19 +1376,19 @@ class CrossHostClaimTests(ReviewFlowTests):
 
     def test_a_retry_renews_a_claim_that_would_run_out_during_it(self):
         self.app.echo_posts = True
-        self.app.pr_comments.append(self.other_claim(10, host="Tycho", posted_minutes=-50))  # its first attempt's
+        self.app.pr_comments.append(self.other_claim(10, host="ci-box", posted_minutes=-50))  # its first attempt's
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [review_reply()]
-        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.host("ci-box", request, 5).review_step([], None, None, True, {})
         self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(5 + 45 + 15))], "renewed for the whole run")
         comments = self.app.rest_paginated("repos/{repo}/issues/7/comments")
-        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(30))["agent"], "reviewer@Tycho:review",
+        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(30))["agent"], "reviewer@ci-box:review",
                          "past its first claim's expiry, the renewal still holds it")
 
     def test_a_claim_that_lost_never_takes_over(self):
-        comments = [self.other_claim(50, 1, "Tycho", -10), self.other_claim(55, 2, "Eidolon", -10),  # posted at once
-                    self.other_claim(100, 3, "Tycho", 40)]  # Tycho's renewal
-        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(52))["agent"], "reviewer@Tycho:review")
+        comments = [self.other_claim(50, 1, "ci-box", -10), self.other_claim(55, 2, "workstation", -10),  # posted at once
+                    self.other_claim(100, 3, "ci-box", 40)]  # ci-box's renewal
+        self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(52))["agent"], "reviewer@ci-box:review")
         self.assertEqual(reviewer.claim_owner(comments[:2], 7, HEAD, "opus", at(52)), None,
                          "the loser's claim frees nothing and holds nothing")
         self.assertEqual(reviewer.claim_owner(comments, 7, HEAD, "opus", at(101)), None, "expired")
@@ -1399,12 +1399,12 @@ class CrossHostClaimTests(ReviewFlowTests):
 
         def racing(path, method="GET", body=None):
             if method == "POST" and "review-claim" in ((body or {}).get("body") or ""):
-                self.app.pr_comments.append(self.other_claim(60))  # Eidolon's, posted just before ours
+                self.app.pr_comments.append(self.other_claim(60))  # workstation's, posted just before ours
             return real(path, method, body)
         self.app.rest = racing
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [review_reply()]
-        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.host("ci-box", request, 5).review_step([], None, None, True, {})
         self.assertEqual(self.reviews(), [], "the re-read found the earlier claim")
 
     def test_a_finished_review_waiting_to_post_keeps_its_claim(self):
@@ -1412,13 +1412,13 @@ class CrossHostClaimTests(ReviewFlowTests):
         unclaimed and unanswered, so another host ran it again."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        first = self.host("Tycho", request, 5)
+        first = self.host("ci-box", request, 5)
         self.replies = [review_reply(), review_reply()]
         first.review_step([], None, None, True, {}, user_ok=False)  # run, then wait to record the pass
         self.assertEqual(len(self.reviews()), 1)
         first.now = at(60)  # an hour-long wake may come before the next handling: still covered
         first.review_step([], None, None, True, {}, user_ok=False)
-        self.host("Eidolon", request, 100).review_step([], None, None, True, {})  # past the run's lease (65)
+        self.host("workstation", request, 100).review_step([], None, None, True, {})  # past the run's lease (65)
         self.assertEqual(len(self.reviews()), 1, "the other host saw the renewed claim and did not run")
         # The run's lease, then one renewal for two gaps (two 60-min wake runs + 15) when it waited.
         self.assertEqual([c["until"] for c in self.claims()], [snapshot.iso(at(65)), snapshot.iso(at(5 + 270))])
@@ -1432,7 +1432,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         """Codex on 369c620: a read failing in compose() skipped the renewal."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        first = self.host("Tycho", request, 5)
+        first = self.host("ci-box", request, 5)
         self.replies = [review_reply()]
         first.review_step([], None, None, True, {}, user_ok=False)  # finished; waits on the budget
         real = self.app.rest_paginated
@@ -1456,7 +1456,7 @@ class CrossHostClaimTests(ReviewFlowTests):
 
         def racing(path, method="GET", body=None):
             if method == "POST" and "review-claim" in ((body or {}).get("body") or ""):
-                payload = {"kind": "review", "v": 1, "agent": "reviewer@Eidolon:review", "pr": 7, "head": HEAD,
+                payload = {"kind": "review", "v": 1, "agent": "reviewer@workstation:review", "pr": 7, "head": HEAD,
                            "model": "opus", "request": request["id"], "verdict": "pass"}
                 self.app.pr_comments.append({"id": 2, "user": {"login": reviewer.APP_LOGIN, "type": "Bot"},
                                              "body": marker.compose("review", payload),
@@ -1464,7 +1464,7 @@ class CrossHostClaimTests(ReviewFlowTests):
             return real(path, method, body)
         self.app.rest = racing
         self.replies = [review_reply()]
-        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.host("ci-box", request, 5).review_step([], None, None, True, {})
         self.assertEqual(self.reviews(), [], "answered meanwhile: no second run")
 
     def test_the_renewal_after_a_long_run_counts_the_run(self):
@@ -1472,7 +1472,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         claim had a whole gap left when only the margin did."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        host = self.host("Tycho", request, 5)
+        host = self.host("ci-box", request, 5)
         host.config.review_timeout = 2 * 60 * 60  # twice the run timeout: gap = 2 h 15
         wall, runner = [at(5)], self.runner
 
@@ -1492,7 +1492,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         started at the step still read the tick's start time."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        host = self.host("Tycho", request, 5)
+        host = self.host("ci-box", request, 5)
         wall = [at(5)]
         host.began = wall[0]
         self.replies = [review_reply()]
@@ -1514,12 +1514,12 @@ class CrossHostClaimTests(ReviewFlowTests):
         run_timeout, before review_step renews anything."""
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
-        first = self.host("Tycho", request, 5)
+        first = self.host("ci-box", request, 5)
         self.replies = [review_reply()]
         first.review_step([], None, None, True, {}, user_ok=False)  # finished; waits on the budget
         first.now = at(65)
         first.review_step([], None, None, True, {}, user_ok=False)  # the last renewal before the wake
-        self.assertEqual(self.owner_at(65 + 120 + 5), "reviewer@Tycho:review", "two 60-min runs later, still held")
+        self.assertEqual(self.owner_at(65 + 120 + 5), "reviewer@ci-box:review", "two 60-min runs later, still held")
 
     def test_a_failed_attempt_keeps_its_claim_for_the_retry(self):
         """Codex on 85c4876: after a failed run the request is retryable, and its claim must
@@ -1527,10 +1527,10 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [claude_result("SUMMARY: I forgot the block")]
-        first = self.host("Tycho", request, 5)
+        first = self.host("ci-box", request, 5)
         first.review_step([], None, None, True, {})
         self.assertEqual(first.state["reviews"][str(request["id"])]["attempts"], 1)
-        self.assertEqual(self.owner_at(5 + 15 + 120), "reviewer@Tycho:review")
+        self.assertEqual(self.owner_at(5 + 15 + 120), "reviewer@ci-box:review")
 
     def test_a_request_given_up_keeps_its_claim_until_the_reply_posts(self):
         """Codex on 85c4876: a give-up reply that failed to post left the request unanswered
@@ -1538,7 +1538,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.app.echo_posts = True
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [claude_result("SUMMARY: I forgot the block")] * 3
-        first = self.host("Tycho", request, 5)
+        first = self.host("ci-box", request, 5)
         for minutes in (5, 10, 15):
             first.now = at(minutes)
             if minutes == 15:
@@ -1546,7 +1546,7 @@ class CrossHostClaimTests(ReviewFlowTests):
             first.review_step([], None, None, True, {})
         record = first.state["reviews"][str(request["id"])]
         self.assertEqual((record["status"], bool(record.get("unsent"))), ("failed", True))
-        self.assertEqual(self.owner_at(15 + 140), "reviewer@Tycho:review")
+        self.assertEqual(self.owner_at(15 + 140), "reviewer@ci-box:review")
         first.now = at(20)
         first.review_step([], None, None, True, {})
         self.assertIn("gave up", self.app.posts[-1])
@@ -1561,7 +1561,7 @@ class CrossHostClaimTests(ReviewFlowTests):
         self.app.pr_comments.append(self.other_claim(4))  # its host died mid-run
         request = reviewer.requests([self.ask(1)])[0]
         self.replies = [review_reply()]
-        self.host("Tycho", request, 5).review_step([], None, None, True, {})
+        self.host("ci-box", request, 5).review_step([], None, None, True, {})
         self.assertEqual(len(self.reviews()), 1)
 
 
@@ -1594,13 +1594,13 @@ class CodexRound8Tests(ReviewFlowTests):
 
 class CodexRound9Tests(unittest.TestCase):
     def comment(self, login, association):
-        return {"id": 1, "user": {"login": login}, "author_association": association, "body": "@inisa-sidechain review",
+        return {"id": 1, "user": {"login": login}, "author_association": association, "body": "@example-reviewer review",
                 "html_url": "https://github.com/o/r/pull/7#issuecomment-1", "created_at": "2026-09-26T00:00:00Z"}
 
     def test_k1_only_trusted_commenters_can_ask(self):
-        self.assertEqual(len(reviewer.requests([self.comment("alex-bridges", "OWNER")])), 1)
+        self.assertEqual(len(reviewer.requests([self.comment("example-owner", "OWNER")])), 1)
         self.assertEqual(len(reviewer.requests([self.comment("helper", "COLLABORATOR")])), 1)
-        self.assertEqual(len(reviewer.requests([self.comment("alex-bridges", None)])), 1, "Alex's login however read")
+        self.assertEqual(len(reviewer.requests([self.comment("example-owner", None)])), 1, "Alex's login however read")
         for association in ("NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", None):
             self.assertEqual(reviewer.requests([self.comment("stranger", association)]), [], association)
 
@@ -1619,27 +1619,27 @@ class CodexRound10Tests(ReviewFlowTests):
         self.assertEqual(len(self.reviews()), 1)
 
     def test_l2_quotes_and_fences_inside_list_items_are_not_requests(self):
-        for body in ("- > @inisa-sidechain review", "1. > > @inisa-sidechain review", "> - @inisa-sidechain review",
-                     "- ```\n  @inisa-sidechain review\n  ```", "* text\n  > @inisa-sidechain review"):
+        for body in ("- > @example-reviewer review", "1. > > @example-reviewer review", "> - @example-reviewer review",
+                     "- ```\n  @example-reviewer review\n  ```", "* text\n  > @example-reviewer review"):
             self.assertIsNone(reviewer.find_tag(body), body)
-        self.assertEqual(reviewer.find_tag("- @inisa-sidechain review sonnet")["model"], "sonnet",
+        self.assertEqual(reviewer.find_tag("- @example-reviewer review sonnet")["model"], "sonnet",
                          "a plain list item is a request")
-        self.assertEqual(reviewer.find_tag("@inisa-sidechain review")["model"], "opus")
+        self.assertEqual(reviewer.find_tag("@example-reviewer review")["model"], "opus")
 
 
 class CodexRound11Tests(ReviewFlowTests):
     def read_guard(self, tool, data, state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
         home = os.path.realpath(os.path.expanduser("~"))
-        env.update({"COORD_AGENT": "reviewer@Tycho:review", "CONDUCTOR_WAKE": "1",
-                    "CLAUDE_PROJECT_DIR": os.path.join(home, "conductor", "INISA"), "CONDUCTOR_STATE_DIR": state})
-        payload = json.dumps({"tool_name": tool, "tool_input": data, "cwd": os.path.join(home, "conductor", "INISA")})
+        env.update({"COORD_AGENT": "reviewer@ci-box:review", "CONDUCTOR_WAKE": "1",
+                    "CLAUDE_PROJECT_DIR": os.path.join(home, "conductor", "example-repo"), "CONDUCTOR_STATE_DIR": state})
+        payload = json.dumps({"tool_name": tool, "tool_input": data, "cwd": os.path.join(home, "conductor", "example-repo")})
         return subprocess.run([sys.executable, REVIEWER_GUARD], input=payload, capture_output=True, text=True,
                               env=env).returncode
 
     def test_m1_the_runs_own_reads_stay_in_the_review(self):
         home = os.path.realpath(os.path.expanduser("~"))
-        state = os.path.join(home, ".local", "state", "inisa-conductor")
+        state = os.path.join(home, ".local", "state", "example-conductor")
         for tool, data in (("Read", {"file_path": "~/.aws/credentials"}), ("Read", {"file_path": "../../.npmrc"}),
                            ("Grep", {"pattern": "token", "path": home}), ("Glob", {"pattern": home + "/.*rc"}),
                            ("LS", {"path": os.path.join(home, ".local")}), ("Grep", {"pattern": "x", "path": "~/.ssh"})):
@@ -1651,10 +1651,10 @@ class CodexRound11Tests(ReviewFlowTests):
             self.assertEqual(self.read_guard(tool, data, state), 0, (tool, data))
 
     def test_m1_the_read_guard_is_registered_for_the_run(self):
-        settings = reviewer.run_settings("/Users/x/conductor/INISA", [], "/r")
+        settings = reviewer.run_settings("/Users/x/conductor/example-repo", [], "/r")
         hook = settings["hooks"]["PreToolUse"][0]
         self.assertEqual(hook["matcher"], "Read|Grep|Glob|LS|NotebookRead")
-        self.assertTrue(hook["hooks"][0]["command"].endswith("/conductor/INISA/.claude/hooks/conductor-guard.py"))
+        self.assertTrue(hook["hooks"][0]["command"].endswith("/conductor/example-repo/.claude/hooks/conductor-guard.py"))
 
     def test_m2_a_restarted_host_counts_its_own_mid_run_beat(self):
         from coordlib import lease
@@ -1714,7 +1714,7 @@ class CodexRound13Tests(ReviewFlowTests):
         deny = json.loads(cmd[cmd.index("--settings") + 1])["permissions"]["deny"]
         for tool in ("Read", "Grep", "Glob", "LS", "Edit", "Write", "WebFetch", "Agent"):
             self.assertIn(tool, deny)
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "agents",
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "agents",
                             "reviewer.md")
         with open(path, encoding="utf-8") as handle:
             front = handle.read().split("---")[1]
@@ -1736,10 +1736,10 @@ class CodexRound13Tests(ReviewFlowTests):
 
 class CodexRound14Tests(ReviewFlowTests):
     def test_p1_html_code_and_quotes_hide_the_tag(self):
-        for body in ("<code>@inisa-sidechain review</code>", "<blockquote>\n@inisa-sidechain review\n</blockquote>",
-                     "<PRE class='x'>@inisa-sidechain review</PRE>", "<kbd>@inisa-sidechain review", "<q>@inisa-sidechain review</q>"):
+        for body in ("<code>@example-reviewer review</code>", "<blockquote>\n@example-reviewer review\n</blockquote>",
+                     "<PRE class='x'>@example-reviewer review</PRE>", "<kbd>@example-reviewer review", "<q>@example-reviewer review</q>"):
             self.assertIsNone(reviewer.find_tag(body), body)
-        self.assertEqual(reviewer.find_tag("<b>note</b> @inisa-sidechain review haiku")["model"], "haiku")
+        self.assertEqual(reviewer.find_tag("<b>note</b> @example-reviewer review haiku")["model"], "haiku")
 
     def test_p2_a_bad_model_is_answered_during_a_pause(self):
         watcher = mock.Mock(state={"reviews": {"1": {"id": 1, "pr": 7, "model": None, "error": "unknown model `x`",
@@ -1769,9 +1769,9 @@ class CodexRound15Tests(ReviewFlowTests):
         self.assertIn("base moved", self.app.posts[-1])
 
     def test_q3_html_comments_hide_the_tag(self):
-        self.assertIsNone(reviewer.find_tag("<!-- @inisa-sidechain review -->"))
-        self.assertIsNone(reviewer.find_tag("<!--\n@inisa-sidechain review"))
-        self.assertEqual(reviewer.find_tag("<!-- x --> @inisa-sidechain review")["model"], "opus")
+        self.assertIsNone(reviewer.find_tag("<!-- @example-reviewer review -->"))
+        self.assertIsNone(reviewer.find_tag("<!--\n@example-reviewer review"))
+        self.assertEqual(reviewer.find_tag("<!-- x --> @example-reviewer review")["model"], "opus")
 
     def test_q4_unfenced_json_with_nested_findings_is_read_whole(self):
         text = 'Done. {"summary": "s", "findings": [{"severity": "P2", "summary": "bug"}], "checked": ["a"]} bye'
@@ -1913,7 +1913,7 @@ class CodexRound17Tests(ReviewFlowTests):
 
 
 class ReviewerWriteGuardTests(unittest.TestCase):
-    def guard(self, path, agent="reviewer@Tycho:review", state="/tmp/state"):
+    def guard(self, path, agent="reviewer@ci-box:review", state="/tmp/state"):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
         env.update({"COORD_AGENT": agent, "CONDUCTOR_WAKE": "1", "CLAUDE_PROJECT_DIR": "/tmp/home",
                     "CONDUCTOR_STATE_DIR": state})
@@ -1927,12 +1927,12 @@ class ReviewerWriteGuardTests(unittest.TestCase):
         self.assertEqual(self.guard("/tmp/state/reviews/pr-7-abc-scratch/probe.py"), 0)
         self.assertEqual(self.guard("/tmp/state/reviews/pr-7-abc/Tools/x.py"), 0, "the PR's throwaway tree")
         self.assertEqual(self.guard("README.md", state=""), 2, "no state dir: nowhere")
-        self.assertEqual(self.guard("README.md", agent="conductor@Tycho:conductor"), 0, "the conductor's own rules")
+        self.assertEqual(self.guard("README.md", agent="conductor@ci-box:conductor"), 0, "the conductor's own rules")
 
 
 class ReviewerAgentTests(unittest.TestCase):
     def test_the_reviewer_definition_exists_and_describes_the_block(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "agents", "reviewer.md")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "agents", "reviewer.md")
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn("name: reviewer", text)
@@ -1940,19 +1940,19 @@ class ReviewerAgentTests(unittest.TestCase):
         self.assertNotIn("\nmodel:", text.split("---")[1], "the watcher's --model decides")
 
 
-_INISA_CONFIG_PATH = None
+_EXAMPLE_CONFIG_PATH = None
 
 
 def setUpModule():
-    global _INISA_CONFIG_PATH
+    global _EXAMPLE_CONFIG_PATH
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import conductor_config_fixture
-    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+    _EXAMPLE_CONFIG_PATH = conductor_config_fixture.use_example_config()
 
 
 def tearDownModule():
     import conductor_config_fixture
-    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
+    conductor_config_fixture.restore(_EXAMPLE_CONFIG_PATH)
 
 
 if __name__ == "__main__":

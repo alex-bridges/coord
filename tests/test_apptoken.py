@@ -25,13 +25,13 @@ from apptestkit import (API, CLIENT_ID, INSTALLATION, OPENSSLS, PEM, PEM_B64, PU
                         AppTestCase, file_mode, jwt_parts, read_json)
 from coordlib import apptoken, budget  # noqa: E402
 from coordlib.gh import AppAuthError  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow names, state dir and weekly reset are config
+example_config.use()  # example-repo workflow names, state dir and weekly reset are config
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 
 
@@ -870,8 +870,8 @@ class ModeTests(AppTestCase):
         self.assertEqual(self.security_calls(), [])
 
     def test_the_default_paths_and_binaries(self):
-        self.assertEqual(apptoken.config_path({}), os.path.expanduser("~/.config/inisa-coord/github-app.json"))
-        self.assertEqual(apptoken.token_cache_dir({}), os.path.expanduser("~/Library/Caches/inisa-coord"))
+        self.assertEqual(apptoken.config_path({}), os.path.expanduser("~/.config/example-coord/github-app.json"))
+        self.assertEqual(apptoken.token_cache_dir({}), os.path.expanduser("~/Library/Caches/example-coord"))
         self.assertEqual(apptoken.OPENSSL, "/usr/bin/openssl")
         with open(apptoken.__file__, encoding="utf-8") as handle:
             source = handle.read()
@@ -1224,11 +1224,11 @@ class SecurityOverrideTests(AppTestCase):
         self.saved_security, self.real_run = apptoken.SECURITY, apptoken.subprocess.run  # the fake, and run itself
         self.patch(apptoken, "SECURITY", "/usr/bin/security")
         self.fake = os.path.join(self.root, "bin", "security")
-        # This test's stand-ins for ~/.config/inisa-coord/github-app.json under $HOME and
+        # This test's stand-ins for ~/.config/example-coord/github-app.json under $HOME and
         # under the real home (never the real file: the test must mean the same on every
         # machine). Both hold "the real" client id.
         self.home = os.path.join(self.root, "Home")
-        self.default = os.path.join(self.home, ".config", "inisa-coord", "github-app.json")
+        self.default = os.path.join(self.home, ".config", "example-coord", "github-app.json")
         self.write(self.default, self.REAL_ID)
         self.patch(apptoken, "default_config_path", lambda: self.default)
         self.patch(apptoken, "real_home", lambda: self.home)
@@ -1278,7 +1278,7 @@ class SecurityOverrideTests(AppTestCase):
             "a symlink to the file": link,
             "a hard link to the file": hard,
             "through a symlinked folder": os.path.join(linked_dir, "github-app.json"),
-            "with ..": os.path.join(folder, "..", "inisa-coord", "github-app.json"),
+            "with ..": os.path.join(folder, "..", "example-coord", "github-app.json"),
             "with ./": os.path.join(folder, ".", "github-app.json"),
             "in other letter case": self.default.replace("/Home/", "/HOME/").replace("github-app", "GitHub-App"),
         }
@@ -1295,7 +1295,7 @@ class SecurityOverrideTests(AppTestCase):
     def test_moving_home_does_not_hide_the_real_config(self):
         # HOME points somewhere else, so default_config_path() names an empty place; the
         # real home (from the password database) still holds the real config.
-        moved = os.path.join(self.root, "moved-home", ".config", "inisa-coord", "github-app.json")
+        moved = os.path.join(self.root, "moved-home", ".config", "example-coord", "github-app.json")
         self.patch(apptoken, "default_config_path", lambda: moved)
         self.assert_refused(self.default, words="is the default app config")
         copy = os.path.join(self.root, "copy.json")

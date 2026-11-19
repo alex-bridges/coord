@@ -335,10 +335,10 @@ def principal_words(repo: str, principal: Optional[str], now: Optional[float] = 
 def header_words(repo: str, now: Optional[float] = None, principal: Optional[str] = USER) -> str:
     """The board's budget line, from recorded readings only (it never spends a call). In
     app mode (`principal` not USER; None before the installation is known) it shows the
-    app's budget, which coord spends, then Alex's."""
+    app's budget, which coord spends, then the user's."""
     if principal == USER:
         return "API: " + principal_words(repo, USER, now)
-    return f"API (app): {principal_words(repo, principal, now)} · Alex: {principal_words(repo, USER, now)}"
+    return f"API (app): {principal_words(repo, principal, now)} · user: {principal_words(repo, USER, now)}"
 
 
 # MARK: - The guard

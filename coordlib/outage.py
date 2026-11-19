@@ -1,6 +1,6 @@
 """Harness outages: every agent of one kind down at once, until a known time.
 
-Every Claude agent (Claude Code on Eidolon and Tycho, the Claude cloud sessions and the
+Every Claude agent (local Claude Code sessions, Claude cloud sessions and the
 conductor) draws on ONE subscription, so a usage limit stops all of them together. The
 weekly limit resets Thursday 12:00 America/New_York (Alex, 2026-09-25); a five-hour
 limit can also stop them in between. Codex has its own quota and keeps working, and so

@@ -68,12 +68,12 @@ class AppRefused(Exception):
 
 def app_words(error: Exception) -> str:
     """The cause of an app failure, and the deliberate override, in one line."""
-    return f"GitHub App token unavailable ({redact(str(error))}); nothing was sent as Alex ({apptoken.OVERRIDE})"
+    return f"GitHub App token unavailable ({redact(str(error))}); nothing was sent as user ({apptoken.OVERRIDE})"
 
 
 def app_stale_words(error: Exception) -> str:
     """The same, short enough for the board's first line."""
-    return f"GitHub App token unavailable: {render._clip(redact(str(error)), 120)}; COORD_APP=off uses Alex's gh"
+    return f"GitHub App token unavailable: {render._clip(redact(str(error)), 120)}; COORD_APP=off uses user's gh"
 
 
 class ArgumentParser(argparse.ArgumentParser):
@@ -281,11 +281,11 @@ def identity_words(gh: GitHub) -> str:
     app = getattr(gh, "app", None)
     if app is None:
         why = f" ({mode.reason})" if mode is not None else ""
-        return f"Alex's gh/keyring login, or GH_TOKEN{why}"
+        return f"user's gh/keyring login, or GH_TOKEN{why}"
     login = ((getattr(app, "config", None) or {}).get("app_login")) or "the GitHub App"
     installation = app.installation_id()
     where = f"installation {installation}" if installation else "installation not yet known"
-    return (f"{login} ({where}) for reads and operational writes; Alex for "
+    return (f"{login} ({where}) for reads and operational writes; user for "
             + ", ".join(f"`{c}`" for c in sorted(USER_IDENTITY)))
 
 
@@ -717,12 +717,12 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     if verdict == train.DROP:
         print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
         return EXIT_CONFLICT
+    needs_label, approved_label = train.needs_owner_label(), train.owner_approved_label()
     text = (
         f"**Added to the merge train** by `{me}` at head `{pr['head'][:9]}`"
         + (f" ({args.note})" if args.note else "") + ".\n\n"
-        "Adding asserts this PR is not a carve-out (a sound-character change, a persistence change "
-        "without a migration, a public API break); those carry `needs-alex` until Alex adds "
-        "`alex-approved`. A new push after this point takes the PR out of the train."
+        f"Adding asserts this PR is not an owner-only carve-out; those carry `{needs_label}` until "
+        f"the owner adds `{approved_label}`. A new push after this point takes the PR out of the train."
     )
     # The head marker first, the label second: the label is what queues the PR, so it
     # must never exist without the record of the head it was added at (Codex on #989).
@@ -811,19 +811,19 @@ def cmd_train_review(args: argparse.Namespace, gh: GitHub) -> int:
 
 
 def cmd_train_approve(args: argparse.Namespace, gh: GitHub) -> int:
-    """Alex approves a needs-alex PR at the head he approved (`--head`), which must still
-    be its head. Every agent posts as Alex's login, so this is procedure, not
-    authentication: run it only on Alex's word."""
+    """Record the owner's approval of a guarded/carve-out PR at the approved head (`--head`),
+    which must still be its head. Agents may share the owner's login, so this is procedure,
+    not authentication: run it only on the owner's explicit approval."""
     me = identity.agent_id()
     head = attested_head(gh, args.pr, args.head)
     if head is None:
         return EXIT_CONFLICT
-    text = (f"**Approved by Alex** for head `{head[:9]}` (recorded by `{me}`).\n\n{args.note}\n\n"
+    text = (f"**Approved by owner** for head `{head[:9]}` (recorded by `{me}`).\n\n{args.note}\n\n"
             "This covers this head only; a new push needs a new approval.")
-    post_comment(gh, args.pr, text, {"kind": "alex-approve", "v": 1, "agent": me, "pr": args.pr, "head": head})
-    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.ALEX_APPROVED_LABEL]})
+    post_comment(gh, args.pr, text, {"kind": "owner-approve", "v": 1, "agent": me, "pr": args.pr, "head": head})
+    gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.owner_approved_label()]})
     cache.invalidate_snapshot(gh.repo)
-    print(f"recorded Alex's approval of #{args.pr} at {head[:9]}")
+    print(f"recorded owner's approval of #{args.pr} at {head[:9]}")
     return EXIT_OK
 
 
@@ -988,7 +988,7 @@ def cmd_token_exec(args: argparse.Namespace, gh: GitHub) -> int:
 
 
 def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
-    # merge-train.yml passes the inisa-sidechain app's installation token here, and only
+    # merge-train.yml passes the GitHub App's installation token here, and only
     # here, when it could mint one; without it workflow PRs are dropped for a hand merge.
     app_token = os.environ.get(train.WORKFLOW_TOKEN_ENV) or ""
     merger = GitHub(repo=gh.repo, transport="http", token=app_token) if app_token else None
@@ -1137,7 +1137,9 @@ def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
         lines += ["", f"THIS MACHINE ({config.agent}): no wakes recorded in {config.state_dir}"]
     reviews = conductor.read_wakes(config, name="reviews.jsonl")
     if reviews:
-        lines += ["", "REVIEWS (@inisa-sidechain review; newest last)"]
+        from . import config as coord_config
+        trigger = coord_config.get("reviewer_trigger") or "sidechain reviewer"
+        lines += ["", f"REVIEWS ({trigger}; newest last)"]
         for entry in reviews[-args.last:]:
             lines.append(f"  {entry.get('at')} #{entry.get('pr')} {str(entry.get('head') or '')[:9]} {entry.get('model')} "
                          f"{'ok' if entry.get('ok') else 'FAILED'} {entry.get('seconds')}s")
@@ -1177,9 +1179,9 @@ def cmd_conductor_escalate(args: argparse.Namespace, gh: GitHub) -> int:
     issue = conductor.conductor_issue(gh)
     posted = conductor.post_record(gh, issue, args.text, {"kind": "conductor", "v": 1, "event": "escalate", "agent": me})
     cache.invalidate_snapshot(gh.repo)
-    notified = conductor.notify_alex(gh, issue, f"{args.text} {posted.get('html_url')}")
-    print(f"escalated to Alex (on the board for 24 h" + (", and to his phone" if notified else
-          "; Notify Alex could not be dispatched") + f"): {posted.get('html_url')}")
+    notified = conductor.notify_owner(gh, issue, f"{args.text} {posted.get('html_url')}")
+    print(f"escalated to the owner (on the board for 24 h" + (", and notified via workflow" if notified else
+          "; notify workflow could not be dispatched") + f"): {posted.get('html_url')}")
     return EXIT_OK
 
 
@@ -1276,10 +1278,10 @@ def parser() -> argparse.ArgumentParser:
     substitute.add_argument("--by", metavar="AGENT", help="the agent that did the review")
     substitute.add_argument("--note", required=True, help="who reviewed and where the review is")
     substitute.set_defaults(func=cmd_train_review)
-    approve = train_sub.add_parser("approve", help="record Alex's approval of a needs-alex PR at a head")
+    approve = train_sub.add_parser("approve", help="record the owner's approval of a guarded PR at a head")
     approve.add_argument("pr", type=int)
     approve.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
-    approve.add_argument("--note", required=True, help="Alex's words, or where he approved")
+    approve.add_argument("--note", required=True, help="the owner's words, or where approval was given")
     approve.set_defaults(func=cmd_train_approve)
     status = train_sub.add_parser("status", help="the current batch and every queued PR's readiness")
     status.add_argument("--json", action="store_true")
@@ -1332,7 +1334,7 @@ def parser() -> argparse.ArgumentParser:
     pause.set_defaults(func=cmd_conductor_pause)
     resume = conductor_sub.add_parser("resume", help="end a pause")
     resume.set_defaults(func=cmd_conductor_resume)
-    escalate = conductor_sub.add_parser("escalate", help="put something in front of Alex on the board (24 h)")
+    escalate = conductor_sub.add_parser("escalate", help="put something in front of the owner on the board (24 h)")
     escalate.add_argument("text")
     escalate.set_defaults(func=cmd_conductor_escalate)
 

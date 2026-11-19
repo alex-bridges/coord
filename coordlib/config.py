@@ -4,8 +4,6 @@ Read from `.coord/config.json` in the target repository's working tree
 (`COORD_CONFIG` overrides the path). A missing file means generic defaults:
 board, claim, send and inbox work; the merge train, reviewer and conductor
 stay disabled until the repo configures them.
-
-Every value that used to be an INISA hardcode lives in DEFAULTS below.
 """
 
 import json
@@ -16,6 +14,8 @@ DEFAULTS = {
     "default_branch": None,          # None: ask GitHub
     "owner_login": None,             # None: repo owner
     "owner_mention": None,           # None: "@" + owner_login
+    "needs_owner_label": "needs-owner",       # label holding PRs for owner approval
+    "owner_approved_label": "owner-approved", # label recording owner approval
     "reviewer_bot_login": None,      # None: reviewer disabled
     "reviewer_trigger": None,        # e.g. "@my-bot review"
     "ci_workflow": None,             # e.g. "ci.yml"; None: train disabled
@@ -24,6 +24,7 @@ DEFAULTS = {
     "verdict_job": None,             # e.g. "CI verdict"
     "wake_job": None,                # e.g. "Wake the merge train"
     "ci_lanes": None,                # e.g. "changed"
+    "ignored_check_prefixes": [],    # check/status name prefixes to ignore in CI state
     "owner_only_paths": [],          # PRs touching these need the owner
     "lane_classifier": None,         # {"script": ..., "rules": ...} or None
     "runner_variables": [],          # repo variables the conductor may set
@@ -40,7 +41,7 @@ DEFAULTS = {
     "claude_weekly_reset": None,     # e.g. "Thu 12:00 America/New_York"
     "keychain_service": "coord-github-app",
     "state_dir_name": "coord",       # ~/.cache/<name>, ~/.config/<name>
-    "legacy_state_dir_names": [],    # read-only fallbacks, e.g. ["inisa-coord"]
+    "legacy_state_dir_names": [],    # read-only fallbacks for older state directory names
 }
 
 CONFIG_RELATIVE_PATH = ".coord/config.json"

@@ -48,11 +48,30 @@ from . import config, marker
 
 TRAIN_LABEL = "train"
 SOLO_LABEL = "train:solo"
-NEEDS_ALEX_LABEL = "needs-alex"
-ALEX_APPROVED_LABEL = "alex-approved"
 REVIEWED_LABEL = "reviewed"
 BATCH_PREFIX = "train/"
 BATCH_CAP = 3
+
+
+def needs_owner_label() -> str:
+    """Label that holds a PR for owner approval (config `needs_owner_label`, default `needs-owner`)."""
+    return config.get("needs_owner_label") or "needs-owner"
+
+
+def owner_approved_label() -> str:
+    """Label that records owner approval of a head (config `owner_approved_label`, default `owner-approved`)."""
+    return config.get("owner_approved_label") or "owner-approved"
+
+
+def labels() -> Dict[str, Tuple[str, str]]:
+    """Labels the train creates and reads (names follow config)."""
+    return {
+        TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
+        SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
+        REVIEWED_LABEL: ("c2e0c6", "coord: informational; a clean review is recorded (coord train review records which head)"),
+        needs_owner_label(): ("b60205", "coord: a carve-out; the train holds it until the owner approves its head"),
+        owner_approved_label(): ("0e8a16", "coord: the owner approved a head (coord train approve records which)"),
+    }
 
 
 class NotConfigured(ValueError):
@@ -172,6 +191,11 @@ _LAZY_NAMES = {
     "OWNER_MENTION": owner_mention,
     "ALEX_ONLY_PATHS": owner_only_paths,
     "OWNER_ONLY_PATHS": owner_only_paths,
+    "NEEDS_OWNER_LABEL": needs_owner_label,
+    "OWNER_APPROVED_LABEL": owner_approved_label,
+    "NEEDS_ALEX_LABEL": needs_owner_label,
+    "ALEX_APPROVED_LABEL": owner_approved_label,
+    "LABELS": labels,
     "LANE_SELECTOR": lambda: (lane_classifier_files() or (None, None))[0],
     "LANE_RULES": lambda: (lane_classifier_files() or (None, None))[1],
 }
@@ -185,59 +209,57 @@ def __getattr__(name: str) -> Any:
 
 
 WORKFLOW_DIR = ".github/workflows/"
-# The inisa-sidechain app's installation token, minted by merge-train.yml with contents
-# and workflows write, for the batch pushes and main moves that carry workflow changes.
-# Unset: workflow PRs are dropped for a hand merge, as before the app had the permission.
+# Optional GitHub App installation token, minted by merge-train.yml with contents and
+# workflows write, for batch pushes and trunk moves that carry workflow changes.
+# Unset: workflow PRs are dropped for a hand merge.
 WORKFLOW_TOKEN_ENV = "COORD_TRAIN_APP_TOKEN"
 # What coord's own views (`train add`, `train status`, the board, the conductor's stuck
-# check) assume, since they cannot see whether the Actions step will hold that token:
-# that it will (Alex granted the app workflows write, 2026-10-04). Only the step decides;
-# without the token it takes the PR out with the hand-merge comment.
+# check) assume, since they cannot see whether the Actions step will hold that token.
+# Only the step decides; without the token it takes the PR out with the hand-merge comment.
 VIEWS_ASSUME_WORKFLOW_TOKEN = True
-# What governs the unattended conductor: its standing orders, the settings, hooks and
-# deny list its runs load, and the watcher that starts them. The conductor must not be
-# able to widen its own powers through the train, so a repo lists those paths in config
-# `owner_only_paths` and they wait for the owner's approval of the head like a
-# needs-alex PR, whoever queued them. Default: none.
+# What governs the unattended conductor: its standing orders, settings, hooks and
+# deny list, and the watcher that starts them. The conductor must not be able to widen
+# its own powers through the train, so a repo lists those paths in config
+# `owner_only_paths` and they wait for the owner's approval of the head, whoever queued
+# them. Default: none.
 MAX_ATTEMPTS = 2
 # Each light/heavy pool admits at most twelve attempts per 24 hours by default.
-# The former twelve-run bound assumed ~1 h per heavy run; counting retries makes
-# that bound honest, and a separate light pool keeps cheap docs moving. An explicit
-# COORD_TRAIN_DAILY_RUNS still imposes its combined cap (now including attempts).
+# An explicit COORD_TRAIN_DAILY_RUNS still imposes its combined cap (including attempts).
 DAILY_RUNS_DEFAULT = 12
 
 READY, HOLD, DROP = "ready", "hold", "drop"
 
-# Why a queued PR is held: a fixed set. The train's `held` notice (#1034) is keyed on
+# Why a queued PR is held: a fixed set. The train's `held` notice is keyed on
 # (PR, head, class), never on the reason's wording, which changes from step to step
 # (the failing checks it lists, the number of findings).
 HOLD_DRAFT = "draft"
 HOLD_PARTIAL_DATA = "partial-data"
-HOLD_NEEDS_ALEX = "needs-alex"
+HOLD_NEEDS_OWNER = "needs-owner"
+HOLD_NEEDS_ALEX = HOLD_NEEDS_OWNER  # compatibility alias
 HOLD_NO_REVIEW = "no-review"  # neither a Codex 👍 nor a recorded clean review at the head (Codex re-reviewing or not)
 HOLD_UNANSWERED_FINDINGS = "unanswered-findings"
 HOLD_CI_RED = "ci-red"
 HOLD_HEAD_MOVED = "head-moved"  # the step's own checks, not eligibility: the head moved under a batch
 HOLD_CONFLICT = "conflict"      # the step's own checks: `git merge-tree` found a conflict
 HOLD_MERGE_CHECK = "merge-check"  # GitHub reports a conflict; the checkout must verify it
-HOLD_CLASSES = (HOLD_DRAFT, HOLD_PARTIAL_DATA, HOLD_NEEDS_ALEX, HOLD_NO_REVIEW, HOLD_UNANSWERED_FINDINGS,
+HOLD_CLASSES = (HOLD_DRAFT, HOLD_PARTIAL_DATA, HOLD_NEEDS_OWNER, HOLD_NO_REVIEW, HOLD_UNANSWERED_FINDINGS,
                 HOLD_CI_RED, HOLD_HEAD_MOVED, HOLD_CONFLICT, HOLD_MERGE_CHECK)
-# Holds only Alex can clear: an approval of the head, or (the train never merges a PR it
-# cannot read whole) a hand merge. Their notice @-mentions him, so it reaches his GitHub
-# notifications even when no agent is running.
-OWNER_HOLDS = frozenset({HOLD_NEEDS_ALEX, HOLD_PARTIAL_DATA})
+# Holds only the owner can clear: an approval of the head, or (the train never merges a
+# PR it cannot read whole) a hand merge. Their notice @-mentions the owner, so it reaches
+# GitHub notifications even when no agent is running.
+OWNER_HOLDS = frozenset({HOLD_NEEDS_OWNER, HOLD_PARTIAL_DATA})
 # Every held notice also goes to the conductor, whichever session that is.
 CONDUCTOR = "conductor@*"
 # What clears each hold; `{pr}` is the PR number.
 HOLD_ACTIONS = {
     HOLD_DRAFT: "Mark it ready for review, or take it out with `coord train remove {pr}`.",
     HOLD_PARTIAL_DATA: ("The train never merges a PR it cannot read whole, so this one stays held at this head. "
-                        "Alex decides: merge it by hand, or take it out of the train."),
+                        "The owner decides: merge it by hand, or take it out of the train."),
     # `--head` is a placeholder, never the current head: copying the current head would
     # attest whatever is there now, not the head that was reviewed or approved.
-    HOLD_NEEDS_ALEX: ("Alex: approve this head (`coord train approve {pr} "
-                      "--head <full-sha-Alex-approved> --note \"…\"`, or tell an agent to), or take it out of the "
-                      "train. A new push needs a new approval."),
+    HOLD_NEEDS_OWNER: ("Owner: approve this head (`coord train approve {pr} "
+                       "--head <full-approved-sha> --note \"…\"`, or ask an agent to), or take it out of the "
+                       "train. A new push needs a new approval."),
     HOLD_NO_REVIEW: ("It needs Codex's 👍 on this head, or a clean review of this head by any agent, recorded "
                      "with `coord train review {pr} --head <full-reviewed-sha> --by <agent> "
                      "--note \"…\"`."),
@@ -252,14 +274,6 @@ HOLD_ACTIONS = {
                     "it waits for the next batch."),
     HOLD_MERGE_CHECK: ("The train verifies this head against its fetched main with git before removing it for a "
                        "conflict. It stays queued while that check is unavailable."),
-}
-
-LABELS = {
-    TRAIN_LABEL: ("0e8a16", "coord: queued for the merge train"),
-    SOLO_LABEL: ("fbca04", "coord: the merge train tests this PR on its own (it was in a red batch)"),
-    REVIEWED_LABEL: ("c2e0c6", "coord: informational; a clean review is recorded (coord train review records which head)"),
-    NEEDS_ALEX_LABEL: ("b60205", "coord: a carve-out; the train holds it until Alex approves its head"),
-    ALEX_APPROVED_LABEL: ("0e8a16", "coord: Alex approved a head (coord train approve records which)"),
 }
 
 
@@ -280,15 +294,18 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     """(verdict, hold class, reason): `eligibility` plus, for a HOLD, which of
     HOLD_CLASSES it is ("" for READY and DROP).
 
-    `workflow_token`: the step holds the inisa-sidechain app's installation token, which
-    may push workflow files (merge-train.yml mints it). Without it a PR that changes
+    `workflow_token`: the step holds a GitHub App installation token that may push
+    workflow files (merge-train.yml mints it). Without it a PR that changes
     `.github/workflows/` is dropped, since the Actions token cannot move main onto it;
-    with it, such a PR waits for Alex's approval of its head, like owner_only_paths.
+    with it, such a PR waits for the owner's approval of its head, like owner_only_paths.
     `base_branch` is the default branch (default_branch() when omitted).
     `merge_verified` is used only by Step after git confirms the exact head merges
     cleanly with its pinned main. Read-only views never override GitHub's metadata."""
     files = list(all_files) if all_files is not None else pr.get("files", [])
-    labels = set(pr.get("labels", []))
+    labels_on_pr = set(pr.get("labels", []))
+    needs_label = needs_owner_label()
+    approved_label = owner_approved_label()
+    approved_head = pr.get("ownerApprovedHead") if pr.get("ownerApprovedHead") is not None else pr.get("alexApprovedHead")
     base = base_branch or default_branch()
     if pr.get("base") != base:
         return DROP, "", f"its base is {pr.get('base')}, not {base}"
@@ -301,31 +318,31 @@ def assess(pr: Dict[str, Any], head_at_add: Optional[str] = None,
     if touched and not workflow_token:
         return DROP, "", (f"it changes {touched[0]}: the Actions token cannot push workflow changes, "
                           "so this PR is merged by hand")
-    approved_at_head = ALEX_APPROVED_LABEL in labels and pr.get("alexApprovedHead") == pr.get("head")
+    approved_at_head = approved_label in labels_on_pr and approved_head == pr.get("head")
     if touched and not approved_at_head:
-        # CI itself, and the train's own workflow: the app token can merge it, Alex decides.
-        return HOLD, HOLD_NEEDS_ALEX, (f"it changes {touched[0]}, a workflow file the train merges only at a head "
-                                       "Alex approved (`coord train approve`)")
+        # CI itself, and the train's own workflow: the app token can merge it, owner decides.
+        return HOLD, HOLD_NEEDS_OWNER, (f"it changes {touched[0]}, a workflow file the train merges only at a head "
+                                        "the owner approved (`coord train approve`)")
     guarded = [f for f in files if any(f == p or f.startswith(p) for p in owner_only_paths())]
     if guarded and not approved_at_head:
-        return HOLD, HOLD_NEEDS_ALEX, (f"it changes {guarded[0]}, which governs the unattended conductor; "
-                                       "Alex approves its head (`coord train approve`)")
+        return HOLD, HOLD_NEEDS_OWNER, (f"it changes {guarded[0]}, which governs the unattended conductor; "
+                                        "the owner approves its head (`coord train approve`)")
     if pr.get("isDraft"):
         return HOLD, HOLD_DRAFT, "it is a draft"
     if pr.get("incomplete"):
         return HOLD, HOLD_PARTIAL_DATA, ("GitHub returned only part of its " + ", ".join(pr["incomplete"])
                                          + "; the train does not decide on partial data")
-    if NEEDS_ALEX_LABEL in labels:
-        # Alex's approval covers the head he approved, not later pushes: labels persist
-        # across pushes (substitute review of #989, P1). `coord train approve` records it.
-        if ALEX_APPROVED_LABEL not in labels:
-            return HOLD, HOLD_NEEDS_ALEX, "it is labelled needs-alex and waits for Alex (`coord train approve`)"
-        if pr.get("alexApprovedHead") != pr.get("head"):
-            return HOLD, HOLD_NEEDS_ALEX, (f"alex-approved does not name the current head {str(pr.get('head'))[:9]}; "
-                                           "Alex's approval covers only the head he approved")
+    if needs_label in labels_on_pr:
+        # Owner approval covers the head approved, not later pushes: labels persist
+        # across pushes. `coord train approve` records which head was approved.
+        if approved_label not in labels_on_pr:
+            return HOLD, HOLD_NEEDS_OWNER, f"it is labelled {needs_label} and waits for the owner (`coord train approve`)"
+        if approved_head != pr.get("head"):
+            return HOLD, HOLD_NEEDS_OWNER, (f"{approved_label} does not name the current head {str(pr.get('head'))[:9]}; "
+                                            "owner approval covers only the head approved")
     if pr.get("head") and pr.get("head") in (pr.get("sidechainBlockedHeads") or []):
-        # Checked before Codex: its 👍 does not answer another reviewer's P0-P2 (Codex on #1049).
-        return HOLD, HOLD_UNANSWERED_FINDINGS, ("an inisa-sidechain review requested changes at this head "
+        # Checked before Codex: its 👍 does not answer another reviewer's P0-P2.
+        return HOLD, HOLD_UNANSWERED_FINDINGS, ("a sidechain review requested changes at this head "
                                                 f"{str(pr.get('head'))[:9]}; only a new push answers it")
     codex = pr.get("codex") or {}
     # A clean review recorded for this exact head is its review, whether or not Codex is
@@ -373,7 +390,7 @@ def review_request_due(pr: Dict[str, Any], now: dt.datetime) -> Optional[str]:
     Codex reviews some new heads on its own and not others, and a queued PR then sits
     held on "no Codex 👍" until someone notices. Due when nobody has reviewed the head
     (no Codex 👍 or summary naming it, no review under way, no recorded clean review, no
-    inisa-sidechain verdict on it), nobody has asked since it was pushed (`reviewRequests`:
+    sidechain reviewer verdict on it), nobody has asked since it was pushed (`reviewRequests`:
     when anyone commented `@codex review` after the push, the train's own record included),
     and either the head is REVIEW_REQUEST_AFTER old or the PR was added again at a new
     head (`readdedAtNewHead`: the train dropped it and its author did what the drop said,
@@ -648,7 +665,7 @@ REAL, TIMEOUT, INFRA, USER_CANCEL = "real", "timeout", "infra", "user-cancel"
 # The job conclusions classify reads. A job that hits `timeout-minutes` ends `cancelled`,
 # not `timed_out`, and takes its run to `cancelled` with it.
 CLASSIFIED_JOB_CONCLUSIONS = ("failure", "timed_out", "startup_failure", "cancelled")
-USER_CANCEL_SIGNAL = "canceled by @"  # "The run was canceled by @alex-bridges."
+USER_CANCEL_SIGNAL = "canceled by @"  # "The run was canceled by @owner."
 TIMEOUT_SIGNAL = "exceeded the maximum execution time"
 # A job the runner never ran or lost: refused by billing, the runner shut down or vanished.
 INFRA_SIGNALS = ("job was not started because", "received a shutdown signal", "lost communication")

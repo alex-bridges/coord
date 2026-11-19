@@ -25,9 +25,9 @@ import urllib.error
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from coordlib import EXIT_BUDGET, EXIT_NOT_FOUND, EXIT_OK, budget, cache, cli  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # the train commands need the INISA workflow config
+example_config.use()  # the train commands need the example-repo workflow config
 from coordlib import gh as ghmodule  # noqa: E402
 from coordlib.gh import GitHub, GitHubError  # noqa: E402
 
@@ -557,7 +557,7 @@ class TrainStepTests(BudgetTestCase):
 class HookTests(BudgetTestCase):
     """.claude/hooks/coord-board.sh passes the budget line on and still exits 0."""
 
-    HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks", "coord-board.sh")
+    HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "hooks", "coord-board.sh")
 
     def run_hook(self):
         bin_dir = tempfile.mkdtemp()

@@ -9,13 +9,13 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from coordlib import marker, snapshot  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 FIXTURE = os.path.join(os.path.dirname(__file__), "fixtures", "coord-protocol.json")
 with open(FIXTURE, encoding="utf-8") as fixture:

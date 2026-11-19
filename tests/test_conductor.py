@@ -104,10 +104,10 @@ class OutageWindowTests(unittest.TestCase):
 
     def test_a_start_is_down_until_its_until(self):
         windows = outage.windows([self.start(1, 0, 60)])
-        self.assertIsNotNone(outage.down(windows, "claude-cloud@abc:INISA", at(30)))
+        self.assertIsNotNone(outage.down(windows, "claude-cloud@abc:example-repo", at(30)))
         self.assertIsNotNone(outage.down(windows, "conductor@*", at(30)))
-        self.assertIsNone(outage.down(windows, "codex@Eidolon:x", at(30)), "codex has its own quota")
-        self.assertIsNone(outage.down(windows, "claude@Eidolon:x", at(61)), "over when until passes")
+        self.assertIsNone(outage.down(windows, "codex@workstation:x", at(30)), "codex has its own quota")
+        self.assertIsNone(outage.down(windows, "claude@workstation:x", at(61)), "over when until passes")
 
     def test_a_second_start_moves_the_reset(self):
         windows = outage.windows([self.start(1, 0, 60), self.start(2, 30, 120)])
@@ -140,11 +140,11 @@ class ClaimStalenessTests(unittest.TestCase):
         return snapshot.resolve_claims([claim], {"issues": {5: {"state": "OPEN"}}, "branches": {}}, [], NOW, windows)
 
     def test_a_claude_claim_does_not_go_stale_during_an_outage(self):
-        self.assertFalse(self.claims("claude-cloud@abc:INISA", 20)[0]["stale"], "60 h idle, 20 of them down")
-        self.assertTrue(self.claims("claude-cloud@abc:INISA", 5)[0]["stale"], "60 h idle, only 5 down")
+        self.assertFalse(self.claims("claude-cloud@abc:example-repo", 20)[0]["stale"], "60 h idle, 20 of them down")
+        self.assertTrue(self.claims("claude-cloud@abc:example-repo", 5)[0]["stale"], "60 h idle, only 5 down")
 
     def test_a_codex_claim_ages_through_a_claude_outage(self):
-        self.assertTrue(self.claims("codex@Eidolon:x", 20)[0]["stale"])
+        self.assertTrue(self.claims("codex@workstation:x", 20)[0]["stale"])
 
 
 class LeaseTests(unittest.TestCase):
@@ -229,10 +229,10 @@ class ReasonTests(unittest.TestCase):
 
     def test_a_runner_counts_after_ten_minutes_offline(self):
         state = {}
-        runners = [{"name": "Tycho", "status": "offline"}]
+        runners = [{"name": "ci-box", "status": "offline"}]
         self.assertEqual(conductor.runner_reasons(runners, state, NOW), [])
         self.assertEqual(len(conductor.runner_reasons(runners, state, at(11))), 1)
-        conductor.runner_reasons([{"name": "Tycho", "status": "online"}], state, at(12))
+        conductor.runner_reasons([{"name": "ci-box", "status": "online"}], state, at(12))
         self.assertEqual(state["runnerOffline"], {})
 
     def test_disk_has_a_margin_before_it_counts_as_recovered(self):
@@ -267,12 +267,12 @@ class ReasonTests(unittest.TestCase):
 
     def test_a_parked_runner_is_never_offline(self):
         state = {}
-        routed = conductor.routing_labels({"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "Tycho-Light"})
-        parked = runner("Eidolon-heavy", "offline", "self-hosted", "macOS", "eidolon")
-        routed_offline = runner("Tycho-2", "offline", "self-hosted", "tycho-light")
+        routed = conductor.routing_labels({"CI_RUNNER_MACOS": "ci-box-macos", "CI_RUNNER_MACOS_LIGHT": "ci-box-Light"})
+        parked = runner("workstation-heavy", "offline", "self-hosted", "macOS", "workstation")
+        routed_offline = runner("ci-box-2", "offline", "self-hosted", "ci-box-light")
         conductor.runner_reasons([parked, routed_offline], state, NOW, routed)
         found = conductor.runner_reasons([parked, routed_offline], state, at(11), routed)
-        self.assertEqual([r["summary"].split()[1] for r in found], ["Tycho-2"], "labels match case-insensitively")
+        self.assertEqual([r["summary"].split()[1] for r in found], ["ci-box-2"], "labels match case-insensitively")
         unknown = {}
         conductor.runner_reasons([parked], unknown, NOW, None)
         self.assertEqual(len(conductor.runner_reasons([parked], unknown, at(11), None)), 1, "routing unknown: as before")
@@ -280,49 +280,49 @@ class ReasonTests(unittest.TestCase):
 
     def test_a_routing_label_no_online_runner_carries(self):
         state = {}
-        variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27",
-                     "MK4_RUNNER_LINUX_ARM64": "tycho-linux"}
-        runners = [runner("Tycho", "online", "self-hosted", "Tycho-macOS"), runner("Tycho-linux", "offline", "tycho-linux")]
+        variables = {"CI_RUNNER_MACOS": "ci-box-macos", "CI_RUNNER_MACOS_LIGHT": "xcode-27",
+                     "CI_RUNNER_LINUX_ARM64": "ci-box-linux"}
+        runners = [runner("ci-box", "online", "self-hosted", "ci-box-macOS"), runner("ci-box-linux", "offline", "ci-box-linux")]
         self.assertEqual(conductor.routing_reasons(variables, runners, state, NOW), [], "not before ten minutes")
         found = conductor.routing_reasons(variables, runners, state, at(11))
         self.assertEqual(sorted(r["key"].split(":")[1] for r in found),
-                         ["MK4_RUNNER_LINUX_ARM64=tycho-linux", "MK4_RUNNER_MACOS_LIGHT=xcode-27"],
+                         ["CI_RUNNER_LINUX_ARM64=ci-box-linux", "CI_RUNNER_MACOS_LIGHT=xcode-27"],
                          "an offline runner's labels do not count")
         self.assertTrue(all(r["kind"] == "routing" and not r["repair"] for r in found))
-        variables["MK4_RUNNER_MACOS_LIGHT"] = "tycho-macos"
+        variables["CI_RUNNER_MACOS_LIGHT"] = "ci-box-macos"
         conductor.routing_reasons(variables, runners, state, at(12))
-        self.assertEqual(list(state["routingMissing"]), ["MK4_RUNNER_LINUX_ARM64=tycho-linux"], "fixed: forgotten")
+        self.assertEqual(list(state["routingMissing"]), ["CI_RUNNER_LINUX_ARM64=ci-box-linux"], "fixed: forgotten")
 
     def test_control_jobs_queued_over_fifteen_minutes(self):
         state = {}
-        queued = {"name": "CI verdict", "status": "queued", "labels": ["self-hosted", "inisa-control"],
+        queued = {"name": "CI verdict", "status": "queued", "labels": ["self-hosted", "ci-control"],
                   "created_at": snapshot.iso(at(-16)), "html_url": "j/1"}
         self.assertEqual(conductor.control_queued_reasons([dict(queued, created_at=snapshot.iso(at(-14)))],
-                                                          "inisa-control", state, NOW), [])
+                                                          "ci-control", state, NOW), [])
         self.assertEqual(conductor.control_queued_reasons([dict(queued, status="in_progress"),
-                                                           dict(queued, labels=["tycho-light"])],
-                                                          "inisa-control", state, NOW), [])
-        found = conductor.control_queued_reasons([queued], "inisa-control", state, NOW)
+                                                           dict(queued, labels=["ci-box-light"])],
+                                                          "ci-control", state, NOW), [])
+        found = conductor.control_queued_reasons([queued], "ci-control", state, NOW)
         self.assertEqual([(r["kind"], r["url"], r["repair"]) for r in found], [("control-queued", "j/1", True)])
-        self.assertEqual(conductor.control_queued_reasons([queued], "inisa-control", state, at(5))[0]["key"], found[0]["key"])
-        conductor.control_queued_reasons([], "inisa-control", state, at(6))
+        self.assertEqual(conductor.control_queued_reasons([queued], "ci-control", state, at(5))[0]["key"], found[0]["key"])
+        conductor.control_queued_reasons([], "ci-control", state, at(6))
         self.assertNotIn("controlQueuedSince", state)
 
     def test_a_runner_failing_fast_while_another_could_take_its_jobs(self):
-        def failure(job_id, seconds=41, ended=-10, runner_name="Eidolon-heavy", labels=("tycho-macos",), run_id=None):
+        def failure(job_id, seconds=41, ended=-10, runner_name="workstation-heavy", labels=("ci-box-macos",), run_id=None):
             """A failed job; each in its own run unless `run_id` says otherwise."""
             return {"id": job_id, "run_id": run_id or 600 + job_id, "name": f"job {job_id}", "conclusion": "failure",
                     "runner_name": runner_name, "labels": list(labels),
                     "started_at": snapshot.iso(at(ended) - dt.timedelta(seconds=seconds)),
                     "completed_at": snapshot.iso(at(ended))}
 
-        runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
-                   runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
+        runners = [runner("ci-box", "online", "self-hosted", "ci-box-macos"),
+                   runner("workstation-heavy", "online", "self-hosted", "ci-box-macos")]
         three = [failure(1), failure(2), failure(3)]
         state = {}
         found = conductor.poisoned_runners(three, runners, state, NOW)
-        self.assertEqual([alert["key"] for alert in found], [f"runner-poisoned:Eidolon-heavy:{snapshot.iso(NOW)}"])
-        self.assertIn("Tycho", found[0]["text"])
+        self.assertEqual([alert["key"] for alert in found], [f"runner-poisoned:workstation-heavy:{snapshot.iso(NOW)}"])
+        self.assertIn("ci-box", found[0]["text"])
         self.assertEqual(conductor.poisoned_runners(three, runners, state, at(5))[0]["key"], found[0]["key"], "one episode")
         across_runs = [dict(failure(n), name="Android") for n in (11, 12, 13)]
         self.assertEqual(len(conductor.poisoned_runners(across_runs, runners, {}, NOW)), 1,
@@ -395,7 +395,7 @@ class OutcomeTests(unittest.TestCase):
 # MARK: - The watcher, against a fake GitHub
 
 
-def make_config(state_dir, agent="conductor@Tycho:conductor"):
+def make_config(state_dir, agent="conductor@ci-box:conductor"):
     return conductor.Config(home=state_dir, state_dir=state_dir, claude="claude", agent=agent,
                             host=agent.split("@")[1].split(":")[0], update_checkout=False)
 
@@ -407,7 +407,7 @@ class FakeGitHub:
         self.issue_comments = []   # raw, on the conductor issue (900)
         self.repo_comments = []    # raw, anywhere (issues/comments)
         self.main_runs = []
-        self.runners = [{"name": "Tycho", "status": "online"}]
+        self.runners = [{"name": "ci-box", "status": "online"}]
         self.next_id = 1000
         self.calls = []
         self.dispatches = []
@@ -427,7 +427,7 @@ class FakeGitHub:
             self.next_id += 1
             comment_id = self.next_id
         payload = marker.decode(body) or {}
-        author = {"login": "o", "type": "User"} if payload.get("kind") == "conductor" else {"login": "alex-bridges"}
+        author = {"login": "o", "type": "User"} if payload.get("kind") == "conductor" else {"login": "example-owner"}
         return {"id": comment_id, "created_at": snapshot.iso(at(minutes)), "html_url": f"c/{comment_id}", "body": body,
                 "issue_url": "https://api/repos/o/r/issues/900", "user": author}
 
@@ -556,7 +556,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(len(self.runs), 1)
         self.assertEqual(self.runs[0]["model"], conductor.TRIAGE_MODEL)
         self.assertIn("the train looks stuck", self.runs[0]["prompt"])
-        self.assertEqual(self.runs[0]["agent"], "conductor@Tycho:conductor")
+        self.assertEqual(self.runs[0]["agent"], "conductor@ci-box:conductor")
         self.tick(10)
         self.assertEqual(len(self.runs), 1, "handled")
 
@@ -804,7 +804,7 @@ class WatcherTests(unittest.TestCase):
         alerts = [c["body"] for c in self.gh.issue_comments
                   if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
         self.assertEqual(len(alerts), 1)
-        self.assertIn("Tycho: 5 GB free", alerts[0])
+        self.assertIn("ci-box: 5 GB free", alerts[0])
         self.assertNotIn("the train looks stuck", alerts[0])
         self.assertNotIn("r/7", alerts[0])
         self.assertFalse(any("issues/comments?since" in path for _, path in self.gh.calls), "standby never reads GitHub work")
@@ -1045,7 +1045,7 @@ class WatcherTests(unittest.TestCase):
         escalations = self.gh.records("conductor", "escalate")
         self.assertEqual(len(escalations), 1)
         self.assertEqual([(w, ref, inputs["issue"]) for w, ref, inputs in self.gh.dispatches],
-                         [("notify-alex.yml", "main", "900")], "the escalation reaches Alex's phone")
+                         [("notify-owner.yml", "main", "900")], "the escalation reaches Alex's phone")
 
     def test_an_escalation_stands_when_notify_alex_cannot_be_dispatched(self):
         self.gh.dispatch_error = conductor.GitHubError("HTTP 404 (not on main yet)")
@@ -1132,7 +1132,7 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("`train/x` infra again on attempt 4", self.runs[0]["prompt"])
         escalations = self.gh.records("conductor", "escalate")
         self.assertEqual(len(escalations), 1)
-        self.assertIn("notify-alex.yml", [workflow for workflow, _, _ in self.gh.dispatches])
+        self.assertIn("notify-owner.yml", [workflow for workflow, _, _ in self.gh.dispatches])
         self.receipt(6, "infra")
         self.receipt(7, "timed-out")
         self.tick(10)
@@ -1174,26 +1174,26 @@ class WatcherTests(unittest.TestCase):
         self.assertTrue(any("would dispatch merge-train.yml" in line for line in lines), lines)
 
     def test_a_parked_runner_raises_nothing(self):
-        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
-        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
-                           runner("Eidolon-heavy", "offline", "self-hosted", "macOS", "eidolon")]
+        self.gh.variables = {"CI_RUNNER_MACOS": "ci-box-macos"}
+        self.gh.runners = [runner("ci-box", "online", "self-hosted", "ci-box-macos"),
+                           runner("workstation-heavy", "offline", "self-hosted", "macOS", "workstation")]
         for minutes in (0, 15, 30):
             self.tick(minutes)
         self.assertEqual(self.runs, [])
 
     def test_a_routing_label_on_no_online_runner_wakes_the_conductor(self):
-        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27"}
-        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos")]
+        self.gh.variables = {"CI_RUNNER_MACOS": "ci-box-macos", "CI_RUNNER_MACOS_LIGHT": "xcode-27"}
+        self.gh.runners = [runner("ci-box", "online", "self-hosted", "ci-box-macos")]
         self.tick(0)
         self.assertEqual(self.runs, [])
         self.tick(15)
         self.assertEqual([r["model"] for r in self.runs], [conductor.TRIAGE_MODEL])
-        self.assertIn("[routing] repository variable MK4_RUNNER_MACOS_LIGHT routes jobs to the runner label `xcode-27`",
+        self.assertIn("[routing] repository variable CI_RUNNER_MACOS_LIGHT routes jobs to the runner label `xcode-27`",
                       self.runs[0]["prompt"])
 
     def test_unreadable_variables_skip_the_routing_checks_with_one_note(self):
         self.gh.variables = None
-        self.gh.runners = [runner("Eidolon-heavy", "offline", "self-hosted", "eidolon")]
+        self.gh.runners = [runner("workstation-heavy", "offline", "self-hosted", "workstation")]
         first = self.tick(0)
         self.assertEqual(sum("cannot read the repository variables" in line for line in first), 1)
         later = self.tick(15)
@@ -1202,9 +1202,9 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("[runner-offline]", self.runs[0]["prompt"])
 
     def test_control_jobs_queued_wake_the_repair_model(self):
-        self.gh.variables = {"MK4_RUNNER_CONTROL": "inisa-control"}
-        self.gh.runners = [runner("Tycho-control-1", "online", "self-hosted", "inisa-control")]
-        control = {"id": 1, "name": "CI verdict", "status": "queued", "labels": ["self-hosted", "inisa-control"],
+        self.gh.variables = {"CI_RUNNER_CONTROL": "ci-control"}
+        self.gh.runners = [runner("ci-box-control-1", "online", "self-hosted", "ci-control")]
+        control = {"id": 1, "name": "CI verdict", "status": "queued", "labels": ["self-hosted", "ci-control"],
                    "created_at": snapshot.iso(at(-20)), "html_url": "j/1"}
         self.gh.recent_runs = [
             {"id": 501, "status": "in_progress", "event": "workflow_dispatch", "path": ".github/workflows/ci.yml",
@@ -1214,16 +1214,16 @@ class WatcherTests(unittest.TestCase):
         self.gh.run_jobs = {501: [control], 502: [dict(control, id=2)]}
         self.tick(0)
         self.assertEqual([r["model"] for r in self.runs], [conductor.REPAIR_MODEL])
-        self.assertIn("[control-queued] 1 job(s) for the control runners (`inisa-control`)", self.runs[0]["prompt"])
+        self.assertIn("[control-queued] 1 job(s) for the control runners (`ci-control`)", self.runs[0]["prompt"])
         self.assertNotIn(("GET", "repos/{repo}/actions/runs/502/jobs?filter=all&per_page=100"), self.gh.calls,
                          "pull-request CI never targets the control runners")
 
     def fast_android_failures(self, runs):
-        """Android failing in 41 s on Eidolon-heavy, once per (run id, attempt) in `runs`, while
-        Tycho, online, carries the same label."""
-        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos"}
-        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos"),
-                           runner("Eidolon-heavy", "online", "self-hosted", "tycho-macos")]
+        """Android failing in 41 s on workstation-heavy, once per (run id, attempt) in `runs`, while
+        ci-box, online, carries the same label."""
+        self.gh.variables = {"CI_RUNNER_MACOS": "ci-box-macos"}
+        self.gh.runners = [runner("ci-box", "online", "self-hosted", "ci-box-macos"),
+                           runner("workstation-heavy", "online", "self-hosted", "ci-box-macos")]
         self.gh.recent_runs = [{"id": run_id, "status": "completed", "conclusion": "failure", "event": "workflow_dispatch",
                                 "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-50)),
                                 "updated_at": snapshot.iso(at(-5))} for run_id in sorted({run_id for run_id, _ in runs})]
@@ -1231,7 +1231,7 @@ class WatcherTests(unittest.TestCase):
         for n, (run_id, attempt) in enumerate(runs, 1):
             self.gh.run_jobs.setdefault(run_id, []).append(
                 {"id": n, "run_id": run_id, "run_attempt": attempt, "name": "Android / Android arm64 tests + APK + ELF closure",
-                 "conclusion": "failure", "runner_name": "Eidolon-heavy", "labels": ["tycho-macos"],
+                 "conclusion": "failure", "runner_name": "workstation-heavy", "labels": ["ci-box-macos"],
                  "started_at": snapshot.iso(at(-10 * n)), "completed_at": snapshot.iso(at(-10 * n) + dt.timedelta(seconds=41))})
 
     def test_a_poisoned_runner_goes_to_alex_once_and_wakes_nobody(self):
@@ -1242,7 +1242,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.runs, [])
         escalations = [c for c in self.gh.issue_comments if (marker.decode(c["body"]) or {}).get("event") == "escalate"]
         self.assertEqual(len(escalations), 1)
-        self.assertIn("Runner Eidolon-heavy may be poisoned: it failed 3 jobs", escalations[0]["body"])
+        self.assertIn("Runner workstation-heavy may be poisoned: it failed 3 jobs", escalations[0]["body"])
 
     def test_one_job_rerun_three_times_on_one_runner_is_not_poisoning(self):
         self.fast_android_failures([(601, 1), (601, 2), (601, 3)])
@@ -1250,8 +1250,8 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.gh.records("conductor", "escalate"), [])
 
     def test_a_failed_new_read_skips_its_check_not_the_slow_tick(self):
-        self.gh.variables = {"MK4_RUNNER_MACOS": "tycho-macos", "MK4_RUNNER_MACOS_LIGHT": "xcode-27"}
-        self.gh.runners = [runner("Tycho", "online", "self-hosted", "tycho-macos")]
+        self.gh.variables = {"CI_RUNNER_MACOS": "ci-box-macos", "CI_RUNNER_MACOS_LIGHT": "xcode-27"}
+        self.gh.runners = [runner("ci-box", "online", "self-hosted", "ci-box-macos")]
         self.gh.recent_runs = [{"id": 701, "status": "in_progress", "event": "workflow_dispatch",
                                 "path": ".github/workflows/ci.yml", "created_at": snapshot.iso(at(-30)),
                                 "updated_at": snapshot.iso(at(-1))}]
@@ -1262,7 +1262,7 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.gh.dispatches, [("merge-train.yml", "main", None)], "the other checks still ran")
         state = conductor.load_state(self.config)
         self.assertEqual(state.get("lastSlow"), snapshot.iso(at(0)), "the slow tick counts as done")
-        self.assertIn("MK4_RUNNER_MACOS_LIGHT=xcode-27", state.get("routingMissing") or {}, "the routing check ran")
+        self.assertIn("CI_RUNNER_MACOS_LIGHT=xcode-27", state.get("routingMissing") or {}, "the routing check ran")
         self.gh.calls.clear()
         self.tick(5)
         self.assertFalse(any("actions/runs?per_page=100" in path for _, path in self.gh.calls),
@@ -1298,8 +1298,8 @@ class BoardTests(unittest.TestCase):
     def test_the_board_shows_an_outage_and_the_conductor(self):
         windows = outage.windows([record(1, -10, {"kind": "outage", "event": "start", "harness": "claude",
                                                   "until": snapshot.iso(at(120)), "reason": "weekly usage limit"})])
-        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@Tycho:conductor",
-                                "host": "Tycho", "beat": snapshot.iso(at(-2)), "disk": 27,
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@ci-box:conductor",
+                                "host": "ci-box", "beat": snapshot.iso(at(-2)), "disk": 27,
                                 "lastWake": {"at": snapshot.iso(at(-30)), "summary": "answered #12"}})
         snap = {"repo": "o/r", "main": {"sha": "m" * 40}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [],
                 "overlaps": [], "runs": {"running": [], "queued": []}, "train": [],
@@ -1307,7 +1307,7 @@ class BoardTests(unittest.TestCase):
                 "conductor": {"hosts": lease.hosts([beat], NOW, REPO), "pause": None, "escalations": []}}
         text = render.board(snap, "codex@E:x", 0)
         self.assertIn("OUTAGE  claude agents are down until", text)
-        self.assertIn("conductor@Tycho:conductor (leader) · beat 2m ago · disk 27 GB free · last wake 30m ago: answered #12",
+        self.assertIn("conductor@ci-box:conductor (leader) · beat 2m ago · disk 27 GB free · last wake 30m ago: answered #12",
                       text)
         brief = render.brief(snap, "codex@E:x")
         self.assertIn("conductor down (outage)", brief)
@@ -1321,18 +1321,18 @@ class BoardTests(unittest.TestCase):
     def test_the_board_shows_a_stalled_reviewer_backlog(self):
         """The reviewer piling up requests with the app unavailable (#1092) shows on the
         board, not only in the watcher log only this host can read."""
-        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@Tycho:conductor",
-                                "host": "Tycho", "beat": snapshot.iso(at(-1)),
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@ci-box:conductor",
+                                "host": "ci-box", "beat": snapshot.iso(at(-1)),
                                 "reviewer": {"waiting": 19, "appAvailable": False}})
         snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
                 "runs": {"running": [], "queued": []}, "train": [], "outages": [],
                 "conductor": {"hosts": lease.hosts([beat], NOW, REPO), "pause": None, "escalations": []}}
         text = render.board(snap, "codex@E:x", 0)
-        self.assertIn("reviewer off (app not available on Tycho), 19 waiting", text)
+        self.assertIn("reviewer off (app not available on ci-box), 19 waiting", text)
 
     def test_the_board_shows_a_running_reviewer(self):
-        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@Tycho:conductor",
-                                "host": "Tycho", "beat": snapshot.iso(at(-1)),
+        beat = record(2, -600, {"kind": "conductor", "event": "beat", "agent": "conductor@ci-box:conductor",
+                                "host": "ci-box", "beat": snapshot.iso(at(-1)),
                                 "reviewer": {"waiting": 1, "appAvailable": True}})
         snap = {"repo": "o/r", "main": {}, "generatedAt": snapshot.iso(NOW), "prs": [], "claims": [], "overlaps": [],
                 "runs": {"running": [], "queued": []}, "train": [], "outages": [],
@@ -1400,13 +1400,13 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertLess((dt.datetime.now() - started).total_seconds(), 10)
 
 
-GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "inisa", ".claude", "hooks", "conductor-guard.py")
+GUARD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "example_repo", ".claude", "hooks", "conductor-guard.py")
 
 
 class GuardHookTests(unittest.TestCase):
     """.claude/hooks/conductor-guard.py: the substitute reviews of 7afafab1 and 4d3b200b."""
 
-    def run_guard(self, tool, data, agent="conductor@Tycho:conductor", cwd="/tmp/home", project="/tmp/home", raw=None,
+    def run_guard(self, tool, data, agent="conductor@ci-box:conductor", cwd="/tmp/home", project="/tmp/home", raw=None,
                   full=False):
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE", "CLAUDE_PROJECT_DIR")}
         env["HOME"] = os.path.expanduser("~")
@@ -1419,10 +1419,10 @@ class GuardHookTests(unittest.TestCase):
         return result if full else result.returncode
 
     def test_moving_main_merging_and_approving_are_blocked(self):
-        for command in ("gh api -X PUT repos/example-org/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
+        for command in ("gh api -X PUT repos/example-owner/example-repo/pulls/1/merge", "git push origin --force --dry-run HEAD",
                         "./Tools/coord/coord train approve 1 --note x", "Tools/coord/coord train approve 1",
                         "git push origin +HEAD:main", "git push origin HEAD:main", "git push -uf origin x",
-                        "gh pr merge 5 --squash", "gh pr -R example-org/example-repo merge 5", "gh pr --repo o/r merge 5",
+                        "gh pr merge 5 --squash", "gh pr -R example-owner/example-repo merge 5", "gh pr --repo o/r merge 5",
                         "bash -c 'gh pr merge 5'", "sh -c \"git push origin main\"", "eval 'coord train approve 3'",
                         "gh api -X PATCH repos/o/r/git/refs/heads/main -f sha=x", "gh api repos/o/r/merges -f base=main",
                         "gh variable set X", "gh secret list", "sudo rm -rf /", "launchctl list", "cd x && sudo ls",
@@ -1497,15 +1497,15 @@ class GuardHookTests(unittest.TestCase):
         for command in ("Tools/coord/coord token exec -- gh pr list",
                         "Tools/coord/coord token exec --kind ops -- sh -c 'echo $GH_TOKEN'",
                         "./Tools/coord/coord token exec --kind read -- env",
-                        "/Users/dev/Projects/INISA/Tools/coord/coord token exec -- true",
+                        "/Users/dev/Projects/example-repo/Tools/coord/coord token exec -- true",
                         "python3 Tools/coord/coord token exec -- true", "coord token  exec -- true",
                         "sh -c 'Tools/coord/coord token exec --kind ops -- env'",
                         "bash -c \"coord token exec -- gh api user\"", "eval 'coord token exec -- true'",
                         "cd /tmp && Tools/coord/coord token exec -- true",
                         "true; Tools/coord/coord token exec -- true", "x=1 && coord token exec -- true",
                         # coord's top-level --repo before the command (round three, P3-1)
-                        "Tools/coord/coord --repo example-org/example-repo token exec -- env",
-                        "Tools/coord/coord --repo=example-org/example-repo token exec --kind ops -- env",
+                        "Tools/coord/coord --repo example-owner/example-repo token exec -- env",
+                        "Tools/coord/coord --repo=example-owner/example-repo token exec --kind ops -- env",
                         "sh -c 'coord --repo o/r token exec -- env'",
                         # Round twelve's review (P3-1): every spelling of coord's options that
                         # argparse takes, before the command and between its two words.
@@ -1523,8 +1523,8 @@ class GuardHookTests(unittest.TestCase):
                         "gh pr comment 5 -b 'never run coord token exec here'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 2, command)
         for command in ("Tools/coord/coord token status", "grep -n 'token exec' Docs/agent-coordination.md",
-                        "Tools/coord/coord --repo example-org/example-repo token status",
-                        "Tools/coord/coord --repo example-org/example-repo board", "Tools/coord/coord --rep o/r board",
+                        "Tools/coord/coord --repo example-owner/example-repo token status",
+                        "Tools/coord/coord --repo example-owner/example-repo board", "Tools/coord/coord --rep o/r board",
                         "Tools/coord/coord -- token status", "Tools/coord/coord send --on 1 'the token exec docs'"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
         self.assertEqual(self.run_guard("Bash", {"command": "Tools/coord/coord token exec -- true"}, agent=""), 0,
@@ -1533,7 +1533,7 @@ class GuardHookTests(unittest.TestCase):
     def test_train_approve_with_repo_is_blocked(self):
         # A second rule beside main's `coord train approve` rule, which is unchanged: the same
         # command with at least one of coord's options in it, in any spelling argparse takes.
-        for command in ("Tools/coord/coord --repo example-org/example-repo train approve 5 --note x",
+        for command in ("Tools/coord/coord --repo example-owner/example-repo train approve 5 --note x",
                         "coord --repo=o/r train approve 5", "Tools/coord/coord --rep o/r train approve 5 --note x",
                         "Tools/coord/coord --re=o/r train approve 5 --note x",
                         "Tools/coord/coord --r o/r train approve 5 --note x",
@@ -1574,7 +1574,7 @@ class GuardHookTests(unittest.TestCase):
                         "security find-internet-password -s github.com -w", "security dump-keychain -d",
                         "security export -k login.keychain -o /tmp/k.p12", "sh -c 'security find-generic-password -w'",
                         "x=$(security find-generic-password -s example-coord-github-app -w)",
-                        "cd /tmp && security find-generic-password -ga inisa", "security find-g -s x -w",
+                        "cd /tmp && security find-generic-password -ga example", "security find-g -s x -w",
                         "security find-generic -w", "security dump-k",
                         # Round twelve's review (P2-1): any prefix, and interactive mode.
                         "security f -s x -w", "security fi -s x -w", "security find -s x -w", "security find- -s x -w",
@@ -1625,30 +1625,30 @@ class GuardHookTests(unittest.TestCase):
 
     def test_the_token_cache_is_blocked(self):
         # Codex on 141d38f62 (P1): a path has spellings no pattern keeps up with, so the rule is
-        # co-occurrence, like apptoken's: `inisa-coord` and `cache` anywhere in the case-folded command.
-        for command in ("cat ~/Library/Caches/inisa-coord/ops.json", "cat \"$HOME/Library/Caches/inisa-coord/read.json\"",
-                        "python3 -c 'print(open(\"/Users/dev/Library/Caches/inisa-coord/ops.json\").read())'",
-                        "ls -la ~/Library/Caches/inisa-coord", "cp ~/Library/Caches/inisa-coord/ops.json /tmp/",
-                        "cat ~/library/caches/INISA-COORD/ops.json", "cat ~/Library//Caches/inisa-coord/read.json",
-                        "cat ~/Library/Caches/./inisa-coord/ops.json",
-                        "cat ~/Library/Caches/INISA-COORD/ops.json", "cd ~/Library/Caches && cat inisa-coord/ops.json",
+        # co-occurrence, like apptoken's: `example-coord` and `cache` anywhere in the case-folded command.
+        for command in ("cat ~/Library/Caches/example-coord/ops.json", "cat \"$HOME/Library/Caches/example-coord/read.json\"",
+                        "python3 -c 'print(open(\"/Users/dev/Library/Caches/example-coord/ops.json\").read())'",
+                        "ls -la ~/Library/Caches/example-coord", "cp ~/Library/Caches/example-coord/ops.json /tmp/",
+                        "cat ~/library/caches/EXAMPLE-COORD/ops.json", "cat ~/Library//Caches/example-coord/read.json",
+                        "cat ~/Library/Caches/./example-coord/ops.json",
+                        "cat ~/Library/Caches/EXAMPLE-COORD/ops.json", "cd ~/Library/Caches && cat example-coord/ops.json",
                         # The cost, as for apptoken: any command that names both, the budget cache and
                         # prose included. The way out is the Write tool.
-                        "cat ~/.cache/inisa-coord/alex-bridges_INISA/budget.json"):
+                        "cat ~/.cache/example-coord/example-owner_example-repo/budget.json"):
             result = self.run_guard("Bash", {"command": command}, full=True)
             self.assertEqual(result.returncode, 2, command)
-            self.assertIn("`inisa-coord` and `cache` in one command", result.stderr, command)
+            self.assertIn("`example-coord` and `cache` in one command", result.stderr, command)
             self.assertIn("write such text with the Write tool", result.stderr, command)
         # The repo's own name beside a cache word is not the token cache (#1051, Alex: narrow the
         # rule): the false positives of #1046's fresh review. The last is the conductor's disk-low
-        # `du -xhd1` of the CI trees and caches. A glob (`inisa*`) now passes: the spelling class
+        # `du -xhd1` of the CI trees and caches. A glob (`example*`) now passes: the spelling class
         # #1051 accepts.
         for command in ("ls ~/Library/Caches", "Tools/coord/coord token status", "cat ~/.cache/pip/x.json",
-                        "git -C /Users/dev/Projects/INISA diff --cached", "gh cache list --repo example-org/example-repo",
-                        "gh api repos/example-org/example-repo/actions/caches",
-                        "python3 /Users/dev/Projects/INISA/scripts/test-ci-cache-preservation.py",
-                        "du -xhd1 ~/actions-runner*/_work/INISA ~/Library/Caches 2>/dev/null | sort -h",
-                        "cat ~/Library/Caches/inisa*/ops.json"):
+                        "git -C /Users/dev/Projects/example-repo diff --cached", "gh cache list --repo example-owner/example-repo",
+                        "gh api repos/example-owner/example-repo/actions/caches",
+                        "python3 /Users/dev/Projects/example-repo/scripts/test-ci-cache-preservation.py",
+                        "du -xhd1 ~/actions-runner*/_work/example-repo ~/Library/Caches 2>/dev/null | sort -h",
+                        "cat ~/Library/Caches/example*/ops.json"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
 
     def test_the_keychain_service_name_is_blocked_however_it_is_called(self):
@@ -1723,8 +1723,8 @@ class GuardHookTests(unittest.TestCase):
                           "(--body-file / -F", result.stderr, command)
         # Every shell way to write such text is refused, so the Write tool is the way: the guard
         # checks only its path. The state directory is the watcher's default (conductor.Config:
-        # $XDG_STATE_HOME or ~/.local/state, then inisa-conductor).
-        note = os.path.join(os.path.expanduser("~"), ".local", "state", "inisa-conductor", "note.md")
+        # $XDG_STATE_HOME or ~/.local/state, then example-conductor).
+        note = os.path.join(os.path.expanduser("~"), ".local", "state", "example-conductor", "note.md")
         for path in (note, "$CONDUCTOR_STATE_DIR/note.md"):
             self.assertEqual(self.run_guard("Write", {"file_path": path, "content": "python3 cannot import apptoken"}), 0)
         for command in (f"gh pr create --title x --body-file {note}", f"git commit -q -F {note}",
@@ -1745,7 +1745,7 @@ class GuardHookTests(unittest.TestCase):
                         "Tools/coord/coord send --to 'conductor@*' 'I am on main-red'", "Tools/coord/coord claim 991",
                         "Tools/coord/coord train add 1046", "Tools/coord/coord conductor escalate \"PR 7 needs you\"",
                         "Tools/coord/coord conductor pause --for 2h", "gh run view 123456 --log-failed | tail -80",
-                        "tail -50 ~/Library/Logs/inisa/ci-health.log", "du -xhd1 /Users/dev 2>/dev/null | sort -h",
+                        "tail -50 ~/Library/Logs/example-repo/ci-health.log", "du -xhd1 /Users/dev 2>/dev/null | sort -h",
                         "git worktree add -b conductor/fix-x ../conductor-fix-x origin/main",
                         "gh pr diff 1046 -- Tools/coord/coordlib/apptoken.py | head -100"):
             self.assertEqual(self.run_guard("Bash", {"command": command}), 0, command)
@@ -1754,7 +1754,7 @@ class GuardHookTests(unittest.TestCase):
         # _QUOTED rescans to the end for each unclosed quote: uncapped, 100,000 characters of
         # this take ~20 s, past the hook's timeout, which lets the call through.
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
-        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        env.update({"COORD_AGENT": "conductor@ci-box:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
         payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": 'echo "' + 'a\\"' * 66665}, "cwd": "/tmp/home"})
         result = subprocess.run([sys.executable, GUARD], input=payload, capture_output=True, text=True, env=env, timeout=3)
         self.assertEqual(result.returncode, 2)
@@ -1769,7 +1769,7 @@ class GuardHookTests(unittest.TestCase):
     def run_patched_guard(self, code, payload):
         """The guard with `code` run just before main(), in a child with a 15 s cap."""
         env = {k: v for k, v in os.environ.items() if k not in ("COORD_AGENT", "CONDUCTOR_WAKE")}
-        env.update({"COORD_AGENT": "conductor@Tycho:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
+        env.update({"COORD_AGENT": "conductor@ci-box:conductor", "CLAUDE_PROJECT_DIR": "/tmp/home"})
         with tempfile.TemporaryDirectory() as folder:
             patched = os.path.join(folder, "conductor-guard.py")
             with open(GUARD, encoding="utf-8") as handle:
@@ -1878,8 +1878,8 @@ class GuardHookTests(unittest.TestCase):
 
     def test_the_deny_list_keeps_the_read_tool_out_of_the_token_cache(self):
         # The guard sees Bash only; a conductor run's Read tool is kept out by --settings deny.
-        self.assertIn("Read(~/Library/Caches/inisa-coord/**)", conductor.DENY)
-        self.assertIn("Read(//Users/*/Library/Caches/inisa-coord/**)", conductor.DENY)
+        self.assertIn("Read(~/Library/Caches/example-coord/**)", conductor.DENY)
+        self.assertIn("Read(//Users/*/Library/Caches/example-coord/**)", conductor.DENY)
 
     def test_the_guard_protects_exactly_what_the_train_holds_for_alex(self):
         spec = __import__("importlib.util").util.spec_from_file_location("guard", GUARD)
@@ -1889,7 +1889,7 @@ class GuardHookTests(unittest.TestCase):
 
 
 class GenericConfigTests(unittest.TestCase):
-    """A repo with no .coord/config.json: no INISA value leaks, features needing config say so."""
+    """A repo with no .coord/config.json: no example-repo value leaks, features needing config say so."""
 
     def setUp(self):
         from coordlib import config
@@ -1900,15 +1900,15 @@ class GenericConfigTests(unittest.TestCase):
         config._cache.clear()
         self.addCleanup(config._cache.clear)
 
-    def test_the_deny_list_is_built_from_the_slug_not_from_inisa(self):
+    def test_the_deny_list_is_built_from_the_slug_not_from_legacy(self):
         rules = conductor.deny_rules("acme/widgets")
         self.assertIn("Bash(gh api -X PUT repos/acme/widgets/pulls/*/merge:*)", rules)
-        self.assertFalse([rule for rule in rules if "INISA" in rule or "inisa" in rule], rules)
+        self.assertFalse([rule for rule in rules if "example-repo" in rule], rules)
         self.assertIn("Read(~/Library/Caches/coord/**)", rules)
 
     def test_the_reviewer_is_off_and_the_login_is_a_sentinel(self):
         from coordlib import reviewer
-        self.assertEqual(reviewer.find_tag("@inisa-sidechain review"), None)
+        self.assertEqual(reviewer.find_tag("@example-reviewer review"), None)
         self.assertNotEqual(snapshot.sidechain_login(), "")
         self.assertIsNone(snapshot.sidechain_blocks({"author": {"login": ""}}, {"kind": "review", "verdict": "changes", "head": "h"}))
 
@@ -1937,19 +1937,19 @@ class DurationTests(unittest.TestCase):
             conductor.parse_duration("soon")
 
 
-_INISA_CONFIG_PATH = None
+_EXAMPLE_CONFIG_PATH = None
 
 
 def setUpModule():
-    global _INISA_CONFIG_PATH
+    global _EXAMPLE_CONFIG_PATH
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import conductor_config_fixture
-    _INISA_CONFIG_PATH = conductor_config_fixture.use_inisa_config()
+    _EXAMPLE_CONFIG_PATH = conductor_config_fixture.use_example_config()
 
 
 def tearDownModule():
     import conductor_config_fixture
-    conductor_config_fixture.restore(_INISA_CONFIG_PATH)
+    conductor_config_fixture.restore(_EXAMPLE_CONFIG_PATH)
 
 
 if __name__ == "__main__":

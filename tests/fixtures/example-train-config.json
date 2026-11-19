@@ -1,13 +1,16 @@
 {
   "default_branch": "main",
-  "owner_login": "alex-bridges",
-  "owner_mention": "@alex-bridges",
+  "owner_login": "example-owner",
+  "owner_mention": "@example-owner",
+  "needs_owner_label": "needs-owner",
+  "owner_approved_label": "owner-approved",
   "ci_workflow": "ci.yml",
   "train_workflow": "merge-train.yml",
-  "notify_workflow": "notify-alex.yml",
+  "notify_workflow": "notify-owner.yml",
   "verdict_job": "CI verdict",
   "wake_job": "Wake the merge train",
   "ci_lanes": "changed",
+  "ignored_check_prefixes": ["LegacyCI | "],
   "owner_only_paths": [
     ".claude/agents/",
     ".claude/settings.json",
@@ -21,6 +24,6 @@
     "rules": ".github/ci-lanes.json"
   },
   "claude_weekly_reset": "Thu 12:00 America/New_York",
-  "state_dir_name": "inisa-coord",
+  "state_dir_name": "example-coord",
   "keychain_service": "example-coord-github-app"
 }

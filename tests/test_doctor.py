@@ -23,7 +23,7 @@ class DoctorTests(unittest.TestCase):
     def setUp(self):
         self.start_patch(patch.dict(os.environ, {}, clear=True))
         self.which = self.start_patch(patch("shutil.which", side_effect=lambda name: "/bin/git" if name == "git" else None))
-        self.start_patch(patch.object(doctor.identity, "agent_id", return_value="codex@host:INISA-task"))
+        self.start_patch(patch.object(doctor.identity, "agent_id", return_value="codex@host:example-repo-task"))
         self.cached = self.start_patch(patch.object(doctor.cache, "load_snapshot", return_value=None))
         self.start_patch(patch.object(doctor.snapshot, "now_utc", return_value=NOW))
         self.start_patch(patch.object(doctor.budget, "summary", return_value=None))

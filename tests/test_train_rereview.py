@@ -19,13 +19,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_train as base  # noqa: E402
 from coordlib import marker, snapshot, train, train_step  # noqa: E402
 from test_coord import ALEX, NOW, reaction, t  # noqa: E402
-import inisa_config  # noqa: E402
+import example_config  # noqa: E402
 
-inisa_config.use()  # INISA workflow/job/lane names are config, not defaults
+example_config.use()  # example-repo workflow/job/lane names are config, not defaults
 
 
 def setUpModule():
-    inisa_config.use()
+    example_config.use()
 
 
 def requests(fake):

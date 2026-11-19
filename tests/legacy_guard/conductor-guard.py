@@ -44,7 +44,7 @@ _REPO_FLAG = r"(--repo(=|\s+)\S+\s+)?"  # coord's one top-level option, which ma
 # Checked against the whole command, quoted strings included: a path or a Python script is
 # usually quoted. So prose that names them is blocked too; say it another way.
 RAW_RULES = [
-    (re.compile(r"Library/Caches/inisa-coord"), "the GitHub App's token cache (Library/Caches/inisa-coord)"),
+    (re.compile(r"Library/Caches/example-coord"), "the GitHub App's token cache (Library/Caches/example-coord)"),
     # The Keychain item's service name: catches a quoted `security` call or one made from Python.
     (re.compile(r"example-coord-github-app"), "the GitHub App's private key (Keychain item example-coord-github-app)"),
 ]

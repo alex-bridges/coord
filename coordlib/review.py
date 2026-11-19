@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from . import config
 
 CODEX_LOGIN_PREFIX = "chatgpt-codex-connector"
 VERDICT_CHECK = "CI verdict"
@@ -32,21 +34,21 @@ VERDICT_CHECK = "CI verdict"
 # CANCELLED is absent on purpose: a cancelled check is a superseded run, not a red.
 _FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
 # A job GitHub refused to start concludes `failure` with this as its one annotation
-# (#1026, check run 10000099: "The job was not started because an Actions budget is
-# preventing further use.", started and completed 2 s apart, no step run). It never
-# ran, so it is not evidence either way: NOT RUN, neither red nor green. Only this
-# prefix; any other annotation on a failed run leaves it red.
+# ("The job was not started because an Actions budget is preventing further use.",
+# started and completed 2 s apart, no step run). It never ran, so it is not evidence
+# either way: NOT RUN, neither red nor green. Only this prefix; any other annotation
+# on a failed run leaves it red.
 NOT_RUN_PREFIX = "The job was not started because"
-# Alex's policy excludes Xcode Cloud from automatic PR/review and merge decisions.
-# Ignore its legacy statuses; authoritative hosted CI is GitHub Actions.
-_IGNORED_CHECK_PREFIXES = ("LegacyCI | ",)
 
+
+def ignored_check_prefixes() -> Tuple[str, ...]:
+    """Check/status name prefixes excluded from PR/review and merge decisions (config)."""
+    return tuple(str(p) for p in (config.get("ignored_check_prefixes") or ()) if p)
 
 
 def _nodes(connection: Any) -> List[Dict[str, Any]]:
     """A GraphQL connection's nodes, without the nulls GitHub sometimes returns in them
-    (a reaction whose user it will not show, with no `errors` entry). One null reaction
-    crashed the merge train's step on 2026-09-30 (run 10000098)."""
+    (a reaction whose user it will not show, with no `errors` entry)."""
     return [n for n in ((connection or {}).get("nodes") or []) if isinstance(n, dict)]
 
 def parse_time(value: Optional[str]) -> Optional[dt.datetime]:
@@ -156,7 +158,8 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
 
 
 def is_ignored_check(name: Optional[str]) -> bool:
-    return (name or "").startswith(_IGNORED_CHECK_PREFIXES)
+    prefixes = ignored_check_prefixes()
+    return bool(prefixes) and (name or "").startswith(prefixes)
 
 
 def needs_first_annotation(context: Dict[str, Any]) -> bool:
@@ -197,7 +200,7 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
 
     `verdict` is the `CI verdict` aggregate job when present (success, failure,
     pending, skipped, cancelled, or none). `failing`/`pending` list the individual checks,
-    minus the ignored Xcode Cloud ones. `not_run` lists failed check runs GitHub never
+    minus any configured `ignored_check_prefixes`. `not_run` lists failed check runs GitHub never
     started (NOT_RUN_PREFIX); they are neither red nor green, so nothing reads them as
     a reason to hold or to merge.
     """
