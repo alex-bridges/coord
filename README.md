@@ -19,6 +19,11 @@ conductor stay off until the repository configures them. A feature that needs a 
 setting stops with a message naming the key. If the repository cannot be detected
 (no github.com origin, no COORD_REPO), coord says so instead of guessing.
 
+## Documentation
+
+- [docs/adopting.md](docs/adopting.md): step by step for a new repository (install, auth, config, labels, the merge-train workflow, the conductor).
+- [docs/agent-coordination.md](docs/agent-coordination.md): the model, commands, claims, merge train, conductor, outages, API budget and identity.
+
 ## Configuration
 
 Per-repo settings live in `.coord/config.json` at the root of the working tree
