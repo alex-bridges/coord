@@ -34,3 +34,25 @@ jobs:
       - name: Run the tests
         shell: bash
         run: cd tests && env -u CLAUDE_CODE_REMOTE python -m unittest discover -s . -p "test_*.py"
+
+  formal:
+    name: TLA+ contract checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Verify TLC and check all three models
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 -o tla2tools.jar https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+          echo '936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  tla2tools.jar' | sha256sum --check
+          python3 "$GITHUB_WORKSPACE/formal/check.py" tla2tools.jar --logs tlc-logs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tlc-logs
+          path: ${{ runner.temp }}/tlc-logs
