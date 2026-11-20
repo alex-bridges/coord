@@ -13,6 +13,7 @@ GitHub itself with a branch ruleset allowing only the merge-train token to push.
 
 import json
 import os
+from pathlib import Path
 import re
 import sys
 
@@ -78,24 +79,29 @@ def executable_text(command: str) -> str:
 
 
 def is_protected(path: str, project: str) -> bool:
-    home_claude = os.path.join(os.path.realpath(os.path.expanduser("~")), ".claude") + os.sep
-    if path.startswith(home_claude):
-        return any(path[len(home_claude):].startswith(p) for p in HOME_CONTROLS)
-    if project:
-        return any(path == os.path.join(project, p.rstrip("/")) or path.startswith(os.path.join(project, p))
-                   for p in CONTROL_PATHS)
+    target = Path(path)
+    for root, entries in ((Path.home().resolve() / ".claude", HOME_CONTROLS), (Path(project), CONTROL_PATHS)):
+        for entry in entries:
+            control = root / entry
+            if target == control or (entry.endswith("/") and control in target.parents):
+                return True
     return False
 
 
-def verdict(payload: dict, env) -> str:
-    tool = payload.get("tool_name") or ""
+def verdict(payload: object, env) -> str:
+    if not isinstance(payload, dict):
+        return "expected a hook event object"
+    tool = payload.get("tool_name")
     data = payload.get("tool_input")
-    data = data if isinstance(data, dict) else {}
+    if not isinstance(tool, str) or not tool.strip() or not isinstance(data, dict):
+        return "missing or invalid tool_name or tool_input"
     cwd = os.path.realpath(payload.get("cwd") or os.getcwd())
     project = os.path.realpath(env.get("CLAUDE_PROJECT_DIR") or cwd)
 
     if tool == "Bash":
-        command = str(data.get("command") or "")
+        command = data.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return "missing or invalid Bash command"
         folded = command.casefold()
         if KEYCHAIN_SERVICE.casefold() in folded:
             return f"accessing Keychain service `{KEYCHAIN_SERVICE}`"
@@ -115,14 +121,13 @@ def verdict(payload: dict, env) -> str:
         return ""
 
     if tool in ("Edit", "Write", "NotebookEdit", "MultiEdit"):
-        path = str(data.get("file_path") or data.get("notebook_path") or "")
-        if not path:
-            return ""
+        path = data.get("notebook_path" if tool == "NotebookEdit" else "file_path")
+        if not isinstance(path, str) or not path.strip():
+            return "missing or invalid edit path"
         real = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
         if is_reviewer(env):
             state = env.get("CONDUCTOR_STATE_DIR") or ""
-            root = os.path.realpath(os.path.join(os.path.expanduser(state), "reviews")) + os.sep if state else ""
-            if not root or not real.startswith(root):
+            if not state or (Path(state).expanduser() / "reviews").resolve() not in Path(real).parents:
                 return "writing outside the review worktree and scratch directory"
         elif is_protected(real, project):
             return "editing conductor control files (change them via a PR in a worktree)"
@@ -134,7 +139,7 @@ def main() -> int:
         return 0
     try:
         payload = json.load(sys.stdin)
-        why = verdict(payload if isinstance(payload, dict) else {}, os.environ)
+        why = verdict(payload, os.environ)
     except Exception as error:
         print(f"conductor-guard: could not evaluate call ({error.__class__.__name__}); refusing", file=sys.stderr)
         return 2

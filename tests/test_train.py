@@ -990,6 +990,54 @@ class StepTests(unittest.TestCase):
         self.assertNotIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
         self.assertTrue(any("no trusted build record" in line for line in lines), lines)
 
+    def assert_recorded_chain_rejected(self, fake, name, tip, numbers):
+        sh(self.origin, "update-ref", f"refs/heads/{name}", tip)
+        self.assertEqual([member["pr"] for member in self.members(name)], numbers)
+        self.step(fake).comment(numbers[0], "Testing batch", "testing", batch=name, tip=tip, members=numbers)
+        self.run_on(fake, name, tip, conclusion="success")
+        lines = self.step(fake).run()
+        self.assertFalse(any(method == "PATCH" and path.endswith("heads/main") for method, path, _ in fake.writes), lines)
+        self.assertEqual(fake.posted("merged"), [])
+        self.assertIn(("DELETE", f"repos/{{repo}}/git/refs/heads/{name}", None), fake.writes)
+        self.assertTrue(any("commit chain or merge trees do not match" in line for line in lines), lines)
+
+    def test_recorded_green_batch_rejects_an_incorrect_intermediate_merge_tree(self):
+        first = self.pr_branch(1, "first.txt", "first change\n")
+        second = self.pr_branch(2, "second.txt", "second change\n")
+        fake, name, tip = self.build_batch([(1, first), (2, second)])
+        # Drop the first PR's edit from its merge tree. The second merge is
+        # correct for these parents, so checking only the tip would miss it.
+        first_message = sh(self.origin, "log", "-1", "--format=%B", f"{tip}^1")
+        bad_first = sh(self.origin, "commit-tree", f"{self.main}^{{tree}}", "-p", self.main, "-p", first, "-m", first_message)
+        last_tree = sh(self.origin, "merge-tree", "--write-tree", "--no-messages", bad_first, second)
+        last_message = sh(self.origin, "log", "-1", "--format=%B", tip)
+        bad_tip = sh(self.origin, "commit-tree", last_tree, "-p", bad_first, "-p", second, "-m", last_message)
+        self.assert_recorded_chain_rejected(fake, name, bad_tip, [1, 2])
+
+    def test_recorded_green_batch_rejects_an_extra_merge_beyond_the_cap(self):
+        numbers = list(range(1, train.BATCH_CAP + 2))
+        heads = [(n, self.pr_branch(n, f"pr{n}.txt", f"change {n}\n")) for n in numbers]
+        fake, name, tip = self.build_batch(heads)
+        self.assertEqual([member["pr"] for member in self.members(name)], numbers[:-1])
+        number, head = heads[-1]
+        tree = sh(self.origin, "merge-tree", "--write-tree", "--no-messages", tip, head)
+        message = "\n\n".join(train.merge_message({"number": number, "branch": f"pr{number}"}, fake.owner, name))
+        too_long = sh(self.origin, "commit-tree", tree, "-p", tip, "-p", head, "-m", message)
+        self.assert_recorded_chain_rejected(fake, name, too_long, numbers)
+
+    def test_chain_requires_exact_parent_ids_and_member_count_even_for_identical_trees(self):
+        head = self.pr_branch(1, "first.txt", "same content\n")
+        other = self.pr_branch(2, "first.txt", "same content\n")
+        fake, _, tip = self.build_batch([(1, head)])
+        sh(self.clone, "fetch", "-q", "origin", "refs/pull/2/head")
+        self.assertNotEqual(head, other)
+        self.assertEqual(sh(self.clone, "rev-parse", f"{head}^{{tree}}"), sh(self.clone, "rev-parse", f"{other}^{{tree}}"))
+        step = self.step(fake)
+        member = {"pr": 1, "sha": head}
+        self.assertTrue(step.valid_batch_chain(self.main, [member], tip))
+        self.assertFalse(step.valid_batch_chain(self.main, [dict(member, sha=other)], tip))
+        self.assertFalse(step.valid_batch_chain(self.main, [member, {"pr": 2, "sha": other}], tip))
+
     def closed_issues(self, fake):
         return [path.rsplit("/", 1)[1] for method, path, body in fake.writes
                 if method == "PATCH" and re.search(r"issues/\d+$", path) and body == {"state": "closed",
