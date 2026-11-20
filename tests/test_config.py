@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from coordlib import config  # noqa: E402
@@ -10,7 +11,9 @@ from coordlib import config  # noqa: E402
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.mkdtemp()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = temp.name
         self.path = os.path.join(self.dir, "config.json")
         os.environ["COORD_CONFIG"] = self.path
         config._cache.clear()
@@ -39,6 +42,26 @@ class ConfigTests(unittest.TestCase):
             handle.write("{")
         with self.assertRaises(ValueError):
             config.load()
+
+    def test_wrong_field_type_reports_the_setting(self):
+        for value, field in [({"owner_only_paths": "src/"}, "owner_only_paths"),
+                             ({"conductor": {"deny": [1]}}, "conductor.deny"),
+                             ({"owner_login": {}}, "owner_login"),
+                             ({"lane_classifier": []}, "lane_classifier")]:
+            with self.subTest(value=value):
+                with open(self.path, "w") as handle:
+                    json.dump(value, handle)
+                with self.assertRaisesRegex(config.ConfigError, field):
+                    config.load(refresh=True)
+
+    def test_repeated_lookups_discover_each_checkout_once(self):
+        os.environ.pop("COORD_CONFIG")
+        with mock.patch.object(config, "_repo_root", return_value=self.dir) as discover:
+            config.get("ci_workflow", start=self.dir)
+            config.get("conductor", start=self.dir)
+            self.assertEqual(discover.call_count, 1)
+            config.load(start=self.dir, refresh=True)
+            self.assertEqual(discover.call_count, 2)
 
 
 if __name__ == "__main__":

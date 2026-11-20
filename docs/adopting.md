@@ -146,6 +146,11 @@ The train advances one step per workflow run (see Merge train in
 repository with push access plus a pinned commit of `coord`, and runs `coord train step`.
 Pin `COORD_SHA` to a reviewed commit and bump it deliberately.
 
+`coord train step --repo-dir PATH` reads the target checkout's config and discovers
+the GitHub repository from its origin. `COORD_CONFIG` can select another config file.
+For a local mirror or proxy origin, pass `coord --repo owner/name train step --repo-dir PATH`
+or set `COORD_REPO`. Recognizable GitHub fetch and push URLs must match that repository.
+
 ```yaml
 name: Merge train
 on:
@@ -203,7 +208,7 @@ started by `GITHUB_TOKEN` do not trigger `workflow_run`.
 Before merging a PR, the train requires a clean review of its exact head commit. Either signal
 satisfies the gate:
 1. **Manual / agent review attestation (works for any team):** After another agent or human
-   completes a clean review, record it on the repository owner's identity:
+   completes a clean review, record it using the configured `owner_login` account (the repository owner by default):
    ```sh
    coord train review 42 --head <full-40-char-sha> --by <reviewer-agent-or-name> --note "clean review"
    ```
@@ -268,9 +273,9 @@ when there is real work (messages to `conductor@*`, red CI, train holds, offline
    git clone https://github.com/alex-bridges/coord ~/tools/coord
    ~/tools/coord/conductor/install.sh --repo owner/name [--home DIR] [--interval 300] [--no-wake]
    ```
-   Installs `com.coord.conductor.<owner>-<name>` (log
-   `~/Library/Logs/coord-conductor-<owner>-<name>.log`), keeps a detached `origin/main`
-   checkout at `~/conductor/<name>`, and runs `coord conductor tick` every `--interval`
+   Installs `com.coord.conductor.<owner>+<name>` (log
+   `~/Library/Logs/coord-conductor-<owner>+<name>.log`), keeps a detached checkout of the default branch
+   at `~/conductor/<owner>/<name>`, and runs `coord conductor tick` every `--interval`
    seconds. Use `--no-wake` for model-free ticks and `--uninstall` to remove it.
 
    **Windows (Task Scheduler, PowerShell):**
@@ -278,18 +283,20 @@ when there is real work (messages to `conductor@*`, red CI, train holds, offline
    git clone https://github.com/alex-bridges/coord $HOME\tools\coord
    & "$HOME\tools\coord\conductor\install.ps1" -Repo owner/name [-HomeDir DIR] [-Interval 300] [-NoWake]
    ```
-   Registers a per-user Scheduled Task `coord-conductor-<owner>-<name>` (log
-   `%LOCALAPPDATA%\coord\logs\conductor-<owner>-<name>.log`) running from `~\conductor\<name>`.
+   Registers a per-user Scheduled Task `coord-conductor-<owner>+<name>` (log
+   `%LOCALAPPDATA%\coord\logs\conductor-<owner>+<name>.log`) running from `~\conductor\<owner>\<name>`.
    Use `-NoWake` for model-free ticks and `-Uninstall` to remove it.
 
-   Check status on either OS with `coord conductor status`.
+   On either OS, existing installations retain their previous scheduler name when the recorded
+   repository matches. When reusing a checkout, any identifiable GitHub fetch or push URL for
+   `origin` must point to the requested repository. Check status with `coord conductor status`.
 
 ## 9. Using `coord` on a public vs. private repository
 
 `coord` was designed primarily for private repositories where everyone who can comment is a
 collaborator, and it also enforces boundaries if used on a **public** repository:
 - **Approvals & clean reviews:** `owner-approve` and `review-clean` records are only trusted
-  when GitHub reports the comment author as the repository owner (`User`, never a `[bot]` or
+  when GitHub identifies the author as `owner_login`, which defaults to the repository owner (`User`, never a `[bot]` or
   external commenter).
 - **Merge train:** PRs from forks are automatically rejected (`fromFork`), and batch CI runs
   only count when dispatched by `github-actions[bot]`.

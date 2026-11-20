@@ -54,6 +54,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -286,14 +287,19 @@ def store_private_key(pem: bytes, client_id: str, service: Optional[str] = None,
                     os.unlink(tmp)
         return f"Windows DPAPI store ({path})"
     if compat.IS_MACOS:
-        encoded = base64.b64encode(pem).decode("ascii")
-        result = subprocess.run(
-            [SECURITY, "add-generic-password", "-U", "-s", svc, "-a", client_id, "-w", encoded],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0:
-            detail = redact((result.stderr or "").strip())[:200]
-            raise AppAuthError(f"macOS Keychain refused to store the key (exit {result.returncode}: {detail})")
+        helper = os.path.join(os.path.dirname(__file__), "macos_keychain.py")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", helper, svc, client_id], input=base64.b64encode(pem),
+                capture_output=True, timeout=SUBPROCESS_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise AppAuthError(f"the Keychain did not answer within {SUBPROCESS_TIMEOUT_SECONDS}s "
+                               "(locked, or waiting on an access prompt)") from None
+        except OSError as error:
+            raise AppAuthError(f"could not start the Keychain import ({error.strerror})") from None
+        if result.returncode:
+            detail = redact(result.stderr.decode(errors="replace").strip())[:200]
+            raise AppAuthError(f"macOS Keychain could not store the key (exit {result.returncode}: {detail})")
         return f"macOS login Keychain (service {svc}, account {client_id})"
     raise AppAuthError("importing a GitHub App key requires macOS Keychain or Windows DPAPI")
 
@@ -317,6 +323,10 @@ def load_config(path: str) -> Dict[str, Any]:
             "app_id": data.get("app_id") if isinstance(data.get("app_id"), int) else None}
 
 
+def review_run(env: Dict[str, str]) -> bool:
+    return str(env.get("COORD_AGENT") or "").startswith("reviewer@")
+
+
 def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
     """App mode for `repo`: on only when every condition in the module doc holds.
 
@@ -328,7 +338,7 @@ def detect(repo: str, env: Optional[Dict[str, str]] = None) -> Mode:
     """
     env = os.environ if env is None else env
     path = config_path(env)
-    if str(env.get("COORD_AGENT") or "").startswith("reviewer@"):
+    if review_run(env):
         # A review run, and anything it starts (a PR's test, a wrapper), is read-only: it
         # mints no token and falls back to no identity (Codex on #1049). Every call refuses.
         return Mode(True, "a review run holds no GitHub credential", path,
@@ -757,18 +767,15 @@ class AppTokens:
         """One JWT-authenticated call. These are the app's own calls, on its own limit, so
         they are not recorded against the installation's budget."""
         data = json.dumps(body).encode() if body is not None else None
-        # The JWT as an unredirected header, sent through gh.app_open: a redirect to another
+        # The JWT as an unredirected header, sent through gh.api_open: a redirect to another
         # origin is refused, so the JWT never reaches anyone but GitHub.
-        request = gh.app_request(method, f"{self.api}/{path}", jwt, data)
-        opener = self._urlopen or gh.app_open
+        request = gh.api_request(method, f"{self.api}/{path}", jwt, data)
+        opener = self._urlopen or gh.api_open
         try:
             with opener(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
         except urllib.error.HTTPError as error:
-            try:
-                detail = redact(error.read().decode(errors="replace").strip())[:300]
-            except Exception:  # noqa: BLE001 - an unreadable error body is still this HTTP error
-                detail = "(no readable body)"
+            detail = redact(gh.http_error_detail(error).strip())[:300]
             failure = AppAuthError(f"{method} {path} answered HTTP {error.code}: {detail}")
             failure.status = error.code  # type: ignore[attr-defined]
             raise failure from None

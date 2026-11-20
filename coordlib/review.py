@@ -28,8 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 
-CODEX_LOGIN_PREFIX = "chatgpt-codex-connector"
-VERDICT_CHECK = "CI verdict"
+CODEX_LOGINS = frozenset({"chatgpt-codex-connector", "chatgpt-codex-connector[bot]"})
 
 # CANCELLED is absent on purpose: a cancelled check is a superseded run, not a red.
 _FAILED = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "ERROR"}
@@ -65,7 +64,7 @@ def parse_time(value: Optional[str]) -> Optional[dt.datetime]:
 
 def is_bot(login: Optional[str]) -> bool:
     login = login or ""
-    return login.endswith("[bot]") or login.startswith(CODEX_LOGIN_PREFIX)
+    return login.endswith("[bot]") or login in CODEX_LOGINS
 
 
 def _head_commit(pr: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,7 +96,7 @@ def summary_reviewed_commit(pr: Dict[str, Any]) -> Optional[str]:
     for comment in _nodes(pr.get("comments")):
         login = (comment.get("author") or {}).get("login") or ""
         body = comment.get("body") or ""
-        if login.startswith(CODEX_LOGIN_PREFIX) and SUMMARY_MARKER in body:
+        if login in CODEX_LOGINS and SUMMARY_MARKER in body:
             match = _SUMMARY_ROW.search(body)
             if match and "Completed" in match.group("status"):
                 return match.group("sha")
@@ -115,7 +114,7 @@ def codex_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     for a head Codex never reviewed (substitute review of #989).
     """
     reactions = _nodes(pr.get("reactions"))
-    bot = [r for r in reactions if ((r.get("user") or {}).get("login") or "").startswith(CODEX_LOGIN_PREFIX)]
+    bot = [r for r in reactions if (r.get("user") or {}).get("login") in CODEX_LOGINS]
     thumbs = [parse_time(r.get("createdAt")) for r in bot if r.get("content") == "THUMBS_UP"]
     eyes = any(r.get("content") == "EYES" for r in bot)
     pushed = head_pushed_at(pr)
@@ -150,8 +149,8 @@ def unanswered_findings(pr: Dict[str, Any]) -> int:
         starter = (comments[0].get("author") or {}).get("login")
         if not is_bot(starter):
             continue
-        answered = any(isinstance(c, dict) and not is_bot((c.get("author") or {}).get("login"))
-                       for c in comments[1:])
+        replies = ((c.get("author") or {}).get("login") for c in comments[1:] if isinstance(c, dict))
+        answered = any(login and not is_bot(login) for login in replies)
         if not answered:
             count += 1
     return count
@@ -198,8 +197,9 @@ def never_started(context: Dict[str, Any]) -> bool:
 def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     """The CI picture at the head commit.
 
-    `verdict` is the `CI verdict` aggregate job when present (success, failure,
-    pending, skipped, cancelled, or none). `failing`/`pending` list the individual checks,
+    `verdict` describes the configured aggregate job. Without one, successful checks
+    give a green verdict once the remaining checks have completed successfully or
+    been skipped or neutral. `failing`/`pending` list the individual checks,
     minus any configured `ignored_check_prefixes`. `not_run` lists failed check runs GitHub never
     started (NOT_RUN_PREFIX); they are neither red nor green, so nothing reads them as
     a reason to hold or to merge.
@@ -210,7 +210,9 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
     pending: List[str] = []
     started: List[str] = []
     not_run: List[str] = []
+    completed = set()
     verdict = "none"
+    verdict_name = config.get("verdict_job")
     for context in contexts:
         refused = False
         if context.get("__typename") == "CheckRun":
@@ -223,7 +225,7 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
             if status == "IN_PROGRESS" and not is_ignored_check(name):
                 started.append(name)
             # A verdict job that never ran says nothing; the verdict stays as it was.
-            if name == VERDICT_CHECK and not refused:
+            if name == verdict_name and not refused and not is_ignored_check(name):
                 if not done:
                     verdict = "pending"
                 elif conclusion == "SUCCESS":
@@ -234,9 +236,9 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
                     verdict = "failure"
         else:
             name = context.get("context") or ""
-            state = context.get("state")
-            done = state not in ("PENDING", "EXPECTED")
-            failed = state in _FAILED
+            conclusion = context.get("state")
+            done = conclusion not in ("PENDING", "EXPECTED")
+            failed = conclusion in _FAILED
         if is_ignored_check(name):
             continue
         if refused:
@@ -245,6 +247,19 @@ def ci_state(pr: Dict[str, Any]) -> Dict[str, Any]:
             failing.append(name)
         elif not done:
             pending.append(name)
+        else:
+            completed.add(conclusion)
+    if not verdict_name:
+        if failing:
+            verdict = "failure"
+        elif pending:
+            verdict = "pending"
+        elif "SUCCESS" in completed and completed <= {"SUCCESS", "SKIPPED", "NEUTRAL"}:
+            verdict = "success"
+        elif "CANCELLED" in completed:
+            verdict = "cancelled"
+        elif completed == {"SKIPPED"}:
+            verdict = "skipped"
     # `started` is the part of `pending` a runner has picked up; the rest waits in the
     # queue. The board says "running" only when something started (probe 5: a PR row
     # said "running" while the header, which counts workflow runs, said 0 running).

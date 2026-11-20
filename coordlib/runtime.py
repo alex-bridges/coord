@@ -11,7 +11,7 @@ import json
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import config
-from .gh import redact
+from .gh import GitHubError, redact
 
 
 def setting(section: str, key: str, required: bool = True) -> Optional[str]:
@@ -19,7 +19,7 @@ def setting(section: str, key: str, required: bool = True) -> Optional[str]:
     required one raises a ValueError that names the key and the config file."""
     value = (config.get(section) or {}).get(key)
     if not value and required:
-        raise ValueError("coord: '%s.%s' is not set; add it to %s to use this feature"
+        raise config.ConfigError("coord: '%s.%s' is not set; add it to %s to use this feature"
                          % (section, key, config.CONFIG_RELATIVE_PATH))
     return value or None
 
@@ -37,8 +37,8 @@ _default_branches = {}
 
 def default_branch(gh: Any = None, hint: Optional[str] = None) -> str:
     """The repository's default branch: config `default_branch`, else `hint` (a branch the
-    caller already read from GitHub), else one GitHub lookup per repo; "main" only when none
-    of those is available."""
+    caller already read from GitHub), else one GitHub lookup per repo. With a GitHub
+    client, an unsuccessful lookup must stop operations that depend on the branch."""
     configured = config.get("default_branch")
     if configured:
         return str(configured)
@@ -48,10 +48,11 @@ def default_branch(gh: Any = None, hint: Optional[str] = None) -> str:
     if gh is None or not repo:
         return "main"
     if repo not in _default_branches:
-        try:
-            _default_branches[repo] = str((gh.rest("repos/{repo}") or {}).get("default_branch") or "main")
-        except Exception:  # GitHub unavailable: not cached, so a later call retries
-            return "main"
+        repository = gh.rest("repos/{repo}")
+        branch = repository.get("default_branch") if isinstance(repository, dict) else None
+        if not isinstance(branch, str) or not branch:
+            raise GitHubError(f"GitHub did not return a default branch for {repo}")
+        _default_branches[repo] = branch
     return _default_branches[repo]
 
 

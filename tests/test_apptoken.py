@@ -7,6 +7,7 @@ the real Keychain item, writes the real token cache or reaches GitHub.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -38,6 +39,24 @@ def setUpModule():
 
 
 class JWTTests(AppTestCase):
+    def test_macos_key_import_sends_the_secret_only_over_stdin_and_times_out(self):
+        from unittest.mock import patch
+        from coordlib import compat
+
+        with patch.object(compat, "IS_MACOS", True), patch.object(compat, "IS_WINDOWS", False), \
+                patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+            result = apptoken.store_private_key(PEM, CLIENT_ID, service="test-service")
+            args = run.call_args.args[0]
+            self.assertEqual(args[:3], [sys.executable, "-I", "-S"])
+            self.assertEqual(os.path.basename(args[3]), "macos_keychain.py")
+            self.assertEqual(args[4:], ["test-service", CLIENT_ID])
+            self.assertEqual(run.call_args.kwargs["input"], PEM_B64.encode())
+            self.assertEqual(run.call_args.kwargs["timeout"], apptoken.SUBPROCESS_TIMEOUT_SECONDS)
+            self.assertIn("test-service", result)
+            run.side_effect = subprocess.TimeoutExpired(args, 20)
+            with self.assertRaisesRegex(AppAuthError, "Keychain did not answer"):
+                apptoken.store_private_key(PEM, CLIENT_ID, service="test-service")
+
     def verify(self, verifier: str, jwt: str) -> "subprocess.CompletedProcess[bytes]":
         header, payload, signature = jwt.split(".")
         work = tempfile.mkdtemp(dir=self.root)
@@ -1083,7 +1102,7 @@ class MintErrorTests(AppTestCase):
         for name, kwargs in cases.items():
             with self.subTest(case=name):
                 self.forget_failures()
-                self.patch(apptoken.gh, "app_open", self.failing_urlopen(**kwargs))
+                self.patch(apptoken.gh, "api_open", self.failing_urlopen(**kwargs))
                 with self.assertRaises(AppAuthError) as caught:
                     self.tokens().token("read")
                 self.assert_no_secret(str(caught.exception))
@@ -1121,9 +1140,9 @@ class RedirectTests(unittest.TestCase):
         self.addCleanup(os.environ.update, saved)
         from coordlib import gh
         self.gh = gh
-        original = gh._APP_OPENER  # noqa: SLF001
-        gh._APP_OPENER = None  # noqa: SLF001
-        self.addCleanup(setattr, gh, "_APP_OPENER", original)
+        original = gh._API_OPENER  # noqa: SLF001
+        gh._API_OPENER = None  # noqa: SLF001
+        self.addCleanup(setattr, gh, "_API_OPENER", original)
 
     def url(self, server, path):
         return f"http://127.0.0.1:{server.server_address[1]}{path}"
@@ -1170,9 +1189,9 @@ class RedirectTests(unittest.TestCase):
     def test_an_app_token_never_reaches_another_origin(self):
         for path, method, data in (("/away", "GET", None), ("/away-307", "POST", b"{}")):
             with self.subTest(path=path):
-                request = self.gh.app_request(method, self.url(self.a, path), "ghs_THROWAWAY_read", data)
+                request = self.gh.api_request(method, self.url(self.a, path), "ghs_THROWAWAY_read", data)
                 with self.assertRaises(urllib.error.HTTPError) as caught:
-                    self.gh.app_open(request, timeout=5)
+                    self.gh.api_open(request, timeout=5)
                 caught.exception.close()
                 self.assertIn("refused a redirect", str(caught.exception.reason))
         self.assertEqual(self.b.seen, [], "B was never reached, with or without a credential")
@@ -1194,20 +1213,21 @@ class RedirectTests(unittest.TestCase):
         self.assertEqual(self.b.seen, [], "B was never reached")
 
     def test_a_redirect_within_the_origin_keeps_the_credential(self):
-        request = self.gh.app_request("GET", self.url(self.a, "/same"), "ghs_THROWAWAY_read")
-        self.gh.app_open(request, timeout=5).read()
+        request = self.gh.api_request("GET", self.url(self.a, "/same"), "ghs_THROWAWAY_read")
+        self.gh.api_open(request, timeout=5).read()
         self.assertEqual(self.a.seen, [("GET", "/same", "Bearer ghs_THROWAWAY_read"),
                                        ("GET", "/final", "Bearer ghs_THROWAWAY_read")])
 
     def test_a_downgrade_to_http_on_the_same_host_is_refused(self):
-        request = self.gh.app_request("GET", "https://api.github.com/repos/o/r", "ghs_THROWAWAY_read")
+        request = self.gh.api_request("GET", "https://api.github.com/repos/o/r", "ghs_THROWAWAY_read")
         for target in ("http://api.github.com/repos/o/r", "https://api.github.com:8443/x", "https://evil.example/x"):
             with self.subTest(target=target):
-                with self.assertRaises(urllib.error.HTTPError):
-                    self.gh.SameOriginRedirects().redirect_request(request, None, 302, "Found", {}, target)
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    self.gh.SameOriginRedirects().redirect_request(request, io.BytesIO(), 302, "Found", {}, target)
+                caught.exception.close()
 
     def test_the_credential_is_never_a_redirectable_header(self):
-        request = self.gh.app_request("GET", "https://api.github.com/x", "ghs_THROWAWAY_read")
+        request = self.gh.api_request("GET", "https://api.github.com/x", "ghs_THROWAWAY_read")
         self.assertNotIn("Authorization", request.headers)
         self.assertEqual(request.unredirected_hdrs["Authorization"], "Bearer ghs_THROWAWAY_read")
 

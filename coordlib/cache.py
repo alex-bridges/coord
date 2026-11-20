@@ -19,8 +19,9 @@ import re
 import tempfile
 import time
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import quote
 
-from . import compat, config
+from . import compat, config, review
 
 
 def state_dir_name() -> str:
@@ -49,8 +50,11 @@ def base_cache_dir(name: Optional[str] = None) -> str:
 
 
 def cache_dir(repo: str) -> str:
-    base = base_cache_dir()
-    return os.path.join(base, re.sub(r"[^A-Za-z0-9._-]", "_", repo))
+    # Preserve the shared budget.json path used by older clients wherever the
+    # original separator identifies just one repo. Discard ambiguous cache keys.
+    separator = "+" if "_" in repo else "_"
+    owner, _, name = repo.lower().partition("/")
+    return os.path.join(base_cache_dir(), quote(owner, safe="") + separator + quote(name, safe=""))
 
 
 def _read(path: str) -> Optional[Dict[str, Any]]:
@@ -58,7 +62,8 @@ def _read(path: str) -> Optional[Dict[str, Any]]:
     raise (ValueError, RecursionError, MemoryError, …) is no data: the cache fails open."""
     try:
         with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
+            data = json.load(handle)
+            return data if isinstance(data, dict) else None
     except Exception:  # noqa: BLE001 - a cache read must never take a command down
         return None
 
@@ -96,8 +101,9 @@ def load_snapshot(repo: str, max_age_seconds: float) -> Optional[Dict[str, Any]]
     if age > max_age_seconds:
         return None
     data = _read(path)
-    if data is not None:
-        data["cacheAgeSeconds"] = int(age)
+    if data is None or _timestamp(data.get("generatedAt")) is None:
+        return None
+    data["cacheAgeSeconds"] = max(0, int(age))
     return data
 
 
@@ -125,16 +131,17 @@ def load_mailboxes(repo: str) -> List[int]:
     # Version 1 cached unauthenticated comment markers indefinitely. Discard it
     # so a forged marker seen before the author check cannot poison future sends.
     numbers = data.get("numbers") if isinstance(data, dict) and data.get("version") == 2 else None
-    return [n for n in numbers if isinstance(n, int)] if isinstance(numbers, list) else []
+    return [n for n in numbers if type(n) is int and n > 0] if isinstance(numbers, list) else []
 
 
 def remember_mailboxes(repo: str, numbers: List[int]) -> None:
     """Add to the known mailbox numbers. Nothing ever leaves: a retired mailbox still has
     nobody working on it. Written only when something is new, so most reads cost no write."""
-    known = set(load_mailboxes(repo))
-    new = {n for n in numbers if isinstance(n, int)} - known
-    if new:
-        _write(mailboxes_path(repo), {"version": 2, "numbers": sorted(known | new)})
+    new = {n for n in numbers if type(n) is int and n > 0}
+    if new and new.difference(load_mailboxes(repo)):
+        with _cache_lock(repo, "mailboxes.lock", 5.0) as acquired:
+            if acquired:
+                _write(mailboxes_path(repo), {"version": 2, "numbers": sorted(new.union(load_mailboxes(repo)))})
 
 
 def budget_path(repo: str) -> str:
@@ -200,13 +207,20 @@ def store_budget(repo: str, readings: Dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) -> Iterator[None]:
+def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) -> Iterator[bool]:
     """Serialize read-modify-writes of one principal's file between processes, so one
     agent's reading cannot overwrite another's (the app principal keeps a maximum per
     window): budget.lock for Alex's, budget-app.lock for the app's. Best effort: a lock
     that cannot be had within the timeout is skipped, not waited on."""
     name = "budget.lock" if principal == USER else "budget-app.lock"
+    with _cache_lock(repo, name, timeout_seconds) as acquired:
+        yield acquired
+
+
+@contextlib.contextmanager
+def _cache_lock(repo: str, name: str, timeout_seconds: float) -> Iterator[bool]:
     fd = None
+    acquired = False
     try:
         os.makedirs(cache_dir(repo), exist_ok=True)
         fd = os.open(os.path.join(cache_dir(repo), name), os.O_RDWR | os.O_CREAT, 0o600)
@@ -214,6 +228,7 @@ def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) 
         while True:
             try:
                 compat.try_lock(fd)
+                acquired = True
                 break
             except OSError:
                 if time.monotonic() > deadline:
@@ -222,10 +237,11 @@ def budget_lock(repo: str, timeout_seconds: float = 5.0, principal: str = USER) 
     except OSError:
         pass
     try:
-        yield
+        yield acquired
     finally:
         if fd is not None:
-            compat.unlock(fd)
+            if acquired:
+                compat.unlock(fd)
             os.close(fd)
 
 
@@ -237,14 +253,25 @@ def _cursor_path(repo: str, agent: str) -> str:
     return os.path.join(cache_dir(repo), "inbox", f"{readable}-{digest}.json")
 
 
+def _timestamp(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        try:
+            if review.parse_time(value) is not None:
+                return value
+        except ValueError:
+            pass
+    return None
+
+
 def load_cursor(repo: str, agent: str) -> Optional[str]:
     data = _read(_cursor_path(repo, agent))
-    return (data or {}).get("seenThrough")
+    return _timestamp((data or {}).get("seenThrough"))
 
 
 def load_seen_ids(repo: str, agent: str) -> List[int]:
     data = _read(_cursor_path(repo, agent))
-    return [int(i) for i in (data or {}).get("seenIds", []) if isinstance(i, int)]
+    ids = (data or {}).get("seenIds")
+    return [i for i in ids if type(i) is int and i != 0] if isinstance(ids, list) else []
 
 
 def store_cursor(repo: str, agent: str, seen_through: str, seen_ids: Optional[List[int]] = None) -> None:

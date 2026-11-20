@@ -106,7 +106,7 @@ class ConcurrentIdentityTests(unittest.TestCase):
     def test_simultaneous_claims_remain_separate_and_contested(self):
         first = self.agent({"CODEX_THREAD_ID": "task-one"})
         second = self.agent({"CODEX_THREAD_ID": "task-two"})
-        comments = [{"id": number, "createdAt": "2026-09-27T01:00:00Z", "url": f"https://example/{number}",
+        comments = [{"id": number, "on": 1, "createdAt": "2026-09-27T01:00:00Z", "url": f"https://example/{number}",
                      "payload": {"kind": "claim", "v": 1, "issue": 1, "agent": agent,
                                  "branch": f"branch-{number}", "files": []}}
                     for number, agent in enumerate((first, second), 1)]

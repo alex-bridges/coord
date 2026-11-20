@@ -24,6 +24,7 @@ can print it.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import http.client
 import json
@@ -112,12 +113,31 @@ def _default_runner(args: Sequence[str], stdin: Optional[str]) -> "subprocess.Co
         raise GitHubError(f"gh timed out after {CALL_TIMEOUT_SECONDS}s: {' '.join(args[:3])}") from error
 
 
+def _valid_repo(repo: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9._-]+", repo)
+                and repo.split("/")[1] not in (".", ".."))
+
+
 def repo_from_remote_url(url: str) -> Optional[str]:
-    """owner/name from an https or ssh GitHub remote URL, or None."""
-    match = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", url.strip())
-    if not match:
-        return None
-    return f"{match.group(1)}/{match.group(2)}"
+    """owner/name from a GitHub remote URL, or None."""
+    url = url.strip()
+    if "://" in url:
+        try:
+            remote = urllib.parse.urlsplit(url)
+            if remote.scheme not in ("https", "http", "ssh", "git") or remote.query or remote.fragment:
+                return None
+            if remote.hostname != "github.com" and (remote.scheme, remote.hostname) != ("ssh", "ssh.github.com"):
+                return None
+        except ValueError:
+            return None
+        path = remote.path.removeprefix("/")
+    else:
+        match = re.fullmatch(r"(?:[^/@:]+@)?github\.com:(.+)", url, re.IGNORECASE)
+        if not match:
+            return None
+        path = match.group(1)
+    repo = path.removesuffix("/").removesuffix(".git")
+    return repo if _valid_repo(repo) else None
 
 
 def detect_repo(cwd: Optional[str] = None) -> str:
@@ -151,11 +171,11 @@ def _next_link(header: Optional[str]) -> Optional[str]:
     return None
 
 
-# MARK: - Requests that carry an app credential
+# MARK: - Authenticated requests
 
 
 class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
-    """Redirects for requests carrying an app credential (a JWT or an installation token).
+    """Redirects for requests carrying a GitHub credential.
 
     urllib's own handler copies headers added with `add_header` onto 301, 302, 303 and 307
     redirects, to any host and to plain http, so a redirect from GitHub (or from anything
@@ -169,7 +189,7 @@ class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
         if (old.scheme, old.netloc.lower()) != (new.scheme, new.netloc.lower()):
             raise urllib.error.HTTPError(
                 req.full_url, code,
-                f"refused a redirect to {new.scheme}://{new.netloc}: app credentials stay with {old.netloc}",
+                f"refused a redirect to another origin: credentials stay with {old.netloc}",
                 headers, fp)
         follow = super().redirect_request(req, fp, code, msg, headers, newurl)
         credential = req.unredirected_hdrs.get("Authorization")
@@ -178,20 +198,20 @@ class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
         return follow
 
 
-_APP_OPENER: Optional[urllib.request.OpenerDirector] = None
+_API_OPENER: Optional[urllib.request.OpenerDirector] = None
 
 
-def app_open(request: urllib.request.Request, timeout: float = CALL_TIMEOUT_SECONDS) -> Any:
-    """urlopen for a request carrying an app credential (see SameOriginRedirects)."""
-    global _APP_OPENER
-    if _APP_OPENER is None:
-        _APP_OPENER = urllib.request.build_opener(SameOriginRedirects)
-    return _APP_OPENER.open(request, timeout=timeout)
+def api_open(request: urllib.request.Request, timeout: float = CALL_TIMEOUT_SECONDS) -> Any:
+    """Open an authenticated API request using same-origin redirects."""
+    global _API_OPENER
+    if _API_OPENER is None:
+        _API_OPENER = urllib.request.build_opener(SameOriginRedirects)
+    return _API_OPENER.open(request, timeout=timeout)
 
 
-def app_request(method: str, url: str, credential: str, data: Optional[bytes] = None) -> urllib.request.Request:
-    """A request with an app credential as an UNREDIRECTED Authorization header, so no
-    redirect handler copies it anywhere. Send it with `app_open`."""
+def api_request(method: str, url: str, credential: str, data: Optional[bytes] = None) -> urllib.request.Request:
+    """A request with its credential as an UNREDIRECTED Authorization header, so no
+    redirect handler copies it anywhere. Send it with `api_open`."""
     request = urllib.request.Request(url, data=data, method=method)
     request.add_unredirected_header("Authorization", f"Bearer {credential}")
     _api_headers(request, data)
@@ -226,6 +246,26 @@ def repo_path_link(url: str, repo: str) -> str:
     return re.sub(r"/repositories/\d+/", f"/repos/{repo}/", url, count=1)
 
 
+def _response_json(raw: str) -> Any:
+    try:
+        return json.loads(raw) if raw.strip() else None
+    except (ValueError, RecursionError):
+        raise GitHubError("GitHub returned invalid JSON") from None
+
+
+def http_error_detail(error: urllib.error.HTTPError) -> str:
+    """Read a bounded error body without losing the status if its stream fails."""
+    if error.fp is None:
+        return "(no readable body)"  # Python 3.9 leaves the response wrapper uninitialized
+    try:
+        return error.read(4000).decode(errors="replace")
+    except Exception:
+        return "(no readable body)"
+    finally:
+        with contextlib.suppress(Exception):
+            error.close()
+
+
 class GitHub:
     """`runner` injects a fake `gh` (tests); `transport` forces "gh" or "http".
 
@@ -242,6 +282,8 @@ class GitHub:
         app: Optional[Any] = None,
     ):
         self.repo = repo or detect_repo()
+        if not _valid_repo(self.repo):
+            raise GitHubError("expected a GitHub repository in owner/name form")
         self.owner, self.name = self.repo.split("/", 1)
         self._runner = runner
         self._transport = transport or os.environ.get("COORD_TRANSPORT") or ("gh" if runner else None)
@@ -305,29 +347,23 @@ class GitHub:
         for a GET or a GraphQL query, `ops` for every other write), obtained BEFORE anything
         else: a failure raises AppAuthError and no request is sent, with any token."""
         kind = kind or token_kind(method, url)
-        if not url.startswith("http"):
-            url = f"{(GITHUB_API if self.app is not None else self.api)}/{url.lstrip('/')}"
+        base = GITHUB_API if self.app is not None else self.api
+        if not url.startswith(("http:", "https:", "//")):
+            url = f"{base}/{url.lstrip('/')}"
+        if not url.startswith(base + "/"):
+            error_type = AppAuthError if self.app is not None else GitHubError
+            raise error_type(f"refused to send a credential outside {base}")
         if self.app is not None:
-            if not url.startswith(GITHUB_API + "/"):
-                # A next-page link or anything else pointing off GitHub never gets an app token.
-                raise AppAuthError(f"not sending an app token to {url.split('?', 1)[0]}: app credentials go to "
-                                   f"{GITHUB_API} only")
             bearer = self.app.token(kind)
             principal = self.principal() or budget.USER  # the token just named the installation
         else:
             bearer, principal = self.token(), budget.USER
         self.calls += 1
         data = json.dumps(body).encode() if body is not None else None
-        if self.app is not None:
-            request, opener = app_request(method, url, bearer, data), app_open
-        else:
-            request = urllib.request.Request(url, data=data, method=method)
-            request.add_header("Authorization", f"Bearer {bearer}")
-            _api_headers(request, data)
-            opener = urllib.request.urlopen
+        request = api_request(method, url, bearer, data)
         resource = "graphql" if url.rstrip("/").endswith("/graphql") else "core"
         try:
-            with opener(request, timeout=CALL_TIMEOUT_SECONDS) as response:
+            with api_open(request, timeout=CALL_TIMEOUT_SECONDS) as response:
                 raw = response.read().decode()
                 headers = {k.lower(): v for k, v in response.headers.items()}
             budget.record(self.repo, headers, resource, principal)
@@ -337,10 +373,7 @@ class GitHub:
             error_headers = {k.lower(): v for k, v in error.headers.items()} if error.headers else {}
             budget.record(self.repo, error_headers, resource, principal)
             # Whole, or nearly: a proxy's 403 can carry the list of routes to use instead.
-            try:
-                detail = error.read().decode(errors="replace")[:4000]
-            except Exception:  # noqa: BLE001 - an unreadable error body is still this HTTP error
-                detail = "(no readable body)"
+            detail = http_error_detail(error)
             if error.code == 401 and self.app is not None:
                 # The app's token was refused: revoked, or the installation suspended. Drop
                 # it from the cache and refuse (reads serve their cache; nothing goes to Alex).
@@ -358,7 +391,7 @@ class GitHub:
             raise failure from error
         except (urllib.error.URLError, OSError, http.client.HTTPException, UnicodeDecodeError) as error:
             raise GitHubError(f"{method} {url}: {type(error).__name__}: {error}") from error
-        return (json.loads(raw) if raw.strip() else None), headers
+        return _response_json(raw), headers
 
     # MARK: - API
 
@@ -373,7 +406,7 @@ class GitHub:
             args += ["--input", "-"]
             stdin = json.dumps(body)
         out = self._run(args, stdin)
-        return json.loads(out) if out.strip() else None
+        return _response_json(out)
 
     def rest_paginated(self, path: str) -> List[Any]:
         """Every page of a list endpoint, flattened.
@@ -387,14 +420,24 @@ class GitHub:
         pages: List[Any] = []
         if self.transport() == "http":
             url: Optional[str] = path
+            visited = set()
             while url:
+                if url in visited:
+                    raise GitHubError("GitHub returned a repeated pagination link")
+                visited.add(url)
                 page, headers = self._http("GET", url)
                 pages.append(page)
                 link = _next_link(headers.get("link"))
+                if self.app is None and link and link.startswith(GITHUB_API + "/"):
+                    # A proxy may return GitHub's canonical link. Continue through the
+                    # selected API endpoint on every page.
+                    link = self.api + link[len(GITHUB_API):]
                 url = repo_path_link(link, self.repo) if link else None
         else:
             out = self._run(["api", path, "--paginate", "--slurp"])
-            pages = json.loads(out) if out.strip() else []
+            pages = _response_json(out) if out.strip() else []
+            if not isinstance(pages, list):
+                raise GitHubError("gh returned an invalid paginated response")
         flat: List[Any] = []
         for page in pages:
             if isinstance(page, list):
@@ -408,10 +451,16 @@ class GitHub:
         if self.transport() == "http":
             data = self._http("POST", "graphql", payload)[0]
         else:
-            data = json.loads(self._run(["api", "graphql", "--input", "-"], json.dumps(payload)))
+            data = _response_json(self._run(["api", "graphql", "--input", "-"], json.dumps(payload)))
+        if not isinstance(data, dict):
+            raise GitHubError("GitHub returned an invalid GraphQL response")
         if data.get("errors"):
-            messages = "; ".join(str(e.get("message", e)) for e in data["errors"])
+            errors = data["errors"]
+            messages = "; ".join(str(e.get("message", e)) if isinstance(e, dict) else str(e)
+                                 for e in errors) if isinstance(errors, list) else str(errors)
             raise GitHubError(f"GraphQL: {messages}")
+        if not isinstance(data.get("data"), dict):
+            raise GitHubError("GitHub returned no GraphQL data")
         return data["data"]
 
     def probe_budget(self) -> Optional[Dict[str, Any]]:

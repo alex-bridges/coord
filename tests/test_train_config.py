@@ -1,7 +1,10 @@
 """The merge train's per-repo configuration: what a repo with no .coord/config.json gets."""
 
 import json
+import contextlib
+import io
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,8 +14,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import example_config  # noqa: E402
-from coordlib import EXIT_USAGE, cli, config, review, snapshot, train  # noqa: E402
-from coordlib.gh import GitHub  # noqa: E402
+from test_coord import check, with_checks  # noqa: E402
+from coordlib import EXIT_USAGE, cli, config, review, runtime, snapshot, train  # noqa: E402
+from coordlib.gh import GitHub, GitHubError  # noqa: E402
 
 
 class FakeGitHub:
@@ -33,8 +37,7 @@ class UnconfiguredRepoTests(unittest.TestCase):
         self.path = os.path.join(self.dir.name, "config.json")
         os.environ["COORD_CONFIG"] = self.path  # absent: generic defaults
         config._cache.clear()
-        train._default_branch_cache.clear()
-        train._last_default_branch.clear()
+        runtime._default_branches.clear()
 
     def tearDown(self):
         self.dir.cleanup()
@@ -71,6 +74,20 @@ class UnconfiguredRepoTests(unittest.TestCase):
         self.assertEqual(train.default_branch(fake), "develop")
         self.assertEqual(fake.calls, [])
 
+    def test_failed_branch_lookup_does_not_guess_or_reuse_another_repos_branch(self):
+        self.assertEqual(train.default_branch(FakeGitHub("trunk")), "trunk")
+        other = FakeGitHub(None)
+        other.repo = "acme/other"
+        with self.assertRaises(GitHubError):
+            train.default_branch(other)
+        other.default_branch = "stable"
+        self.assertEqual(train.default_branch(other), "stable")
+
+    def test_queue_uses_the_default_branch_in_the_snapshot(self):
+        pr = {"number": 1, "base": "trunk", "head": "a" * 40, "codex": {"approved": True}}
+        snap = {"main": {"name": "trunk"}, "prs": [pr], "train": [{"pr": 1}]}
+        self.assertEqual(cli.train_queue(snap)[0]["verdict"], train.READY)
+
     def test_without_a_lane_classifier_every_pr_is_one_heavy_lane_and_nothing_runs(self):
         def show(path):
             raise AssertionError("nothing may be read or executed: " + path)
@@ -105,6 +122,68 @@ class ConfiguredRepoTests(unittest.TestCase):
         self.assertEqual(review.ignored_check_prefixes(), ("LegacyCI | ",))
 
 
+class StepCheckoutTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.targets = {}
+        for name in ("caller", "target"):
+            directory = os.path.join(temp.name, name)
+            subprocess.run(["git", "init", "-q", directory], check=True)
+            subprocess.run(["git", "-C", directory, "remote", "add", "origin", f"https://github.com/team/{name}.git"],
+                           check=True)
+            os.makedirs(os.path.join(directory, ".coord"))
+            with open(os.path.join(directory, ".coord", "config.json"), "w", encoding="utf-8") as handle:
+                json.dump({"ci_workflow": f"{name}.yml", "train_workflow": "train.yml"}, handle)
+            self.targets[name] = directory
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.targets["caller"])
+        environ = mock.patch.dict(os.environ, {"COORD_APP": "off", "COORD_AGENT": "tester@host"})
+        environ.start()
+        self.addCleanup(environ.stop)
+        for name in ("COORD_CONFIG", "COORD_REPO", "GITHUB_STEP_SUMMARY", "COORD_TRAIN_APP_TOKEN"):
+            os.environ.pop(name, None)
+
+    def invoke(self, *options):
+        seen = []
+        def capture(step):
+            seen.append((step.gh.repo, os.path.realpath(step.git.cwd), train.ci_workflow()))
+            return []
+        errors = io.StringIO()
+        with mock.patch.object(cli.train_step.Step, "run", capture), contextlib.redirect_stderr(errors):
+            code = cli.main([*options, "train", "step", "--repo-dir", self.targets["target"]])
+        return code, seen, errors.getvalue()
+
+    def test_checkout_selects_api_and_config_and_preserves_explicit_config(self):
+        target = os.path.realpath(self.targets["target"])
+        self.assertEqual(self.invoke()[:2], (0, [("team/target", target, "target.yml")]))
+        os.environ["COORD_CONFIG"] = ".coord/config.json"
+        self.assertEqual(self.invoke()[:2], (0, [("team/target", target, "caller.yml")]))
+
+    def test_explicit_target_must_match_fetch_and_every_push_url(self):
+        os.environ["COORD_REPO"] = "team/caller"
+        for options in ((), ("--repo", "team/caller")):
+            with self.subTest(options=options):
+                code, seen, message = self.invoke(*options)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(seen, [])
+                self.assertIn("team/target", message)
+        os.environ["COORD_REPO"] = "TEAM/TARGET"
+        for repo in ("team/target", "team/other"):
+            subprocess.run(["git", "-C", self.targets["target"], "remote", "set-url", "--add", "--push", "origin",
+                            f"git@github.com:{repo}.git"], check=True)
+        code, seen, message = self.invoke()
+        self.assertNotEqual(code, 0)
+        self.assertEqual(seen, [])
+        self.assertIn("push", message)
+        self.assertIn("team/other", message)
+
+    def test_explicit_api_repository_with_a_local_origin(self):
+        target = self.targets["target"]
+        subprocess.run(["git", "-C", target, "remote", "set-url", "origin", self.targets["caller"]], check=True)
+        self.assertEqual(self.invoke("--repo", "team/local")[:2], (0, [("team/local", os.path.realpath(target), "target.yml")]))
+
+
 class ConfigurableLabelsAndChecksTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -121,6 +200,23 @@ class ConfigurableLabelsAndChecksTests(unittest.TestCase):
         self.assertEqual(train.owner_approved_label(), "owner-approved")
         self.assertEqual(review.ignored_check_prefixes(), ())
         self.assertFalse(review.is_ignored_check("LegacyCI | Test"))
+
+    def test_verdict_uses_the_configured_aggregate_job(self):
+        with open(self.path, "w") as handle:
+            json.dump({"verdict_job": "Build gate"}, handle)
+        self.assertEqual(review.ci_state(with_checks(check("CI verdict")))["verdict"], "none")
+        self.assertEqual(review.ci_state(with_checks(check("Build gate")))["verdict"], "success")
+
+    def test_unconfigured_verdict_reports_successful_checks(self):
+        status = {"__typename": "StatusContext", "context": "lint", "state": "SUCCESS"}
+        self.assertEqual(review.ci_state(with_checks(status, check("Build")))["verdict"], "success")
+        self.assertEqual(review.ci_state(with_checks(status, check("Test", status="QUEUED")))["verdict"], "pending")
+        for conclusion in ("NEUTRAL", "SKIPPED", "CANCELLED"):
+            self.assertNotEqual(review.ci_state(with_checks(check("Build", conclusion=conclusion)))["verdict"], "success")
+        with open(self.path, "w") as handle:
+            json.dump({"ignored_check_prefixes": ["External"]}, handle)
+        config._cache.clear()
+        self.assertEqual(review.ci_state(with_checks(check("External build")))["verdict"], "none")
 
     def test_custom_labels_and_ignored_check_prefixes_are_honoured(self):
         with open(self.path, "w") as handle:

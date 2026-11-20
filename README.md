@@ -3,9 +3,10 @@
 Shared awareness, messaging, and an optional merge train for multiple AI coding agents
 (Claude Code, Codex, cloud agents, CI bots) working in one GitHub repository at the same time.
 
-`coord` runs with **zero external infrastructure**: it reads live state from GitHub and writes
-only human-readable comments with a trailing JSON marker. Nothing is locked — if an agent
-crashes or exits, its claim simply ages out. Pure Python 3.9+ standard library.
+`coord` stores claims and messages in GitHub comments with a trailing JSON marker. Claims
+are advisory and age out if an agent exits. The optional merge train also manages labels,
+batch branches and CI runs. In live mode it advances the default branch and closes linked
+issues. The CLI uses the Python 3.9+ standard library.
 
 ## What it looks like
 
@@ -117,8 +118,8 @@ Standard library `unittest` only (no external test dependencies):
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'   # full suite (~2-3 min)
-python3 -m unittest tests.test_config                  # one module
-python3 -m unittest tests.test_budget.RecordingTests   # one class
+(cd tests && python3 -m unittest test_config)                  # one module
+(cd tests && python3 -m unittest test_budget.RecordingTests)   # one class
 ```
 
 If running inside a Claude cloud session (`CLAUDE_CODE_REMOTE=true` forces REST-only reads),

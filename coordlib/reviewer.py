@@ -253,32 +253,56 @@ def requests(issue_comments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # MARK: - Reading the run's result (pure)
 
 
+_FENCED_RESULT = re.compile(r"(?P<fence>```(?:json)?\s*)(?P<value>\{)")
+# Plain prose can contain unbalanced punctuation. Start decoding only at a
+# JSON-looking object or array, so a truncated wrapper still owns its contents.
+_RESULT_START = re.compile(r"""
+    (?P<fence>```(?:json)?\s*)?
+    (?P<value>
+        \{ (?= \s* (?: ["{\[] | [\w-]+\s*: ) )
+      | \[ (?= \s* (?: ["{\[0-9-] | (?:null|true|false)\b | [\w-]+\s*, ) )
+    )
+""", re.X)
+_CLOSE_FENCE = re.compile(r"\s*```")
+_CLOSE_FENCE_LINE = re.compile(r"^[ \t]*```[ \t]*\r?$", re.M)
+_PROSE_FRAGMENT = re.compile(r"\{[^{}\[\]\n]*\}|\[[^{}\[\]\n]*[)\]]")
+
+
 def extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """The review's JSON: the last ```json block, else the last {...} holding "findings"."""
-    blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text or "", re.S)
-    candidates = blocks[::-1]
-    if not candidates:
-        # Unfenced: decode a whole object from every `{`, and take the last outer one that has
-        # findings (not a finding nested inside it; Codex on #1049).
-        decoder, found = json.JSONDecoder(), None
-        index = (text or "").find("{")
-        while index >= 0:
-            try:
-                data, end = decoder.raw_decode(text, index)
-            except ValueError:
-                index = text.find("{", index + 1)
-                continue
-            if isinstance(data, dict) and isinstance(data.get("findings"), list):
-                found = data
-            index = text.find("{", end)
-        return found
-    for candidate in candidates:
+    """Read the complete final findings object, fenced or unfenced."""
+    text = (text or "").rstrip()
+    starts = _FENCED_RESULT if text.endswith("```") else _RESULT_START
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while match := starts.search(text, cursor):
+        start = match.start("value")
         try:
-            data = json.loads(candidate)
-        except ValueError:
-            continue
-        if isinstance(data, dict) and isinstance(data.get("findings"), list):
-            return data
+            _, end = decoder.raw_decode(text, start)
+        except (ValueError, RecursionError):
+            end = None
+        if match.group("fence"):
+            closing = _CLOSE_FENCE.match(text, end) if end is not None else None
+            # An earlier fenced example has an explicit end even if its JSON is
+            # invalid. Never restart inside an unfinished JSON-looking wrapper.
+            if not closing:
+                if closing := _CLOSE_FENCE_LINE.search(text, start):
+                    cursor = closing.end()
+                    continue
+                return None
+            cursor = closing.end()
+        elif end is None:
+            if example := _PROSE_FRAGMENT.match(text, start):
+                cursor = example.end()  # a complete snippet such as {ok: true} or [a,b)
+                continue
+            return None
+        else:
+            cursor = end
+        if cursor == len(text):
+            try:
+                data = marker.parse_json(text[start:end])
+            except ValueError:
+                return None
+            return data if isinstance(data, dict) and isinstance(data.get("findings"), list) else None
     return None
 
 
@@ -315,7 +339,8 @@ def posted_review(pr_comments: List[Dict[str, Any]], pr: int, head: str, model: 
     and bill the same review again (Codex on #1049)."""
     for comment in pr_comments:
         payload = marker.decode(comment.get("body")) or {}
-        if ours(comment, payload, repo) and payload.get("pr") == pr and payload.get("head") == head \
+        if ours(comment, payload, repo) and payload.get("verdict") != "stale" \
+                and payload.get("pr") == pr and payload.get("head") == head \
                 and payload.get("model") == model:
             return comment.get("html_url") or ""
     return None
@@ -947,9 +972,8 @@ class Reviews:
         if finished.get("base") and base_of(current) != finished["base"]:
             moved = f"the PR's base moved from `{finished['base'][:9]}` during the review; ask again"
             if outcome == "pass":
-                blocked_by = blocked_by or moved
-            else:
-                blocked_by = moved
+                outcome = "stale"
+            blocked_by = moved
         counts = outcome == "pass" and not blocked_by
         # A blocking review of a head whose clean review is recorded withdraws that record;
         # the blocking marker holds the head in the train either way (Codex on #1049).
@@ -999,7 +1023,8 @@ class Reviews:
                                        f"requested changes ({link}). A new push needs a new review.",
                         {"head": "", "revokes": head})
             posting.update(revoked=True)
-        self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
+        if posting["verdict"] != "stale":
+            self.done_heads[key] = {"url": link, "at": snapshot.iso(now)}
         record.pop("posting", None)
         record.pop("finished", None)
         record.update(status="done", at=snapshot.iso(now), url=link, verdict=posting["verdict"])
@@ -1090,13 +1115,15 @@ class Reviews:
         if self.w.issue is not None:
             # One beat now, so the run is on record before the first five-minute beat. If it
             # cannot be posted, nothing starts: the GitHubError leaves the request pending (Codex).
-            self.w.beat(True, dict(getattr(self, "extra", {}), live=True))
+            self.w.beat(True, getattr(self, "extra", {}))
             beating.start()
         started = snapshot.now_utc()
         try:
             completed = self.w.runner(command, self.config.home, env, self.config.review_timeout)
         finally:
             stop.set()
+            if beating.is_alive():
+                beating.join()
         return completed, int((snapshot.now_utc() - started).total_seconds())
 
 

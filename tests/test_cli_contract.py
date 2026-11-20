@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -83,6 +84,19 @@ class JsonContractTests(unittest.TestCase):
                 code = cli.main(argv)
             self.assertNotEqual(code, 0)
             self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], code)
+
+    def test_bad_config_and_invalid_since_are_json_usage_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "config.json")
+            with open(path, "w") as handle:
+                handle.write("{")
+            with mock.patch.dict(os.environ, {"COORD_CONFIG": path, "COORD_REPO": "o/r", "COORD_APP": "off"}):
+                for argv, kind in [(["whoami", "--json"], "configuration"),
+                                   (["inbox", "--since", "yesterday", "--json"], "usage")]:
+                    out = io.StringIO()
+                    with self.subTest(argv=argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(cli.main(argv), EXIT_USAGE)
+                        self.assertEqual(json.loads(out.getvalue())["error"]["kind"], kind)
 
 
 if __name__ == "__main__":

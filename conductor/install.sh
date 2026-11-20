@@ -1,12 +1,12 @@
 #!/bin/bash
 # Install (or remove) the conductor's watcher on this Mac: a launchd agent that runs
-# `coord conductor tick` every few minutes from a checkout kept at origin/main.
+# `coord conductor tick` every few minutes from a checkout kept at the repository's default branch.
 #
 #   conductor/install.sh --repo owner/name              install or refresh
 #   conductor/install.sh --repo owner/name --uninstall  stop and remove the launchd agent
 #
 # Options: --repo OWNER/NAME (required), --home DIR (the conductor's checkout; default
-# ~/conductor/NAME, cloned from the repository and kept detached at origin/main),
+# ~/conductor/OWNER/NAME, cloned from the repository and kept detached at the default branch),
 # --interval SECONDS (default 300). coord runs from this script's own directory.
 # --no-wake installs model-free ticks and does not require Claude; --wake enables
 # model wakes. Refreshes preserve the installed choice; new installs enable wakes.
@@ -35,12 +35,32 @@ while [ $# -gt 0 ]; do
 done
 
 [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "install.sh: --repo owner/name is required" >&2; exit 1; }
-REPO_NAME="${REPO#*/}"
-REPO_SLUG="${REPO//\//-}"
+case "/$REPO/" in
+  */./*|*/../*) echo "install.sh: expected a repository owner and name" >&2; exit 1 ;;
+esac
+# '+' is outside the repo-name alphabet, so the separator is unambiguous.
+REPO_SLUG="$(LC_ALL=C tr '[:upper:]' '[:lower:]' <<< "${REPO//\//+}")"
+LEGACY_SLUG="${REPO//\//-}"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/com.coord.conductor.$LEGACY_SLUG.plist"
+if [ -f "$LEGACY_PLIST" ]; then
+  # Keep an installed job's name only when its own configuration names this repo.
+  REPO_SLUG="$(python3 - "$LEGACY_PLIST" "$REPO" "$REPO_SLUG" <<'PYTHON'
+import plistlib
+import sys
+
+path, repo, slug = sys.argv[1:]
+with open(path, "rb") as handle:
+    installed_repo = plistlib.load(handle).get("EnvironmentVariables", {}).get("COORD_REPO")
+if isinstance(installed_repo, str) and installed_repo.lower() == repo.lower():
+    slug = installed_repo.replace("/", "-")
+print(slug)
+PYTHON
+)"
+fi
 LABEL="com.coord.conductor.$REPO_SLUG"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/Library/Logs/coord-conductor-$REPO_SLUG.log"
-[ -n "$HOME_DIR" ] || HOME_DIR="$HOME/conductor/$REPO_NAME"
+[ -n "$HOME_DIR" ] || HOME_DIR="$HOME/conductor/$REPO"
 COORD="$(cd "$(dirname "$0")/.." && pwd)/coord"
 
 DOMAIN="gui/$(id -u)"
@@ -72,11 +92,17 @@ PY
 gh auth status >/dev/null 2>&1 || { echo "install.sh: gh is not authenticated" >&2; exit 1; }
 
 [ -x "$COORD" ] || [ -f "$COORD" ] || { echo "install.sh: cannot find coord next to this script ($COORD)" >&2; exit 1; }
+NEW_CHECKOUT=0
 if [ ! -d "$HOME_DIR/.git" ] && [ ! -f "$HOME_DIR/.git" ]; then
   mkdir -p "$(dirname "$HOME_DIR")"
   gh repo clone "$REPO" "$HOME_DIR" -- -q
-  git -C "$HOME_DIR" checkout -q --detach origin/main
-  echo "made the conductor's checkout: $HOME_DIR (detached at origin/main)"
+  NEW_CHECKOUT=1
+fi
+CHECKOUT_HELPER="$(dirname "$COORD")/conductor/checkout.py"
+"$PY" -I "$CHECKOUT_HELPER" verify "$HOME_DIR" "$REPO"
+if [ "$NEW_CHECKOUT" = 1 ]; then
+  git -C "$HOME_DIR" checkout -q --detach HEAD
+  echo "made the conductor's checkout: $HOME_DIR (detached at the default branch)"
 fi
 
 HOST="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
@@ -85,13 +111,13 @@ AGENT="conductor@$HOST:conductor"
 # Git may live separately from gh/Python and is needed for the watcher's self-update.
 JOB_PATH="$(dirname "$GIT"):$(dirname "$(command -v gh)"):$(dirname "$PY"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-# Check the code that will run: bring a clean, detached checkout to origin/main first.
+# Check the code that will run: bring a clean, detached checkout to the remote default branch first.
 if [ -n "$(git -C "$HOME_DIR" status --porcelain)" ]; then
-  echo "install.sh: WARNING: $HOME_DIR has local changes; checking it as it is, not at origin/main" >&2
+  echo "install.sh: WARNING: $HOME_DIR has local changes; checking it as it is" >&2
 elif git -C "$HOME_DIR" symbolic-ref -q HEAD >/dev/null; then
-  echo "install.sh: WARNING: $HOME_DIR is on a branch; the watcher expects it detached at origin/main" >&2
-elif ! { git -C "$HOME_DIR" fetch -q origin main && git -C "$HOME_DIR" checkout -q --detach FETCH_HEAD; }; then
-  echo "install.sh: WARNING: could not fetch origin/main; checking the checkout as it is" >&2
+  echo "install.sh: WARNING: $HOME_DIR is on a branch; the watcher expects it detached at the default branch" >&2
+elif ! "$PY" -I "$CHECKOUT_HELPER" update "$HOME_DIR"; then
+  echo "install.sh: WARNING: could not update from the default branch; checking the checkout as it is" >&2
 fi
 echo "checking a dry-run tick as $AGENT at $(git -C "$HOME_DIR" rev-parse --short HEAD) ..."
 # Build and check the candidate before stopping the installed job. plistlib keeps

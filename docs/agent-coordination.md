@@ -133,7 +133,7 @@ per token:
 
 | Principal | Who spends it | Recorded as |
 |---|---|---|
-| User counter | the owner's `gh`, every agent's `gh`, `coord` outside app mode, in app mode the commands that stay user-identity (`train approve`, `train review` and its old name `train substitute-review`, a hand-run `train step`, `conductor tick`), and cloud proxy tokens | `user` |
+| User counter | the owner's `gh`, every agent's `gh`, cloud proxy tokens, and `coord` commands using the user identity (see Identity below) | `user` |
 | The GitHub App installation | `coord`'s reads and operational writes in app mode (see Identity). Its hourly tokens are one budget, not several | `app:<installation id>` |
 | Actions | the merge train's `GITHUB_TOKEN` (1,000 an hour per repository) | not recorded |
 
@@ -202,7 +202,7 @@ not a live quota meter for the child.
   token with only what they need: Issues write, Pull requests write, Actions write, and
   Metadata read.
 - **The user's login** (`gh`/keyring or `GH_TOKEN`), for everything else: attestations, a
-  hand-run train step, the conductor's tick, and all of `coord` when app mode is off.
+  hand-run train step, conductor ticks and control records, and all commands when app mode is off.
 
 Why both Issues and Pull requests write: GitHub enforces whichever permission matches the
 issue/PR number (Issues write for issues, Pull requests write for PRs), so operational
@@ -239,7 +239,8 @@ nothing ever switches to it on its own.
 | owner-approve record, `<owner_approved_label>` label | `train approve` | user | an attestation, only on the owner's word; counted only when a trusted user posted it, never a bot |
 | batch branches, main, train comments | `train step` run by hand | user | moves and deletes branches, which needs Contents write; in Actions the step uses `GITHUB_TOKEN` |
 | outage records, and the conductor issue if missing | `outage start`, `outage end` | the app (ops token) | operational; `outage.windows` reads the marker, not the author |
-| pause and resume records, escalations and their notify workflow dispatch; `conductor status` is a board read | `conductor status`, `pause`, `resume`, `escalate` | the app (read and ops tokens) | operations like the others; `lease.pause` and `lease.escalations` read the marker, not the author |
+| pause, resume and escalation records | `conductor pause`, `resume`, `escalate` | user | the watcher accepts control records from the configured owner login |
+| conductor status | `conductor status` | the app (read token) | reads the board |
 | lease beats, the outage records it finds itself | `conductor tick` | user | lists Actions runners (Administration read), edits its own heartbeat comments, and gates spending on the user's budget |
 | PRs, `@codex review`, review-thread replies, `git push` | not coord | user | `review.is_bot` counts a reply from any `[bot]` login as no answer to a Codex finding |
 
@@ -509,7 +510,7 @@ personal account, so the train is built from Actions parts
    `--head` the same way. `substitute-review` is the command's old name and still works,
    and `review-substitute` / `alex-approve` records still count alongside `review-clean` /
    `owner-approve`. A clean-review or approval record counts only when GitHub lists a
-   trusted user (`snapshot.trusted_attesters`, the repository owner) as its author, never a
+   trusted user (`owner_login`, defaulting to the repository owner) as its author, never a
    bot or another account: anyone who can comment can write a marker. That is why
    attestations never run on the app identity.
 
@@ -530,7 +531,10 @@ personal account, so the train is built from Actions parts
 
 3. **Batch.** Up to three ready PRs, in the order they were added, are merged onto trunk
    as `--no-ff` merge commits on `train/<stamp>` (computed with `git merge-tree`, no
-   checkout). One `ci_workflow` run gates it (dispatched with `lanes=<ci_lanes>` if
+   checkout). Before advancing a branch, the train matches its name and exact tip to
+   its initial CI reservation or testing comment on the first PR. It skips branches
+   without either record. The reservation precedes the push, so an interrupted build
+   can still resume. One `ci_workflow` run gates it (dispatched with `lanes=<ci_lanes>` if
    configured). Only a run the train dispatched itself counts (`workflow_dispatch` whose
    initial actor is `github-actions[bot]`); someone's narrower dispatch on the same commit
    never moves trunk, and `coord ci` refuses `train/` branches.
@@ -638,8 +642,10 @@ happens (`coordlib/conductor.py`):
   configured routing variables. Most ticks end without invoking any model.
 - **A fresh run per wake.** When something needs judgement, the tick starts a fresh
   `claude -p --agent conductor` run with the reasons in its prompt. Memory lives in GitHub
-  plus `$XDG_STATE_HOME/<state_dir_name>-conductor/notes.md`; each wake is logged in
-  `wakes.jsonl`.
+  plus a repository-specific notes file. For `octo/tools`, the default directory is
+  `$XDG_STATE_HOME/<state_dir_name>-conductor/repo-octo%2Ftools`. It contains
+  `notes.md`, the review queue, and `wakes.jsonl`. Set `CONDUCTOR_STATE_DIR` to keep
+  using an existing directory dedicated to that repository.
 - **Cheap model first.** Messages and train holds wake the triage model
   (`CONDUCTOR_TRIAGE_MODEL`, default `sonnet`); red CI, a failed train workflow, an offline
   runner, queued control jobs or a low disk wake the repair model (`CONDUCTOR_REPAIR_MODEL`,
@@ -670,7 +676,7 @@ happens (`coordlib/conductor.py`):
   post on the conductor issue (visible on the board for 24 h) and optionally dispatch
   `notify_workflow` so GitHub notifies the owner as `github-actions[bot]`.
 
-The conductor's checkout stays detached at `origin/main`: the watcher fast-forwards it
+The conductor's checkout stays detached at the default branch: the watcher fast-forwards it
 periodically when clean, so merged changes take effect on the next tick.
 
 ## Reviews on request (sidechain reviewer)
@@ -685,7 +691,7 @@ Append a model name (`sonnet`, `haiku`, `model=…`) to override the default (`o
   the same tick as a conductor wake). Tags inside quotes, code blocks, issues, or bot
   comments are ignored.
 - **The run.** A fresh `claude -p --agent reviewer` reads and tests the PR's head in a
-  throwaway worktree. It starts in the conductor's checkout at `origin/main` so hooks and
+  throwaway worktree. It starts in the conductor's checkout at the default branch so hooks and
   settings come from trunk; every `.claude` entry is stripped from the PR's throwaway tree
   first and `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD` is unset. The run receives **no
   GitHub credential** (empty `gh` config dir, isolated git config, stripped token env
@@ -740,7 +746,7 @@ Off switches, instant and reversible:
 ```bash
 gh workflow disable merge-train.yml        # stop the train
 gh variable delete COORD_TRAIN_MODE        # back to dry-run: trunk cannot move
-coord conductor pause --for 1d             # no conductor wakes, on every box
+coord conductor pause --for 1d             # pause every box for up to 14 days per record
 ```
 
 ## Code

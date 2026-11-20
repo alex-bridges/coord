@@ -17,7 +17,7 @@ from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
 from . import apptoken, budget, cache, config, doctor, identity, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
-from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact
+from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact, repo_from_remote_url
 
 # Which identity each command uses in app mode. Every command not in USER_IDENTITY runs on
 # the app: its reads on the read token, its writes on the ops token.
@@ -32,9 +32,9 @@ ATTESTATIONS = frozenset({"train approve", "train review", "train substitute-rev
 #   is off and the step uses GITHUB_TOKEN);
 # - `conductor tick` lists the Actions runners (Administration read), edits the lease and
 #   outage comments it posted as Alex, and gates its spending on Alex's budget
-#   (conductor.Watcher.budget_left). The rest of `conductor` (status, pause, resume,
-#   escalate) is a board read or a record post, like any other operation.
-NEEDS_ALEX = frozenset({"train step", "conductor tick"})
+#   (conductor.Watcher.budget_left). Pause, resume, and escalation records must
+#   also use the user login so lease.py accepts the author.
+NEEDS_ALEX = frozenset({"train step", "conductor tick", "conductor pause", "conductor resume", "conductor escalate"})
 # The records agents post in conversation: claims, releases, messages, outages. They run
 # on the app (Alex's decision, 2026-09-25): an app-authored comment notifies Alex on
 # threads he takes part in, and he handles that with notification settings. To post them
@@ -206,19 +206,24 @@ def gate(args: argparse.Namespace, gh: GitHub) -> Optional[int]:
     return None
 
 
-def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "",
-                  seen_ids: Optional[List[int]] = None) -> int:
-    """Messages addressed to `me` newer than the inbox cursor, from the snapshot alone.
-
-    "Mine" is what `inbox_items` treats as mine: claimed issues, their PRs, and the PR
-    of the current branch (an agent on a PR whose claim aged out still gets its mail).
-    """
-    since = (review.parse_time(cursor) - CURSOR_OVERLAP) if cursor else None
-    seen = set(seen_ids or [])
-    mine = {f"#{n}" for c in snap["claims"] if c["agent"] == me for n in (c["issue"], c["pr"]) if n}
+def work_numbers(snap: Dict[str, Any], me: str, current_branch: str) -> set:
+    mine = {n for c in snap["claims"] if c["agent"] == me for n in (c["issue"], c["pr"]) if n}
     local = snapshot.local_prs_by_branch(snap["prs"])
     if current_branch and current_branch in local:
-        mine.add(f"#{local[current_branch]['number']}")
+        mine.add(local[current_branch]["number"])
+    return mine
+
+
+def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_branch: str = "",
+                  seen_ids: Optional[List[int]] = None) -> int:
+    """Addressed messages that a live inbox would deliver, from the snapshot alone."""
+    if cursor:
+        since = review.parse_time(cursor) - CURSOR_OVERLAP
+    else:
+        as_of = review.parse_time(snap.get("generatedAt")) or snapshot.now_utc()
+        since = as_of - dt.timedelta(days=INBOX_DEFAULT_DAYS)
+    seen = set(seen_ids or [])
+    mine = {f"#{n}" for n in work_numbers(snap, me, current_branch)}
     count = 0
     for message in snap["messages"]:
         payload = message["payload"]
@@ -230,7 +235,7 @@ def unread_direct(snap: Dict[str, Any], me: str, cursor: Optional[str], current_
         if message.get("id") in seen:
             continue
         created = review.parse_time(message["createdAt"])
-        if since is None or (created is not None and created > since):
+        if created is not None and created > since:
             count += 1
     return count
 
@@ -347,7 +352,7 @@ def _issue_claims(gh: GitHub, number: int, prs: List[Dict[str, Any]]) -> List[Di
 def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
     me = identity.agent_id()
     branch = args.branch or identity.git_branch()
-    if not branch or branch in ("main", "master", config.get("default_branch")):
+    if not branch or branch in ("main", "master", _local_default_branch()):
         raise UsageError("name the branch you will work on with --branch (you are not on a feature branch)")
     targets = snapshot.fetch_targets(gh, [args.issue], [])
     target = targets["issues"].get(args.issue)
@@ -381,6 +386,11 @@ def cmd_claim(args: argparse.Namespace, gh: GitHub) -> int:
         if not normal:
             raise UsageError(f"{raw!r}: name files by their path from the repository root (no leading /, no ..)")
         files.append(normal)
+    if files:
+        for pr in snap["prs"]:
+            if pr.get("filesTruncated"):
+                print(f"coord: GitHub returned a partial file list for PR #{pr['number']}. "
+                      "Some overlaps may be missing.", file=sys.stderr)
     if args.branch is None and _commits_ahead_of_main() == 0 and not any(
             pr.get("branch") == branch and not pr.get("fromFork") for pr in snap["prs"]):
         # A cloud session starts on a harness branch it never works on (#1084).
@@ -541,6 +551,11 @@ def _number_from_url(url: str) -> Optional[int]:
     return int(tail) if tail.isdigit() else None
 
 
+def inbox_id(comment_id: int, kind: str) -> int:
+    """A cursor key for GitHub's two independent comment ID spaces."""
+    return -comment_id if kind == "review comment" else comment_id
+
+
 def inbox_items(
     issue_comments: List[Dict[str, Any]],
     review_comments: List[Dict[str, Any]],
@@ -551,15 +566,8 @@ def inbox_items(
     seen_ids: Optional[List[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Messages to `me`, plus comments by others on the issues and PRs `me` works on."""
-    mine = set()
-    for claim in snap["claims"]:
-        if claim["agent"] == me:
-            mine.add(claim["issue"])
-            if claim["pr"]:
-                mine.add(claim["pr"])
-    local = snapshot.local_prs_by_branch(snap["prs"])
-    if current_branch and current_branch in local:
-        mine.add(local[current_branch]["number"])
+    mine = work_numbers(snap, me, current_branch)
+    addresses = {f"#{n}" for n in mine}
     seen = set(seen_ids or [])
 
     items = []
@@ -567,7 +575,7 @@ def inbox_items(
         [(c, _number_from_url(c.get("issue_url", "")), "comment") for c in issue_comments]
         + [(c, _number_from_url(c.get("pull_request_url", "")), "review comment") for c in review_comments]
     ):
-        if comment.get("id") in seen:
+        if inbox_id(comment["id"], kind) in seen:
             continue  # delivered by an earlier read inside the overlap window
         created = review.parse_time(comment.get("created_at"))
         if created is None or created <= since:
@@ -578,7 +586,7 @@ def inbox_items(
             continue
         reason = None
         if payload is not None:
-            hits = [to for to in marker.recipients(payload) if identity.matches(to, me)]
+            hits = [to for to in marker.recipients(payload) if identity.matches(to, me) or to in addresses]
             if hits:
                 reason = "to you" if any(h == me for h in hits) else f"to {hits[0]}"
         if reason is None and number in mine:
@@ -630,7 +638,7 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
     stored = None if (args.all or args.since) else cache.load_cursor(gh.repo, me)
     seen_ids = cache.load_seen_ids(gh.repo, me) if stored else []
     if args.since:
-        since = review.parse_time(args.since)
+        since = args.since
     elif stored:
         since = review.parse_time(stored) - CURSOR_OVERLAP
     else:
@@ -673,10 +681,14 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
           "author": snapshot.comment_author(c)} for c in issue_comments], gh.repo)))
     if not args.peek and not args.all and not args.since:
         window = started - CURSOR_OVERLAP
-        # Earlier ids matter only while the earlier read's window overlaps the new one.
-        previous = seen_ids if stored and review.parse_time(stored) >= window else []
-        keep = previous + [item["id"] for item in items if item.get("id") is not None
-                           and (review.parse_time(item["at"]) or started) >= window]
+        # Keep delivered IDs only while their comments fall in the new overlap.
+        # Carrying the entire previous list grows it forever under frequent polling.
+        delivered = set(seen_ids)
+        delivered.update(inbox_id(item["id"], item["kind"]) for item in items)
+        keep = [inbox_id(c["id"], kind)
+                for comments, kind in ((issue_comments, "comment"), (review_comments, "review comment"))
+                for c in comments if inbox_id(c["id"], kind) in delivered
+                and (review.parse_time(c.get("created_at")) or started) >= window]
         cache.store_cursor(gh.repo, me, snapshot.iso(started), keep)
     return EXIT_OK
 
@@ -712,8 +724,8 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     if pr is None:
         print(f"coord: #{args.pr} is not an open pull request", file=sys.stderr)
         return EXIT_NOT_FOUND
-    verdict, reason = train.eligibility(pr, workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN,
-                                        base_branch=train.default_branch(gh))
+    base = train.default_branch(gh, (snap.get("main") or {}).get("name"))
+    verdict, reason = train.eligibility(pr, workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN, base_branch=base)
     if verdict == train.DROP:
         print(f"coord: #{args.pr} cannot join the train: {reason}", file=sys.stderr)
         return EXIT_CONFLICT
@@ -732,7 +744,7 @@ def cmd_train_add(args: argparse.Namespace, gh: GitHub) -> int:
     gh.rest(f"repos/{{repo}}/issues/{args.pr}/labels", method="POST", body={"labels": [train.TRAIN_LABEL]})
     cache.invalidate_snapshot(gh.repo)
     try:
-        gh.dispatch_workflow(train.train_workflow(), train.default_branch(gh))
+        gh.dispatch_workflow(train.train_workflow(), base)
     except AppAuthError:
         raise
     except GitHubError:
@@ -856,9 +868,11 @@ def train_queue(snap: Dict[str, Any]) -> List[Dict[str, Any]]:
     judge them (train.VIEWS_ASSUME_WORKFLOW_TOKEN)."""
     prs = {p["number"]: p for p in snap["prs"]}
     queue = []
+    base = train.default_branch(hint=(snap.get("main") or {}).get("name"))
     for entry in snap["train"]:
         pr = prs.get(entry["pr"])
-        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"), workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN)
+        verdict, reason = (train.eligibility(pr, entry.get("headAtAdd"),
+                                            workflow_token=train.VIEWS_ASSUME_WORKFLOW_TOKEN, base_branch=base)
                            if pr else (train.DROP, "not open"))
         queue.append(dict(entry, verdict=verdict, reason=reason))
     return queue
@@ -1006,6 +1020,28 @@ def cmd_token_import_key(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def checkout_repo(checkout: str, requested: Optional[str]) -> str:
+    """Resolve the API target against the URLs git will actually fetch and push."""
+    selected = requested or os.environ.get("COORD_REPO")
+    for operation, options in (("fetch", []), ("push", ["--push"])):
+        try:
+            urls = subprocess.run(["git", "remote", "get-url", *options, "--all", "origin"], cwd=checkout,
+                                  capture_output=True, text=True, check=True, timeout=5).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError) as error:
+            # Remote URLs and git diagnostics can contain credentials.
+            raise GitHubError(f"git could not read the checkout's origin {operation} URL") from error
+        if not selected and operation == "fetch":
+            selected = repo_from_remote_url(urls[0]) if urls else None
+            if not selected:
+                raise UsageError("cannot identify the GitHub repository from the checkout's origin; "
+                                 "set COORD_REPO or pass --repo owner/name")
+        for url in urls:
+            repo = repo_from_remote_url(url)
+            if repo and repo.lower() != selected.lower():
+                raise UsageError(f"requested repository is {selected}, but git origin's {operation} URL targets {repo}")
+    return selected
+
+
 def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
     # merge-train.yml passes the GitHub App's installation token here, and only
     # here, when it could mint one; without it workflow PRs are dropped for a hand merge.
@@ -1014,7 +1050,8 @@ def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
     if merger is None:
         print(f"coord: no {train.WORKFLOW_TOKEN_ENV}: PRs that change .github/workflows/ are dropped "
               "for a hand merge", file=sys.stderr)
-    step = train_step.Step(gh, train_step.Git(args.repo_dir), args.mode, agent=identity.agent_id(), merger=merger)
+    step = train_step.Step(gh, train_step.Git(args.repo_dir), args.mode, agent=identity.agent_id(cwd=args.repo_dir),
+                           merger=merger)
     try:
         lines = step.run()
     except train_step.GitError as error:
@@ -1030,7 +1067,7 @@ def cmd_train_step(args: argparse.Namespace, gh: GitHub) -> int:
 def cmd_outage_start(args: argparse.Namespace, gh: GitHub) -> int:
     from . import conductor
     now = snapshot.now_utc()
-    until = review.parse_time(args.until) if args.until else outage.next_weekly_reset(now)
+    until = args.until or outage.next_weekly_reset(now)
     if until <= now:
         raise UsageError(f"--until {args.until} is not in the future")
     if until > now + dt.timedelta(days=8):
@@ -1061,7 +1098,7 @@ def cmd_outage_end(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_conductor_tick(args: argparse.Namespace, gh: GitHub) -> int:
     from . import conductor
-    config = conductor.Config.from_env()
+    config = conductor.Config.from_env(gh.repo)
     os.environ["COORD_AGENT"] = config.agent  # every coord call in this process speaks as the conductor
     lines = conductor.Watcher(config, gh).tick(dry_run=args.dry_run, wake=not args.no_wake)
     stamp = snapshot.iso(snapshot.now_utc())
@@ -1133,7 +1170,7 @@ def cmd_conductor_diagnose(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_conductor_status(args: argparse.Namespace, gh: GitHub) -> int:
     from . import conductor
-    config = conductor.Config.from_env()
+    config = conductor.Config.from_env(gh.repo)
     snap = get_snapshot(gh, args.max_age)
     now = snapshot.now_utc()
     # A board served from the cache says so first, as `board` and the brief do.
@@ -1207,11 +1244,28 @@ def cmd_conductor_escalate(args: argparse.Namespace, gh: GitHub) -> int:
 # MARK: - Entry
 
 
+def positive_number(value: str) -> int:
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("expected a positive issue or pull request number")
+    return number
+
+
+def iso_time(value: str) -> dt.datetime:
+    try:
+        parsed = review.parse_time(value)
+        if parsed is not None:
+            return parsed.astimezone(dt.timezone.utc)
+    except (ValueError, OverflowError):
+        pass
+    raise argparse.ArgumentTypeError("expected an ISO date or timestamp")
+
+
 def parser() -> argparse.ArgumentParser:
     top = ArgumentParser(
         prog="coord",
         description="Shared awareness for agents working in a GitHub repository: what is in flight, who works on what, "
-                    "CI and train state, and messages. Reads GitHub; writes only marked comments.",
+                    "CI and train state, and messages.",
     )
     top.add_argument("--repo", help="owner/name (default: the origin remote)")
     sub = top.add_subparsers(dest="command", required=True)
@@ -1233,7 +1287,7 @@ def parser() -> argparse.ArgumentParser:
     preflight.set_defaults(func=cmd_doctor)
 
     claim = sub.add_parser("claim", help="announce that you are working on an issue")
-    claim.add_argument("issue", type=int)
+    claim.add_argument("issue", type=positive_number)
     claim.add_argument("--branch", help="default: the current branch")
     claim.add_argument("--files", nargs="+", metavar="PATH",
                        help="files or directories you expect to touch, as paths from the repository root "
@@ -1244,7 +1298,7 @@ def parser() -> argparse.ArgumentParser:
     claim.set_defaults(func=cmd_claim)
 
     release = sub.add_parser("release", help="end your claim on an issue")
-    release.add_argument("issue", type=int)
+    release.add_argument("issue", type=positive_number)
     release.add_argument("--note")
     release.add_argument("--everyone", action="store_true", help="clear every agent's claim (stale takeovers)")
     release.set_defaults(func=cmd_release)
@@ -1253,7 +1307,7 @@ def parser() -> argparse.ArgumentParser:
     send.add_argument("text")
     send.add_argument("--to", action="append", metavar="AGENT",
                       help="an agent id, a prefix ending in * (codex@*), or all; repeatable")
-    send.add_argument("--on", type=int, metavar="NUMBER",
+    send.add_argument("--on", type=positive_number, metavar="NUMBER",
                       help="post on this issue or PR (default: the mailbox issue)")
     send.set_defaults(func=cmd_send)
 
@@ -1262,7 +1316,7 @@ def parser() -> argparse.ArgumentParser:
     inbox.add_argument("--full", action="store_true", help="do not shorten long messages")
     inbox.add_argument("--peek", action="store_true", help="do not mark as read")
     inbox.add_argument("--all", action="store_true", help=f"the last {INBOX_DEFAULT_DAYS} days, ignoring what was read")
-    inbox.add_argument("--since", help="ISO time; ignores and keeps the read cursor")
+    inbox.add_argument("--since", type=iso_time, help="ISO time; ignores and keeps the read cursor")
     inbox.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
     inbox.set_defaults(func=cmd_inbox)
 
@@ -1274,31 +1328,31 @@ def parser() -> argparse.ArgumentParser:
     train_parser = sub.add_parser("train", help="the merge train: add, remove, status (step runs in Actions)")
     train_sub = train_parser.add_subparsers(dest="train_command", required=True)
     add = train_sub.add_parser("add", help="queue a PR; asserts it is not a carve-out")
-    add.add_argument("pr", type=int)
+    add.add_argument("pr", type=positive_number)
     add.add_argument("--note")
     add.add_argument("--owner-fallback", help="the agent that hears the train's held/removed notices when you "
                      "have stopped (your dispatching lead)")
     add.set_defaults(func=cmd_train_add)
     remove = train_sub.add_parser("remove", help="take a PR out of the train")
-    remove.add_argument("pr", type=int)
+    remove.add_argument("pr", type=positive_number)
     remove.add_argument("--note")
     remove.set_defaults(func=cmd_train_remove)
     head_help = "the full 40-character SHA of the head that was reviewed or approved; refused unless it is the PR's head"
     reviewed = train_sub.add_parser("review", help="record a clean review of a PR's head by an agent")
-    reviewed.add_argument("pr", type=int)
+    reviewed.add_argument("pr", type=positive_number)
     reviewed.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
     reviewed.add_argument("--by", required=True, metavar="AGENT", help="the agent that did the review")
     reviewed.add_argument("--note", required=True, help="where the review is and what it covered")
     reviewed.set_defaults(func=cmd_train_review)
     # The old name, kept for the sessions and docs that still use it; its callers pass no --by.
     substitute = train_sub.add_parser("substitute-review", help="the old name of `train review`; --by is optional here")
-    substitute.add_argument("pr", type=int)
+    substitute.add_argument("pr", type=positive_number)
     substitute.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
     substitute.add_argument("--by", metavar="AGENT", help="the agent that did the review")
     substitute.add_argument("--note", required=True, help="who reviewed and where the review is")
     substitute.set_defaults(func=cmd_train_review)
     approve = train_sub.add_parser("approve", help="record the owner's approval of a guarded PR at a head")
-    approve.add_argument("pr", type=int)
+    approve.add_argument("pr", type=positive_number)
     approve.add_argument("--head", required=True, type=head_sha, metavar="SHA", help=head_help)
     approve.add_argument("--note", required=True, help="the owner's words, or where approval was given")
     approve.set_defaults(func=cmd_train_approve)
@@ -1313,14 +1367,15 @@ def parser() -> argparse.ArgumentParser:
     report.set_defaults(func=cmd_train_report)
     step = train_sub.add_parser("step", help="advance the train by one step (merge-train.yml runs this)")
     step.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
-    step.add_argument("--repo-dir", default=".", help="a clone with push access (default: current directory)")
+    step.add_argument("--repo-dir", default=".", help="target checkout for git, repository discovery, and .coord/config.json "
+                      "(default: current directory)")
     step.set_defaults(func=cmd_train_step)
 
     outage_parser = sub.add_parser("outage", help="declare or end a harness outage (a usage limit: every agent of a kind down)")
     outage_sub = outage_parser.add_subparsers(dest="outage_command", required=True)
     start = outage_sub.add_parser("start", help="declare that a harness's agents are down until a time")
     start.add_argument("harness", help="claude (covers claude@, claude-cloud@ and conductor@) or codex")
-    start.add_argument("--until", help="ISO time (default: the next weekly reset, COORD_CLAUDE_WEEKLY_RESET)")
+    start.add_argument("--until", type=iso_time, help="ISO time (default: the next weekly reset, COORD_CLAUDE_WEEKLY_RESET)")
     start.add_argument("--note", help="why, in a few words")
     start.set_defaults(func=cmd_outage_start)
     end = outage_sub.add_parser("end", help="declare that a harness's agents are back")
@@ -1348,7 +1403,8 @@ def parser() -> argparse.ArgumentParser:
     cstatus.add_argument("--last", type=int, default=5, help="how many recent wakes to list")
     cstatus.set_defaults(func=cmd_conductor_status)
     pause = conductor_sub.add_parser("pause", help="stop every watcher from waking a model for a while")
-    pause.add_argument("--for", dest="duration", required=True, help="45m, 2h, 1d")
+    pause.add_argument("--for", dest="duration", required=True,
+                       help=f"45m, 2h, 1d (maximum {snapshot.CLAIM_WINDOW_DAYS} days)")
     pause.add_argument("--note")
     pause.set_defaults(func=cmd_conductor_pause)
     resume = conductor_sub.add_parser("resume", help="end a pause")
@@ -1384,12 +1440,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         if error.code and "--json" in argv:
             return report_error(argparse.Namespace(json=True), EXIT_USAGE, "usage", "invalid arguments; see stderr")
         raise
-    try:
-        gh = GitHub(args.repo)
-    except GitHubError as error:
-        return report_error(args, EXIT_BACKEND, "github", f"GitHub error: {error}")
-    attach_app(gh)
-    return run(args, gh)
+    checkout = args.repo_dir if args.func is cmd_train_step else None
+    with config.in_checkout(checkout):
+        try:
+            repo = checkout_repo(checkout, args.repo) if checkout is not None else args.repo
+            gh = GitHub(repo)
+            attach_app(gh)
+        except config.ConfigError as error:
+            return report_error(args, EXIT_USAGE, "configuration", str(error))
+        except UsageError as error:
+            return report_error(args, EXIT_USAGE, "usage", str(error))
+        except GitHubError as error:
+            return report_error(args, EXIT_BACKEND, "github", f"GitHub error: {error}")
+        return run(args, gh)
 
 
 def attach_app(gh: GitHub) -> None:
@@ -1418,8 +1481,11 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
     (`get_snapshot`), everything else refuses here, naming the cause and COORD_APP=off.
     """
     command = budget.command_name(args)
-    if getattr(gh, "app", None) is not None and command in USER_IDENTITY:
-        gh = gh.as_user()
+    if command in USER_IDENTITY:
+        if apptoken.review_run(os.environ):
+            return report_error(args, EXIT_BACKEND, "authentication", "a review run holds no GitHub credential")
+        if getattr(gh, "app", None) is not None:
+            gh = gh.as_user()
     gh.cache_read = command in budget.CACHE_READS  # type: ignore[attr-defined]
     try:
         if command.startswith("train") and not train.is_configured():
@@ -1434,7 +1500,7 @@ def run(args: argparse.Namespace, gh: GitHub) -> int:
         return report_error(args, EXIT_BACKEND, "authentication", str(error))
     except UsageError as error:
         return report_error(args, EXIT_USAGE, "usage", str(error))
-    except train.NotConfigured as error:
+    except (train.NotConfigured, config.ConfigError) as error:
         return report_error(args, EXIT_USAGE, "configuration", str(error))
     except identity.IdentityError as error:
         return report_error(args, EXIT_USAGE, "identity", str(error))

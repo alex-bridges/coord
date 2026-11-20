@@ -73,6 +73,8 @@ class ResultTests(unittest.TestCase):
     def test_the_json_block_is_read_from_the_end(self):
         text = 'draft ```json\n{"findings": [{"severity": "P1"}]}\n``` final ```json\n{"findings": []}\n```'
         self.assertEqual(reviewer.extract_json(text), {"findings": []})
+        code = {"findings": [{"severity": "P2", "summary": "the literal ``` is missing"}]}
+        self.assertEqual(reviewer.extract_json("```json\n" + json.dumps(code) + "\n```"), code)
         self.assertEqual(reviewer.extract_json('no fence {"findings": [], "summary": "x"}')["summary"], "x")
         self.assertIsNone(reviewer.extract_json("SUMMARY: I forgot the block"))
 
@@ -82,6 +84,37 @@ class ResultTests(unittest.TestCase):
         for severity in ("P0", "P1", "P2", "critical", ""):
             found = reviewer.normalize({"findings": [{"severity": severity, "summary": "x"}]})
             self.assertEqual(reviewer.verdict(found["findings"]), "changes", severity)
+
+    def test_a_malformed_final_answer_never_approves_an_earlier_draft(self):
+        draft = 'draft ```json\n{"findings": []}\n```\nfinal ```json\n'
+        for final in ('{"findings":', '{"findings": [oops]}\n```', '{"finding": "unfinished"}\n```'):
+            self.assertIsNone(reviewer.extract_json(draft + final))
+        self.assertIsNone(reviewer.extract_json('draft {"findings": []} final answer unavailable'))
+        self.assertIsNone(reviewer.extract_json('draft ```json\n{"findings": []}\n```\nfinal {"findings":'))
+
+    def test_unfenced_final_findings_after_code_and_prose(self):
+        result = {"findings": [], "summary": "ok"}
+        for prose in ("Reviewed `fn() { return 1; }`.", "Examined the {old, new} alternatives.",
+                      "Checked the literal `{`.", "The open delimiter is {.", "The interval is [a,b).",
+                      "The interval is [0,2).", "Reviewed `{ok: true}`.", 'Prose with a stray " and an unmatched [.',
+                      'Draft ```json\n{"findings": ["obsolete"]}\n```'):
+            with self.subTest(prose=prose):
+                self.assertEqual(reviewer.extract_json(prose + "\n" + json.dumps(result)), result)
+
+    def test_an_explicit_final_fence_is_independent_of_prose_punctuation(self):
+        final = '\n```json\n{"findings": []}\n```'
+        for prose in ('The open delimiter is {.', 'The incomplete example is `{"draft":`.',
+                      '```json\n{"draft":]\n```', '```json\n{"draft": 1} trailing words\n```'):
+            self.assertEqual(reviewer.extract_json(prose + final), {"findings": []})
+
+    def test_a_nested_object_cannot_replace_a_malformed_final_result(self):
+        clean = '{"findings": []}'
+        for response in ('{"draft": ' + clean, '[null, ' + clean, '[invalid, ' + clean, '{bad: ' + clean + '}',
+                         '{"draft": [} ' + clean, '{draft: ' + clean,
+                         '```json\n{"draft":\n```json\n' + clean + '\n```',
+                         'draft ' + clean + '\nfinal ```json\n' + clean):
+            with self.subTest(response=response):
+                self.assertIsNone(reviewer.extract_json(response))
 
 
 class FakeApp:
@@ -147,8 +180,8 @@ class FakeApp:
 
 class FakeUser:
     """Alex's identity: where a pass's review-clean record goes (#1054's trusted user)."""
-    repo = "o/r"  # trusted_attesters("o/r") is {"o"}
-    login = "o"
+    repo = "o/r"
+    login = "example-owner"
 
     def __init__(self):
         self.posts, self.fail_posts, self.next_id = [], 0, 9000
@@ -252,7 +285,7 @@ class ReviewFlowTests(unittest.TestCase):
         self.tick(10)
         self.assertEqual(len(self.reviews()), 1, "one review per request")
         prs = [{"number": 7}]
-        comments = [{"payload": marker.decode(b), "on": 7, "author": {"login": "o", "type": "User"}}
+        comments = [{"payload": marker.decode(b), "on": 7, "author": {"login": FakeUser.login, "type": "User"}}
                     for b in self.user.posts]
         snapshot.attach_head_records(prs, comments, "o/r")
         self.assertEqual(prs[0]["reviewedHead"], HEAD, "the train reads it as the head's clean review")
@@ -705,7 +738,7 @@ class ReviewFixTests(ReviewFlowTests):
         self.assertEqual((marker.decode(clean) or {}).get("kind"), "review-clean")
         prs = [{"number": 7}]
         snapshot.attach_head_records(prs, [{"payload": marker.decode(clean), "on": 7,
-                                           "author": {"login": "o", "type": "User"}}], "o/r")
+                                           "author": {"login": FakeUser.login, "type": "User"}}], "o/r")
         self.assertEqual(prs[0]["reviewedHead"], HEAD,
                          "the train may count the review only because its full text is already public")
         self.tick(10)
@@ -794,8 +827,8 @@ class CodexRoundTests(ReviewFlowTests):
         self.assertEqual(len(withdrawn), 1)
         self.assertEqual((withdrawn[0]["head"], withdrawn[0]["revokes"]), ("", HEAD))
         prs = [{"number": 7}]
-        comments = [{"payload": marker.decode(c["body"]), "on": 7, "author": {"login": "o", "type": "User"}}
-                    for c in self.app.pr_comments] + [{"payload": w, "on": 7, "author": {"login": "o", "type": "User"}}
+        comments = [{"payload": marker.decode(c["body"]), "on": 7, "author": {"login": FakeUser.login, "type": "User"}}
+                    for c in self.app.pr_comments] + [{"payload": w, "on": 7, "author": {"login": FakeUser.login, "type": "User"}}
                                                       for w in withdrawn]
         snapshot.attach_head_records(prs, comments, "o/r")
         self.assertNotEqual(prs[0]["reviewedHead"], HEAD, "the train no longer takes the head")
@@ -1055,7 +1088,7 @@ class CodexRound3Tests(ReviewFlowTests):
 
     def test_e3_a_sidechain_block_holds_the_head_even_with_codex_approval(self):
         app = {"login": reviewer.APP_LOGIN}
-        comments = [{"author": app, "payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus",
+        comments = [{"on": 7, "author": app, "payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "opus",
                                                 "verdict": "changes"}},
                     {"payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "head": HEAD, "model": "sonnet", "verdict": "pass"}},
                     {"payload": {"kind": "review", "v": 1, "agent": "t@h:x", "pr": 7, "request": 3, "verdict": "none"}}]
@@ -1221,7 +1254,7 @@ class CodexRound6Tests(ReviewFlowTests):
         from coordlib import lease
         runs = [snapshot.iso(at(-60 * n)) for n in range(10)] + [snapshot.iso(at(-60 * 30))]
         beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
-                "author": {"login": "o", "type": "User"},
+                "author": {"login": FakeUser.login, "type": "User"},
                 "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": "conductor@Old:conductor",
                             "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": runs}}
         hosts = lease.hosts([beat], at(0), "o/r")
@@ -1663,7 +1696,7 @@ class CodexRound11Tests(ReviewFlowTests):
     def test_m2_a_restarted_host_counts_its_own_mid_run_beat(self):
         from coordlib import lease
         beat = {"id": 1, "createdAt": snapshot.iso(at(-1)), "url": "",
-                "author": {"login": "o", "type": "User"},
+                "author": {"login": FakeUser.login, "type": "User"},
                 "payload": {"kind": "conductor", "v": 1, "event": "beat", "agent": self.config.agent,
                             "beat": snapshot.iso(at(-1)), "leader": True, "reviewRuns": [snapshot.iso(at(-5))]}}
         watcher = conductor.Watcher(self.config, self.gh, now=at(0), runner=self.runner,
@@ -1771,6 +1804,12 @@ class CodexRound15Tests(ReviewFlowTests):
         self.assertEqual(self.app.markers("review")[0]["countsForTrain"], False)
         self.assertEqual(self.user.posts, [])
         self.assertIn("base moved", self.app.posts[-1])
+        self.assertEqual(self.app.markers("review")[0]["verdict"], "stale")
+        self.ask(6)
+        self.replies = [review_reply()]
+        self.tick(10)
+        self.assertEqual(len(self.reviews()), 2)
+        self.assertEqual(self.user.markers("review-clean")[0]["head"], HEAD)
 
     def test_q3_html_comments_hide_the_tag(self):
         self.assertIsNone(reviewer.find_tag("<!-- @example-reviewer review -->"))
@@ -1778,7 +1817,7 @@ class CodexRound15Tests(ReviewFlowTests):
         self.assertEqual(reviewer.find_tag("<!-- x --> @example-reviewer review")["model"], "opus")
 
     def test_q4_unfenced_json_with_nested_findings_is_read_whole(self):
-        text = 'Done. {"summary": "s", "findings": [{"severity": "P2", "summary": "bug"}], "checked": ["a"]} bye'
+        text = 'Done. {"summary": "s", "findings": [{"severity": "P2", "summary": "bug"}], "checked": ["a"]}'
         data = reviewer.extract_json(text)
         self.assertEqual(data["findings"][0]["summary"], "bug")
         self.assertEqual(data["summary"], "s")

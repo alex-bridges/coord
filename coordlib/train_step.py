@@ -209,7 +209,9 @@ class Step:
         {} when main's commit has no finished run yet (a hand merge whose run is still
         queued): unknown is not red, so it does not stop the train.
         """
-        pages = self.gh.rest_paginated(f"repos/{{repo}}/actions/workflows/{train.ci_workflow()}/runs?head_sha={main}&per_page=20")
+        branch = urllib.parse.quote(self.main_branch, safe="")
+        pages = self.gh.rest_paginated(
+            f"repos/{{repo}}/actions/workflows/{train.ci_workflow()}/runs?head_sha={main}&branch={branch}&per_page=20")
         runs = [r for page in pages for r in page.get("workflow_runs", [])
                 if r.get("status") == "completed" and r.get("conclusion") in ("success", "failure")]
         if not runs:
@@ -333,7 +335,7 @@ class Step:
         pr["overtakenBy"] = None
         for comment in self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100"):
             login = snapshot.comment_author(comment).get("login") or ""
-            if _CODEX_REQUEST.search(comment.get("body") or "") and not login.startswith(review.CODEX_LOGIN_PREFIX):
+            if _CODEX_REQUEST.search(comment.get("body") or "") and login not in review.CODEX_LOGINS:
                 at = review.parse_time(comment.get("created_at"))
                 if at is not None:
                     requests.append(at)
@@ -476,22 +478,13 @@ class Step:
         pr.setdefault("reviewRequests", []).append(self.now)
         self.note(f"#{number}: asked Codex to review {head[:9]}: {reason}")
 
-    def all_files(self, pr: Dict[str, Any]) -> Optional[List[str]]:
-        """The PR's complete file list when the summary's was cut short, both sides of
-        every rename (snapshot.rest_files), else None."""
-        if not pr.get("filesTruncated"):
-            return None
-        return snapshot.rest_files(self.gh, pr["number"])
-
     def gate_files(self, pr: Dict[str, Any], main: str) -> List[str]:
         """The paths train.assess gates on (workflow files, ALEX_ONLY_PATHS): GitHub's list
         plus what git itself will merge, `git diff --no-renames` from the merge base, which
         names both sides of a rename whatever GitHub's list says. A path renamed out of a
         guarded directory therefore still needs Alex's approval (Codex on #1311)."""
-        listed = self.all_files(pr)
-        paths = list(listed if listed is not None else pr.get("files") or [])
         diff = self.changed_paths(main, pr["number"], pr["head"]) if pr.get("head") else None
-        return paths + [path for path in diff or [] if path not in paths]
+        return list(dict.fromkeys((pr.get("files") or []) + (diff or [])))
 
     def assess(self, pr: Dict[str, Any], main: str,
                head_at_add: Optional[str] = None) -> Tuple[str, str, str]:
@@ -573,27 +566,53 @@ class Step:
         main = self.git.out("rev-parse", f"refs/remotes/origin/{self.main_branch}")
         refs = self.git.out("for-each-ref", "--sort=refname", "--format=%(refname:strip=3) %(objectname)",
                             "refs/remotes/origin/train/")
-        batches = []
+        occupied = set()
+        prs = self.open_prs()
         for line in refs.splitlines():
             if not line.strip():
                 continue
             name, tip = line.split()
+            occupied.add(name)
             # Only branches the train built: their tip carries its Train-Batch trailer. A
             # person's `train/fix-cache` is left alone, never deleted (substitute review).
             trailer = self.git.out("log", "-1", "--format=%(trailers:key=Train-Batch,valueonly,separator=%x2C)", tip)
-            if trailer.strip() == name:
-                batches.append((name, tip))
-            else:
+            if trailer.strip() != name:
                 self.note(f"{name} is not a batch (no Train-Batch trailer); ignoring it")
-        prs = self.open_prs()
-        if batches:
-            name, tip = batches[0]
-            self.advance(name, tip, main, prs)
+                continue
+            base, members = train.parse_batch(
+                self.git.out("log", "--first-parent", f"--max-count={train.BATCH_CAP + 1}",
+                             f"--format={train.LOG_FORMAT}", tip), name)
+            if not members or not self.has_build_record(name, tip, members[0]["pr"]):
+                self.note(f"{name}: no trusted build record for {tip[:9]}; leaving the branch alone")
+                continue
+            self.advance(name, tip, main, prs, base, members)
             if self.closed_batch:
                 self.wake_next()
+            break
         else:
+            if train.batch_name(self.now) in occupied:
+                self.note("the batch name for this second already exists; the next step can build")
+                return self.lines
             self.build(main, prs)
         return self.lines
+
+    def has_build_record(self, name: str, tip: str, number: int) -> bool:
+        """Bind the commit (including its plan and issue references) to the train that built it."""
+        try:
+            comments = self.gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?per_page=100")
+        except NotFound:
+            return False
+        for comment in comments:
+            payload = marker.decode(comment.get("body")) or {}
+            if payload.get("pr") != number or payload.get("batch") != name or not self.own_record(comment, payload):
+                continue
+            if payload.get("event") == "testing" and payload.get("tip") == tip:
+                return True
+            if payload.get("event") == "ci-requested" and isinstance(payload.get("request"), dict) \
+                    and payload["request"].get("action") == "dispatch" and isinstance(payload.get("receipt"), dict) \
+                    and payload["receipt"].get("tip") == tip:
+                return True
+        return False
 
     def wake_next(self) -> None:
         """A batch just ended (merged, ejected, split, abandoned): start the next step now
@@ -688,10 +707,8 @@ class Step:
             except GitHubError as error:
                 self.note(f"#{number}: could not close #{issue} ({str(error)[:120]}); left for a person")
 
-    def advance(self, name: str, tip: str, main: str, prs: Dict[int, Dict[str, Any]]) -> None:
-        base, members = train.parse_batch(
-            self.git.out("log", "--first-parent", f"--max-count={train.BATCH_CAP + 1}",
-                         f"--format={train.LOG_FORMAT}", tip), name)
+    def advance(self, name: str, tip: str, main: str, prs: Dict[int, Dict[str, Any]],
+                base: Optional[str], members: List[Dict[str, Any]]) -> None:
         if not self.valid_batch_chain(base, members, tip):
             self.note(f"{name}: its commit chain or merge trees do not match the train's build; deleting the batch")
             self.delete_branch(name)
@@ -878,10 +895,16 @@ class Step:
                     self.note(f"{name} ({numbers}): main update failed ({error}) and main cannot be re-read "
                               f"({reread}); keeping the batch for the next step")
                     return
-                if now_main != tip:
+                if now_main == base:
                     self.note(f"{name} ({numbers}): green, but main could not be fast-forwarded ({error}); rebuilding")
                     self.record_outcome("rebuilt", f"Merge train: `{name}` passed, but main could not be fast-forwarded; rebuilding.")
                     self.delete_branch(name)
+                    return
+                if now_main != tip:
+                    # Another update may have advanced main beyond our successful update.
+                    # The next step fetches the branch and checks ancestry before cleanup.
+                    self.note(f"{name} ({numbers}): main moved during the failed update ({error}); "
+                              "keeping the batch to check whether main contains it")
                     return
                 self.note(f"{name} ({numbers}): the main update reported {error}, but main is at {tip[:9]}")
         verb = "main fast-forwarded to" if self.mode == "live" else "dry run: would have fast-forwarded main to"

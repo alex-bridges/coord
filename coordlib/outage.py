@@ -149,10 +149,12 @@ _FALLBACK_ZONES: Dict[str, dt.tzinfo] = {
 
 def _zone(name: str) -> dt.tzinfo:
     try:
-        from zoneinfo import ZoneInfo
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
         return ZoneInfo(name)
-    except Exception:  # no tz database (Windows without tzdata, or a bare container)
-        return _FALLBACK_ZONES.get(name) or dt.timezone(dt.timedelta(hours=-5), name)
+    except ZoneInfoNotFoundError:  # Windows and some containers have no IANA database
+        if name in _FALLBACK_ZONES:
+            return _FALLBACK_ZONES[name]
+        raise ValueError(f"unavailable IANA time zone {name!r}") from None
 
 
 def next_weekly_reset(now: dt.datetime, spec: Optional[str] = None) -> dt.datetime:
@@ -160,21 +162,25 @@ def next_weekly_reset(now: dt.datetime, spec: Optional[str] = None) -> dt.dateti
 
     Wall-clock time in the zone, so 12:00 New York is 16:00Z in summer and 17:00Z in winter.
     """
-    words = (spec or weekly_spec()).split()
+    reset = spec or weekly_spec()
+    words = reset.split()
     try:
         weekday = _DAYS[words[0][:3].lower()]
         hour, minute = (int(part) for part in words[1].split(":"))
+        wall_time = dt.time(hour, minute)
+        if len(words) > 3:
+            raise ValueError("unexpected text after time zone")
         zone = _zone(words[2] if len(words) > 2 else "UTC")
     except (IndexError, KeyError, ValueError):
         configured = _configured_weekly_spec()
         if spec is None or configured is None or configured == spec:
-            raise ValueError("coord: the weekly reset %r is not '<Day> <HH:MM> <IANA zone>'" % (spec or configured))
+            raise config.ConfigError(f"the weekly reset {reset!r} requires a day, HH:MM and a known IANA zone") from None
         return next_weekly_reset(now, configured)  # a bad explicit spec falls back to the configured one
     local = now.astimezone(zone)
     days = (weekday - local.weekday()) % 7
-    candidate = dt.datetime.combine(local.date() + dt.timedelta(days=days), dt.time(hour, minute), tzinfo=zone)
+    candidate = dt.datetime.combine(local.date() + dt.timedelta(days=days), wall_time, tzinfo=zone)
     if candidate <= local:
-        candidate = dt.datetime.combine(local.date() + dt.timedelta(days=days + 7), dt.time(hour, minute), tzinfo=zone)
+        candidate = dt.datetime.combine(local.date() + dt.timedelta(days=days + 7), wall_time, tzinfo=zone)
     return candidate.astimezone(dt.timezone.utc)
 
 
@@ -230,8 +236,11 @@ def parse_limit(text: str, now: dt.datetime) -> Optional[Dict[str, Any]]:
     if until is None:
         match = _RELATIVE.search(near)
         if match and any(match.groups()):
-            days, hours, minutes = (int(value or 0) for value in match.groups())
-            until = now + dt.timedelta(days=days, hours=hours, minutes=minutes)
+            try:
+                days, hours, minutes = (int(value or 0) for value in match.groups())
+                until = now + dt.timedelta(days=days, hours=hours, minutes=minutes)
+            except (ValueError, OverflowError):
+                pass  # malformed limit durations use the scheduled probe
     if until is not None and now < until and (weekly is None or until <= weekly):
         return {"until": until, "reason": reason, "exact": True}
     if until is not None and weekly is not None and until > weekly:

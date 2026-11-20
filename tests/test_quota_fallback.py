@@ -21,8 +21,7 @@ class QuotaFallbackTests(AppTestCase):
     def setUp(self):
         super().setUp()
         os.environ["COORD_TRANSPORT"] = "gh"  # Alex's identity would go through the fake gh runner
-        # REST only, as cloud sessions run: the first read is a core one. (A GraphQL 403 is
-        # taken for a proxy's refusal and retried over REST: snapshot.with_rest_fallback.)
+        # Most cases exercise the core quota; the GraphQL case opts back in.
         os.environ["COORD_REST_ONLY"] = "1"
         self.seed_token("read")
         self.seed_snapshot(age_seconds=2 * 3600)
@@ -50,7 +49,7 @@ class QuotaFallbackTests(AppTestCase):
             headers = rate_headers(5000 if remaining_zero else 10, server.reset, resource)
             raise server._error(request.full_url, 403, {"message": "API rate limit exceeded"}, headers)
 
-        self.patch(ghmodule, "app_open", urlopen)
+        self.patch(ghmodule, "api_open", urlopen)
 
     def test_the_exhausting_read_serves_the_stale_board(self):
         self.refuse_first_read()
@@ -62,6 +61,15 @@ class QuotaFallbackTests(AppTestCase):
         self.assertIn("STALE: snapshot from 2h00m ago", out.splitlines()[0])
         self.assertEqual(self.server.api_requests(), [], "no request after the refused one reached GitHub")
         self.assertEqual(self.runner.calls, [], "nothing as Alex")
+
+    def test_exhausted_graphql_serves_the_cache_without_rebuilding_over_rest(self):
+        os.environ["COORD_REST_ONLY"] = "0"
+        self.refuse_first_read()
+        code, out, err = self.main(["board", "--fresh"])
+        self.assertEqual(code, EXIT_OK, err)
+        self.assertEqual(self.refused, ["graphql"])
+        self.assertEqual(self.server.api_requests(), [])
+        self.assertIn("STALE:", out)
 
     def test_a_403_that_leaves_budget_still_errors(self):
         self.refuse_first_read(remaining_zero=False)

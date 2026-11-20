@@ -71,6 +71,45 @@ class PurePythonRS256Tests(unittest.TestCase):
 
 
 class CrossPlatformPrimitivesTests(unittest.TestCase):
+    def test_windows_assignment_failure_never_releases_the_command(self):
+        kernel = mock.Mock()
+        kernel.AssignProcessToJobObject.return_value = False
+        launcher = mock.Mock(_handle=2)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(compat, "IS_WINDOWS", True), \
+                mock.patch.object(compat, "_win_create_kill_job", return_value=1), \
+                mock.patch.object(compat, "_kernel32", kernel, create=True), \
+                mock.patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True), \
+                mock.patch.object(subprocess, "Popen", return_value=launcher) as popen:
+            with self.assertRaisesRegex(OSError, "assign"):
+                compat.run_isolated_process(["target"], tmp, {}, timeout=5)
+            self.assertEqual(popen.call_args.args[0][:4], [sys.executable, "-I", "-S", "-c"])
+            self.assertNotIn("target", popen.call_args.args[0])
+            launcher.communicate.assert_not_called()
+            launcher.kill.assert_called_once()
+            kernel.CloseHandle.assert_called_once_with(1)
+
+    def test_windows_teardown_waits_when_kill_and_pipe_close_race_with_job_exit(self):
+        kernel = mock.Mock()
+        launcher = mock.Mock(_handle=2, returncode=7)
+        launcher.kill.side_effect = PermissionError("launcher already exiting")
+        launcher.stdin.close.side_effect = OSError("pipe already disconnected")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(compat, "IS_WINDOWS", True), \
+                mock.patch.object(compat, "_win_create_kill_job", return_value=1), \
+                mock.patch.object(compat, "_kernel32", kernel, create=True), \
+                mock.patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 512, create=True), \
+                mock.patch.object(subprocess, "Popen", return_value=launcher):
+            for timed_out, expected in ((False, 7), (True, 124)):
+                with self.subTest(timed_out=timed_out):
+                    launcher.reset_mock()
+                    launcher.communicate.side_effect = subprocess.TimeoutExpired("target", 1) if timed_out else None
+                    completed = compat.run_isolated_process(["target"], tmp, {}, timeout=1)
+                    self.assertEqual(completed.returncode, expected)
+                    launcher.stdin.close.assert_called_once()
+                    launcher.wait.assert_called_once_with(timeout=5)
+            launcher.wait.side_effect = subprocess.TimeoutExpired("launcher", 5)
+            with self.assertRaisesRegex(OSError, "launcher did not terminate"):
+                compat.run_isolated_process(["target"], tmp, {}, timeout=1)
+
     def test_file_lock_blocks_second_holder_and_releases(self):
         with tempfile.TemporaryDirectory() as tmp:
             lock_path = os.path.join(tmp, "test.lock")
@@ -159,6 +198,28 @@ class CrossPlatformPrimitivesTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows-native DPAPI and PowerShell installer tests")
 class NativeWindowsTests(unittest.TestCase):
+    def test_isolated_command_preserves_output_arguments_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = [sys.executable, "-c", "import sys; print(sys.argv[1]); print('error', file=sys.stderr); sys.exit(3)",
+                       'argument with "quotes" and spaces']
+            result = compat.run_isolated_process(command, tmp, dict(os.environ), timeout=10)
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(result.stdout.strip(), command[-1])
+            self.assertEqual(result.stderr.strip(), "error")
+            missing = compat.run_isolated_process([os.path.join(tmp, "missing.exe")], tmp, dict(os.environ), timeout=10)
+            self.assertEqual(missing.returncode, 127)
+            self.assertTrue(missing.stderr)
+
+    def test_fast_exiting_parent_leaves_no_live_descendants(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp, "survived")
+            worker = f"import time, pathlib; time.sleep(1.5); pathlib.Path({str(marker)!r}).touch()"
+            parent = f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {worker!r}])"
+            result = compat.run_isolated_process([sys.executable, "-c", parent], tmp, dict(os.environ), timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            time.sleep(2)
+            self.assertFalse(marker.exists())
+
     def test_dpapi_round_trip(self):
         secret = b"-----BEGIN RSA PRIVATE KEY-----\ntest-payload\n-----END RSA PRIVATE KEY-----\n"
         blob = compat.dpapi_protect(secret)

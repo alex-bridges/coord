@@ -23,7 +23,7 @@ def setUpModule():
 MAILBOX = 1001
 PLAIN = 1070
 # This machine's cached board: a message sent without --on, so it was posted on the mailbox.
-BOARD = {"messages": [{"on": MAILBOX, "author": {"login": "o", "type": "User"},
+BOARD = {"messages": [{"on": MAILBOX, "author": {"login": "example-owner", "type": "User"},
                        "payload": {"kind": "msg", "v": 1, "agent": "claude@x:y",
                                                   "to": ["conductor@*"]}}]}
 
@@ -84,7 +84,7 @@ class MailboxLearnedByInboxTests(unittest.TestCase):
         self.mailbox_comment = {
             "id": 77, "created_at": now, "html_url": "https://example.invalid/m",
             "issue_url": f"https://api.github.com/repos/o/r/issues/{MAILBOX}",
-            "user": {"login": "o", "type": "User"},
+            "user": {"login": "example-owner", "type": "User"},
             "body": "**From** `claude@x:y` **to** `conductor@*`\n\nhello\n\n"
                     + marker.encode({"kind": "msg", "v": 1, "agent": "claude@x:y", "to": ["conductor@*"]}),
         }
