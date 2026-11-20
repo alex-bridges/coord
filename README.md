@@ -126,6 +126,9 @@ If running inside a Claude cloud session (`CLAUDE_CODE_REMOTE=true` forces REST-
 run with `env -u CLAUDE_CODE_REMOTE python3 -m unittest …`. On Linux, `test_reviewer`'s
 macOS-only `ps -E` cleanup test is skipped automatically.
 
+CI also runs bounded TLA+ checks for merge-train advancement, Keychain writes, and the
+starter guard. See the [model scopes and local TLC command](formal/README.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

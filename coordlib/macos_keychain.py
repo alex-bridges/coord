@@ -32,6 +32,7 @@ def store_generic_password(service: str, account: str, data: bytes, keychain_pat
     cf.CFRelease.restype = None
     sec.SecKeychainCopyDefault.argtypes = [out_ref]
     sec.SecKeychainOpen.argtypes = [C.c_char_p, out_ref]
+    sec.SecKeychainGetStatus.argtypes = [ref, C.POINTER(C.c_uint32)]
     sec.SecTrustedApplicationCreateFromPath.argtypes = [C.c_char_p, out_ref]
     sec.SecAccessCreate.argtypes = [ref, ref, out_ref]
     sec.SecKeychainItemCreateFromContent.argtypes = [
@@ -59,6 +60,9 @@ def store_generic_password(service: str, account: str, data: bytes, keychain_pat
         else:
             check(sec.SecKeychainOpen(keychain_path, C.byref(kc)))
         owned(kc)
+        # Open also succeeds for a missing file. A subsequent create on an unusable
+        # reference can silently write to the default Keychain instead.
+        check(sec.SecKeychainGetStatus(kc, C.byref(C.c_uint32())))
 
         svc, acct = service.encode(), account.encode()
         check(sec.SecTrustedApplicationCreateFromPath(b"/usr/bin/security", C.byref(tool)))
