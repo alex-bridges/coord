@@ -80,7 +80,9 @@ class HandoffTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        patcher = mock.patch.dict(os.environ, {"COORD_CACHE_DIR": tmp.name})
+        # Generic defaults whatever another test module left in COORD_CONFIG: the trust
+        # rule reads owner_login, which defaults to the repository's owner ("o").
+        patcher = mock.patch.dict(os.environ, {"COORD_CACHE_DIR": tmp.name, "COORD_CONFIG": os.devnull})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.gh = GitHub("o/r", transport="http")
@@ -181,7 +183,8 @@ class SendWakeStepTests(HandoffTestCase):
     def test_a_prefix_lists_every_registered_match_and_a_broadcast_none(self):
         self.run_cli(["session", "register", "worker-a"], RECIPIENT)
         self.run_cli(["session", "register", "worker-c"], RESTARTED)
-        _, out = self.hand_off(to="claude@workstation:worker-*")
+        code, out, err = self.run_cli(["send", "--to", "claude@workstation:worker-*", "fyi"], SENDER)
+        self.assertEqual(code, EXIT_OK, err)
         self.assertIn("worker-a", out)
         self.assertIn("worker-c", out)
         code, out, _ = self.run_cli(["send", "hello all"], SENDER)
@@ -248,11 +251,12 @@ class TakeTests(HandoffTestCase):
         self.assertIn("already taken", out)
         self.assertEqual(self.api.calls, [])
 
-    def test_someone_elses_handoff_needs_force(self):
+    def test_someone_elses_handoff_is_refused_without_suggesting_force(self):
         handoff_id, _ = self.hand_off()
         code, _, err = self.run_cli(["handoff", "take", str(handoff_id)], RESTARTED)
         self.assertEqual(code, EXIT_USAGE)
-        self.assertIn("--force", err)
+        self.assertIn("not yours to take", err)
+        self.assertNotIn("--force", err)
         self.assertEqual(len(self.api.posts()), 1)
 
     def test_a_plain_message_is_not_a_handoff(self):

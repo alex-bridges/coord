@@ -68,7 +68,7 @@ class RelayOnceTests(RelayTestCase):
         self.assertEqual(argv[argv.index("--tools") + 1], "ListAgents,SendMessage")
         self.assertEqual(argv[argv.index("--allowedTools") + 1], "ListAgents,SendMessage")
         text = argv[argv.index("-p") + 1]
-        self.assertEqual(text, relay.PROMPT.format(handoff=handoff_id, number=1001, session="worker-a"))
+        self.assertEqual(text, relay.PROMPT.format(handoff=handoff_id, number=1001, session="worker-a", attempt=1))
         self.assertIn(f"relay attempt 1/3", "\n".join(lines))
         self.assertEqual(self.state()[str(handoff_id)]["attempts"], 1)
 
@@ -80,7 +80,8 @@ class RelayOnceTests(RelayTestCase):
 
     def test_the_senders_own_session_is_never_woken(self):
         self.registered("lead-1", SENDER)
-        self.hand_off(to="claude@workstation:*")
+        code, _, err = self.run_cli(["send", "--handoff", "--to", SENDER, "--to", RECIPIENT, "x"], SENDER)
+        self.assertEqual(code, 0, err)
         self.watch()
         self.assertEqual(self.fake.calls, [])
 
@@ -235,10 +236,10 @@ class InjectionTests(RelayTestCase):
                     relay.prompt(handoff_id, number, session)
 
     def test_the_prompt_is_the_fixed_template(self):
-        text = relay.prompt(7, 8, "worker-a")
-        self.assertEqual(text, relay.PROMPT.format(handoff="7", number="8", session="worker-a"))
+        text = relay.prompt(7, 8, "worker-a", 2)
+        self.assertEqual(text, relay.PROMPT.format(handoff="7", number="8", session="worker-a", attempt="2"))
         self.assertEqual(relay.PROMPT.count("{"), relay.PROMPT.count("{handoff}") + relay.PROMPT.count("{number}")
-                         + relay.PROMPT.count("{session}"))
+                         + relay.PROMPT.count("{session}") + relay.PROMPT.count("{attempt}"))
 
     def test_a_configured_command_must_carry_the_prompt_as_one_item(self):
         with mock.patch.object(relay.config, "get", return_value=["agent", "--ask", "{prompt}"]):
@@ -250,12 +251,15 @@ class InjectionTests(RelayTestCase):
 
 class StateLocationTests(unittest.TestCase):
     def test_the_default_state_dir_is_outside_any_checkout(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
         with mock.patch.object(relay.config, "get", return_value=None):  # the generic default name
-            path = relay.state_dir("Owner/Name", {"XDG_STATE_HOME": os.path.join("x", "state")})
-        self.assertEqual(path, os.path.join("x", "state", "coord-relay", "repo-owner%2Fname"))
+            path = relay.state_dir("Owner/Name", {"XDG_STATE_HOME": os.path.join(root, "state")})
+        self.assertEqual(path, os.path.join(root, "state", "coord-relay", "repo-owner%2Fname"))
         with mock.patch.object(relay.config, "get", return_value="team"):
-            self.assertIn(os.path.join("team-relay", "repo-o%2Fr"), relay.state_dir("o/r", {"XDG_STATE_HOME": "s"}))
-        self.assertEqual(relay.state_dir("o/r", {"COORD_RELAY_STATE_DIR": "elsewhere"}), "elsewhere")
+            self.assertIn(os.path.join("team-relay", "repo-o%2Fr"), relay.state_dir("o/r", {"XDG_STATE_HOME": root}))
+        elsewhere = os.path.join(root, "elsewhere")
+        self.assertEqual(relay.state_dir("o/r", {"COORD_RELAY_STATE_DIR": elsewhere}), elsewhere)
 
     def test_settings_are_bounded(self):
         self.assertEqual(relay.settings({"COORD_RELAY_MAX_ATTEMPTS": "500"})["maxAttempts"], relay.DEFAULT_MAX_ATTEMPTS)

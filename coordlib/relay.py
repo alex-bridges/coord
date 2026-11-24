@@ -31,11 +31,15 @@ Rules this module enforces:
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import os
 import re
+import signal
 import subprocess
+import tempfile
+import threading
 import urllib.parse
 from typing import Any, Callable, Dict, List, Optional
 
@@ -44,24 +48,38 @@ from . import cache, compat, config, handoff, identity, review, snapshot
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_MINUTES = 10.0  # first retry after this; doubles each attempt
 DEFAULT_TIMEOUT_SECONDS = 180
+DEFAULT_MODEL = "claude-haiku-5-5"  # small and pinned; COORD_RELAY_MODEL overrides
+GIVE_UP_POST_LIMIT = 5  # tries at posting one give-up record before recording it here only
 STATE_VERSION = 1
 
-_HANDOFF_ID = re.compile(r"^[1-9][0-9]{0,19}$")
-_NUMBER = re.compile(r"^[1-9][0-9]{0,9}$")
-_SESSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_HANDOFF_ID = re.compile(r"[1-9][0-9]{0,19}")
+_NUMBER = re.compile(r"[1-9][0-9]{0,9}")
+_ATTEMPT = re.compile(r"[1-9][0-9]?")
+_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
-# The whole relay instruction. Only {session}, {handoff} and {number} vary, and each is
-# validated by the pattern above before it is substituted.
+# The whole relay instruction. Only {session}, {handoff}, {number} and {attempt} vary, and
+# each is checked (session names by handoff.session_name_error) before it is substituted.
 PROMPT = (
     "You relay one notice and nothing else. Call ListAgents. If a session named exactly "
     "{session} is listed, call SendMessage once, addressed to {session}, with exactly this "
-    "message text: coord handoff {handoff} on #{number}: run `coord handoff take {handoff}`. "
+    "message text: coord handoff {handoff} on #{number} (relay attempt {attempt}): run "
+    "`coord handoff take {handoff}`. "
     "Call no other tool and send nothing else. Then reply with one word: RELAYED if you sent "
     "it, NOT_LISTED if no session with exactly that name is listed."
 )
 RELAY_TOOLS = "ListAgents,SendMessage"
+# The conductor's diagnosis recipe (runtime.claude_command, role "diagnose"): safe mode (no
+# user hooks, plugins, skills or CLAUDE.md), dontAsk, no MCP servers, no prompts, nothing
+# saved; only the two tools the relay needs; a small pinned model.
 DEFAULT_COMMAND = ["claude", "-p", "{prompt}", "--tools", RELAY_TOOLS, "--allowedTools", RELAY_TOOLS,
-                   "--permission-prompts", "none", "--strict-mcp-config", "--no-session-persistence"]
+                   "--safe-mode", "--strict-mcp-config", "--permission-mode", "dontAsk",
+                   "--permission-prompts", "none", "--no-session-persistence", "--model", "{model}"]
+# Never passed to the relay: credentials, and every variable that ties a process to the
+# coord identity or to the Claude Code session that started the watcher.
+SCRUBBED = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "COORD_AGENT",
+            "COORD_SESSION_ID", "CODEX_THREAD_ID", "CONDUCTOR_WAKE", "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_REMOTE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE")
+SCRUBBED_PREFIXES = ("CLAUDE_CODE_MESSAGING_", "COORD_")
 
 Runner = Callable[[List[str], str, Dict[str, str], int], "subprocess.CompletedProcess[str]"]
 
@@ -77,29 +95,111 @@ def checked(value: Any, pattern: "re.Pattern[str]", what: str) -> str:
     return text
 
 
-def prompt(handoff_id: Any, number: Any, session: Any) -> str:
-    """The fixed relay text, or IdentifierError. Nothing but the three identifiers varies."""
+def session_name(value: Any) -> str:
+    """The registration rule (handoff.session_name_error, which also refuses a session id)."""
+    if handoff.session_name_error(value) is not None:
+        raise IdentifierError("session name does not match its pattern")
+    return value
+
+
+def prompt(handoff_id: Any, number: Any, session: Any, attempt: Any = 1) -> str:
+    """The fixed relay text, or IdentifierError. Nothing but the four identifiers varies."""
     return PROMPT.format(handoff=checked(handoff_id, _HANDOFF_ID, "handoff id"),
                          number=checked(number, _NUMBER, "issue or PR number"),
-                         session=checked(session, _SESSION, "session name"))
+                         session=session_name(session),
+                         attempt=checked(attempt, _ATTEMPT, "attempt number"))
 
 
-def command(text: str) -> List[str]:
-    """The relay argv: config `relay_command` (an argv list with a "{prompt}" item), or the
-    default headless Claude Code run limited to ListAgents and SendMessage. The prompt is
+def command(text: str, model: str = DEFAULT_MODEL) -> List[str]:
+    """The relay argv: config `relay_command` (an argv list with a "{prompt}" item and,
+    optionally, a "{model}" item), or the default isolated Claude Code run. The prompt is
     one argv item; no shell is involved."""
     configured = config.get("relay_command") or []
     template = list(configured) if configured else list(DEFAULT_COMMAND)
     if "{prompt}" not in template:
         raise ValueError('relay_command must contain a "{prompt}" item')
-    return [text if part == "{prompt}" else part for part in template]
+    model = checked(model, _MODEL, "model")
+    return [text if part == "{prompt}" else model if part == "{model}" else part for part in template]
+
+
+def relay_environment(env: Dict[str, str]) -> Dict[str, str]:
+    """The watcher's environment less credentials and session ties (SCRUBBED)."""
+    return {key: value for key, value in env.items()
+            if key not in SCRUBBED and not key.startswith(SCRUBBED_PREFIXES)}
+
+
+class ChildRunner:
+    """Runs one relay at a time in its own process group (a Job Object on Windows, through
+    compat), and kills that group when the watcher is told to stop (SIGTERM, SIGINT), so a
+    relay never outlives the watcher and its timeout."""
+
+    def __init__(self) -> None:
+        self.child: Optional[subprocess.Popen] = None
+
+    def __call__(self, argv: List[str], cwd: str, env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess[str]":
+        if compat.IS_WINDOWS:
+            try:
+                return compat.run_isolated_process(argv, cwd, env, timeout)
+            except OSError as error:
+                return subprocess.CompletedProcess(argv, 127, "", str(error))
+        with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as out, \
+                tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as err:
+            try:
+                self.child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                              stderr=err, text=True, start_new_session=True)
+            except OSError as error:
+                return subprocess.CompletedProcess(argv, 127, "", str(error))
+            timed_out = False
+            try:
+                self.child.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                self.kill()
+                self.child.wait()
+            code = 124 if timed_out else self.child.returncode
+            self.child = None
+            out.seek(0)
+            err.seek(0)
+            return subprocess.CompletedProcess(argv, code, out.read(), err.read())
+
+    def kill(self) -> None:
+        child = self.child
+        if child is not None and not compat.IS_WINDOWS:
+            with contextlib.suppress(OSError):
+                os.killpg(child.pid, signal.SIGKILL)
+
+
+@contextlib.contextmanager
+def stop_kills(runner: Any):
+    """While a pass runs: SIGTERM and SIGINT kill the running relay's group first, then
+    stop the watcher as they would have. Only in the main thread (signal's rule)."""
+    if not hasattr(runner, "kill") or threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = {}
+
+    def handler(signum, frame):
+        runner.kill()
+        old = previous.get(signum)
+        if callable(old):
+            old(signum, frame)
+        elif signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT):
+        previous[signum] = signal.signal(signum, handler)
+    try:
+        yield
+    finally:
+        for signum, old in previous.items():
+            signal.signal(signum, old)
 
 
 def default_runner(argv: List[str], cwd: str, env: Dict[str, str], timeout: int) -> "subprocess.CompletedProcess[str]":
-    try:
-        return compat.run_isolated_process(argv, cwd, env, timeout)
-    except OSError as error:
-        return subprocess.CompletedProcess(argv, 127, "", str(error))
+    """A one-off ChildRunner (the Watcher keeps its own, so a stop signal can reach it)."""
+    return ChildRunner()(argv, cwd, env, timeout)
 
 
 def outcome(result: "subprocess.CompletedProcess[str]") -> str:
@@ -128,47 +228,99 @@ def settings(env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         "maxAttempts": int(_env_number(env, "COORD_RELAY_MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS, 1, 20)),
         "backoffMinutes": _env_number(env, "COORD_RELAY_BACKOFF_MINUTES", DEFAULT_BACKOFF_MINUTES, 0, 24 * 60),
         "timeout": int(_env_number(env, "COORD_RELAY_TIMEOUT", DEFAULT_TIMEOUT_SECONDS, 10, 3600)),
+        "model": env.get("COORD_RELAY_MODEL") or DEFAULT_MODEL,
     }
+
+
+def inside_work_tree(path: str) -> Optional[str]:
+    """The git work tree (a parent holding .git) that contains `path`, or None. No git
+    call: a directory or file named .git is what makes a work tree."""
+    current = os.path.abspath(path)
+    while True:
+        if os.path.lexists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
 
 
 def state_dir(repo: str, env: Optional[Dict[str, str]] = None) -> str:
     """COORD_RELAY_STATE_DIR, else $XDG_STATE_HOME (%LOCALAPPDATA% on Windows, else
-    ~/.local/state) / <state_dir_name>-relay / repo-<owner%2Fname>. Never inside a checkout."""
+    ~/.local/state) / <state_dir_name>-relay / repo-<owner%2Fname>. ValueError inside a
+    git work tree: the state, and the lock that keeps one watcher per repository, belong
+    to the user, not to a checkout."""
     env = dict(os.environ if env is None else env)
     if env.get("COORD_RELAY_STATE_DIR"):
-        return env["COORD_RELAY_STATE_DIR"]
-    if env.get("XDG_STATE_HOME"):
-        root = env["XDG_STATE_HOME"]
-    elif compat.IS_WINDOWS and env.get("LOCALAPPDATA"):
-        root = env["LOCALAPPDATA"]
+        directory = env["COORD_RELAY_STATE_DIR"]
     else:
-        root = os.path.expanduser("~/.local/state")
-    namespace = (config.get("state_dir_name") or "coord") + "-relay"
-    return os.path.join(root, namespace, "repo-" + urllib.parse.quote(repo.lower(), safe=""))
+        if env.get("XDG_STATE_HOME"):
+            root = env["XDG_STATE_HOME"]
+        elif compat.IS_WINDOWS and env.get("LOCALAPPDATA"):
+            root = env["LOCALAPPDATA"]
+        else:
+            root = os.path.expanduser("~/.local/state")
+        namespace = (config.get("state_dir_name") or "coord") + "-relay"
+        directory = os.path.join(root, namespace, "repo-" + urllib.parse.quote(repo.lower(), safe=""))
+    tree = inside_work_tree(directory)
+    if tree is not None:
+        raise ValueError(f"the relay state directory {directory} is inside the git work tree {tree}; "
+                         "set COORD_RELAY_STATE_DIR (or XDG_STATE_HOME) to a directory outside any checkout")
+    return directory
 
 
 def state_path(directory: str) -> str:
     return os.path.join(directory, "relay.json")
 
 
-def load_state(directory: str) -> Dict[str, Any]:
-    """{"version": 1, "handoffs": {id: entry}}. A missing file is an empty state; an
-    unreadable one is set aside (relay.json.bad) and the board decides what is handled."""
+_TIMES = ("lastAttempt", "nextAttempt", "acknowledged", "givingUp", "gaveUp")
+_TEXTS = ("lastResult", "gaveUpReason", "gaveUpRecord", "lastError")
+
+
+def entry_valid(entry: Any) -> bool:
+    """One handoff's record: a dict, a non-negative int `attempts`, times that parse."""
+    if not isinstance(entry, dict) or type(entry.get("attempts")) is not int or entry["attempts"] < 0:
+        return False
+    if type(entry.get("givingUpPosts", 0)) is not int:
+        return False
+    for key in _TIMES:
+        value = entry.get(key)
+        if value is not None:
+            try:
+                if not isinstance(value, str) or review.parse_time(value) is None:
+                    return False
+            except (ValueError, OverflowError):
+                return False
+    return all(entry.get(key) is None or isinstance(entry[key], str) for key in _TEXTS)
+
+
+def load_state(directory: str, set_aside: bool = True) -> Dict[str, Any]:
+    """{"version": 1, "handoffs": {id: entry}}. A missing file is an empty state. An
+    unreadable file, or one with bad entries, is copied aside (relay.json.bad, not in a
+    dry run) and the bad entries dropped: the board's acks and give-up records still
+    decide what is handled."""
     path = state_path(directory)
+    empty: Dict[str, Any] = {"version": STATE_VERSION, "handoffs": {}}
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
-        if isinstance(data, dict) and data.get("version") == STATE_VERSION and isinstance(data.get("handoffs"), dict):
-            return data
-        raise ValueError("unexpected shape")
+        if not (isinstance(data, dict) and data.get("version") == STATE_VERSION and isinstance(data.get("handoffs"), dict)):
+            raise ValueError("unexpected shape")
     except FileNotFoundError:
-        return {"version": STATE_VERSION, "handoffs": {}}
+        return empty
     except (OSError, ValueError, RecursionError):
-        try:
-            compat.atomic_replace(path, path + ".bad")
-        except OSError:
-            pass
-        return {"version": STATE_VERSION, "handoffs": {}, "recovered": True}
+        if set_aside:
+            with contextlib.suppress(OSError):
+                compat.atomic_replace(path, path + ".bad")
+        return dict(empty, recovered=True)
+    good = {key: entry for key, entry in data["handoffs"].items()
+            if isinstance(key, str) and _HANDOFF_ID.fullmatch(key) and entry_valid(entry)}
+    if len(good) != len(data["handoffs"]):
+        if set_aside:
+            with contextlib.suppress(OSError), open(path + ".bad", "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=1, sort_keys=True)
+        return {"version": STATE_VERSION, "handoffs": good, "dropped": len(data["handoffs"]) - len(good)}
+    return data
 
 
 def save_state(directory: str, state: Dict[str, Any]) -> None:
@@ -187,22 +339,27 @@ def save_state(directory: str, state: Dict[str, Any]) -> None:
 
 
 def targets(item: Dict[str, Any], sessions: Dict[str, Dict[str, Any]]) -> List[str]:
-    """Registered agents on this machine the handoff is addressed to (never its sender)."""
-    return sorted(agent for agent in sessions if agent != item["from"]
-                  and any(identity.matches(to, agent) for to in item["to"]))
+    """Registered agents on this machine the handoff names exactly (never its sender). A
+    handoff to `all` or to a prefix wakes nobody: `send --handoff` refuses those."""
+    return sorted(agent for agent in sessions if agent != item["from"] and agent in item["to"])
+
+
+Reader = Callable[[int, str], List[Dict[str, Any]]]
 
 
 class Watcher:
     def __init__(self, gh: Any, post: Callable[[int, str, Dict[str, Any]], Dict[str, Any]],
-                 runner: Runner = default_runner, env: Optional[Dict[str, str]] = None,
-                 now: Optional[dt.datetime] = None, me: Optional[str] = None):
+                 runner: Optional[Runner] = None, env: Optional[Dict[str, str]] = None,
+                 now: Optional[dt.datetime] = None, me: Optional[str] = None,
+                 read: Optional[Reader] = None, state_directory: Optional[str] = None):
         self.gh = gh
         self.post = post
-        self.runner = runner
+        self.read = read
+        self.runner = runner if runner is not None else ChildRunner()
         self.env = dict(os.environ if env is None else env)
         self.now = now or snapshot.now_utc()
         self.settings = settings(self.env)
-        self.dir = state_dir(gh.repo, self.env)
+        self.dir = state_directory or state_dir(gh.repo, self.env)
         self.lines: List[str] = []
         self.me = me or identity.agent_id()
 
@@ -213,7 +370,11 @@ class Watcher:
         return dt.timedelta(minutes=self.settings["backoffMinutes"] * (2 ** max(0, attempts - 1)))
 
     def run(self, snap: Dict[str, Any], dry_run: bool = False) -> List[str]:
-        """One pass under the state lock. Another watcher holding it: say so and stop."""
+        """One pass under the state lock. Another watcher holding it: say so and stop. A
+        dry run takes no lock and writes nothing."""
+        if dry_run:
+            self._pass(snap, True)
+            return self.lines
         os.makedirs(self.dir, exist_ok=True)
         fd = os.open(os.path.join(self.dir, "relay.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
@@ -223,7 +384,8 @@ class Watcher:
                 self.say("another relay watcher is running for this repository; nothing done")
                 return self.lines
             try:
-                self._pass(snap, dry_run)
+                with stop_kills(self.runner):
+                    self._pass(snap, False)
             finally:
                 compat.unlock(fd)
         finally:
@@ -231,62 +393,27 @@ class Watcher:
         return self.lines
 
     def _pass(self, snap: Dict[str, Any], dry_run: bool) -> None:
-        state = load_state(self.dir)
+        state = load_state(self.dir, set_aside=not dry_run)
         if state.get("recovered"):
             self.say(f"the state file was unreadable; set aside as {state_path(self.dir)}.bad. "
                      "The board's acks and give-up records still decide what is handled")
+        if state.get("dropped"):
+            self.say(f"dropped {state['dropped']} malformed state entr{'y' if state['dropped'] == 1 else 'ies'} "
+                     f"(a copy is in {state_path(self.dir)}.bad)")
         entries: Dict[str, Dict[str, Any]] = state["handoffs"]
         items = handoff.handoffs(snap, self.now)
         sessions = cache.load_sessions(self.gh.repo)
-        cap = self.settings["maxAttempts"]
         waiting = 0
         for item in items:
             key = str(item["id"])
-            entry = entries.get(key)
-            if item["acked"]:
-                if entry is not None and not entry.get("acknowledged"):
-                    entry["acknowledged"] = item["acks"][0]["at"]
-                    self.say(f"handoff {key}: taken; done")
-                continue
-            if item["relayGaveUp"]:
-                if entry is not None and not entry.get("gaveUp"):
-                    entry["gaveUp"] = item["relayGaveUp"]["at"]
-                continue
-            if entry is not None and (entry.get("gaveUp") or entry.get("acknowledged")):
-                continue
-            names = targets(item, sessions)
-            if not names:
-                continue  # nobody on this machine to wake; the handoff waits in the inbox
-            entry = entries.setdefault(key, {"attempts": 0})
-            due = review.parse_time(entry.get("nextAttempt"))
-            if due is not None and self.now < due:
-                waiting += 1  # the last attempt also gets its full wait before the give-up
-                continue
-            if entry["attempts"] >= cap:
-                self.give_up(item, entry, f"no ack after {entry['attempts']} relay attempt(s)", dry_run)
-                self.save(state, dry_run)
-                continue
             try:
-                texts = [(sessions[agent]["name"], prompt(item["id"], item.get("on"), sessions[agent]["name"]))
-                         for agent in names]
-            except IdentifierError as error:
-                self.give_up(item, entry, f"not relayed: {error}", dry_run)
+                waiting += self.step(item, entries, sessions, state, dry_run)
+            except Exception as error:  # noqa: BLE001 - one handoff's failure must not stop the others
+                entry = entries.get(key)
+                if entry is not None:
+                    entry["lastError"] = f"{type(error).__name__}: {str(error)[:200]}"
+                self.say(f"handoff {key}: {type(error).__name__}: {str(error)[:200]}; trying again next pass")
                 self.save(state, dry_run)
-                continue
-            entry["attempts"] += 1
-            entry["lastAttempt"] = snapshot.iso(self.now)
-            entry["nextAttempt"] = snapshot.iso(self.now + self.backoff(entry["attempts"]))
-            self.save(state, dry_run)  # the attempt is on disk before the relay runs
-            results = []
-            for name, text in texts:
-                if dry_run:
-                    results.append(f"{name}: dry run")
-                    continue
-                result = self.runner(command(text), self.dir, self.env, self.settings["timeout"])
-                results.append(f"{name}: {outcome(result)}")
-            entry["lastResult"] = ", ".join(results)
-            self.say(f"handoff {key}: relay attempt {entry['attempts']}/{cap} ({entry['lastResult']})")
-            self.save(state, dry_run)
         self.prune(entries, {str(h["id"]) for h in items})
         self.save(state, dry_run)
         if waiting:
@@ -294,20 +421,122 @@ class Watcher:
         if not self.lines:
             self.say("nothing to relay")
 
-    def give_up(self, item: Dict[str, Any], entry: Dict[str, Any], why: str, dry_run: bool) -> None:
-        """Record the give-up here and once on GitHub, where the board and the sender see it."""
-        entry["gaveUp"] = snapshot.iso(self.now)
-        entry["gaveUpReason"] = why
-        self.say(f"handoff {item['id']}: gave up ({why}); it stays in the recipient's inbox")
-        if dry_run or not isinstance(item.get("on"), int):
+    def step(self, item: Dict[str, Any], entries: Dict[str, Dict[str, Any]], sessions: Dict[str, Dict[str, Any]],
+             state: Dict[str, Any], dry_run: bool) -> int:
+        """One handoff; 1 when it waits for its next attempt, else 0."""
+        key = str(item["id"])
+        entry = entries.get(key)
+        if item["acked"]:
+            if entry is not None and not entry.get("acknowledged"):
+                entry["acknowledged"] = item["acks"][0]["at"]
+                self.say(f"handoff {key}: taken; done")
+            return 0
+        if item["relayGaveUp"]:
+            if entry is not None and not entry.get("gaveUp"):
+                entry["gaveUp"] = item["relayGaveUp"]["at"]
+            return 0
+        if entry is not None and (entry.get("gaveUp") or entry.get("acknowledged")):
+            return 0
+        local = cache.load_acked(self.gh.repo).get(key)  # a take on this machine since the board was read
+        if local:
+            if entry is not None:
+                entry["acknowledged"] = local.get("at") or snapshot.iso(self.now)
+            return 0
+        names = targets(item, sessions)
+        if not names:
+            return 0  # nobody on this machine to wake; the handoff waits in the inbox
+        entry = entries.setdefault(key, {"attempts": 0})
+        if entry.get("givingUp"):
+            self.give_up(item, entry, entry.get("gaveUpReason") or "no ack", state, dry_run)
+            return 0
+        due = review.parse_time(entry.get("nextAttempt"))
+        if due is not None and self.now < due:
+            return 1  # the last attempt also gets its full wait before the give-up
+        if entry["attempts"] >= self.settings["maxAttempts"]:
+            self.give_up(item, entry, f"no ack after {entry['attempts']} relay attempt(s)", state, dry_run)
+            return 0
+        attempt = entry["attempts"] + 1
+        texts = []
+        for agent in names:
+            name = sessions[agent].get("name")
+            try:
+                texts.append((name, prompt(item["id"], item.get("on"), name, attempt)))
+            except IdentifierError as error:
+                # This machine's registry entry is bad; skip it here, give nothing up for anyone.
+                self.say(f"handoff {key}: skipped {agent} ({error}); fix it with `coord session register`")
+        if not texts:
+            if not entries[key].get("lastAttempt"):
+                del entries[key]
+            return 0
+        entry["attempts"] = attempt
+        entry["lastAttempt"] = snapshot.iso(self.now)
+        entry["nextAttempt"] = snapshot.iso(self.now + self.backoff(attempt))
+        self.save(state, dry_run)  # the attempt is on disk before the relay runs
+        results = []
+        for name, text in texts:
+            if dry_run:
+                results.append(f"{name}: dry run")
+                continue
+            with tempfile.TemporaryDirectory(prefix="coord-relay-") as scratch:
+                result = self.runner(command(text, self.settings["model"]), scratch,
+                                     relay_environment(self.env), self.settings["timeout"])
+            results.append(f"{name}: {outcome(result)}")
+        entry["lastResult"] = ", ".join(results)
+        self.say(f"handoff {key}: relay attempt {attempt}/{self.settings['maxAttempts']} ({entry['lastResult']})")
+        self.save(state, dry_run)
+        return 0
+
+    def give_up(self, item: Dict[str, Any], entry: Dict[str, Any], why: str, state: Dict[str, Any],
+                dry_run: bool) -> None:
+        """Record the give-up here, and exactly once on GitHub. The intent is on disk before
+        the post; while it is unconfirmed, a later pass first reads the handoff's issue for
+        a give-up record (or an ack) that an earlier, interrupted post may have left."""
+        if dry_run:
+            self.say(f"handoff {item['id']}: would give up ({why})")
             return
+        resuming = bool(entry.get("givingUp"))
+        entry.setdefault("givingUp", snapshot.iso(self.now))
+        entry.setdefault("gaveUpReason", why)
+        self.save(state, False)
+        if not isinstance(item.get("on"), int):
+            self.confirm(entry, None, "no issue to post on")
+            return
+        if resuming:
+            if self.read is None:
+                raise RuntimeError("an earlier give-up post may have landed and nothing can read the issue to check")
+            records = self.read(item["on"], item.get("at") or entry["givingUp"])
+            if handoff.acks(records).get(item["id"]):
+                entry.pop("givingUp", None)
+                entry["acknowledged"] = snapshot.iso(self.now)
+                self.say(f"handoff {item['id']}: taken; done")
+                self.save(state, False)
+                return
+            earlier = next((r for r in records if (r.get("payload") or {}).get("relayGaveUp") == item["id"]), None)
+            if earlier is not None:
+                self.confirm(entry, earlier.get("url"), "found the earlier give-up record")
+                self.save(state, False)
+                return
+        if entry.get("givingUpPosts", 0) >= GIVE_UP_POST_LIMIT:
+            self.confirm(entry, None, f"the give-up record could not be posted in {GIVE_UP_POST_LIMIT} tries; "
+                                      "recorded on this machine only")
+            self.save(state, False)
+            return
+        entry["givingUpPosts"] = entry.get("givingUpPosts", 0) + 1
+        self.save(state, False)
         payload = {"kind": "msg", "v": 1, "agent": self.me, "to": [item["from"]], "relayGaveUp": item["id"]}
         if item.get("addressedOn") is not None:
             payload["on"] = item["on"]
         text = (f"**Relay gave up** on handoff {item['url']} after {entry.get('attempts', 0)} attempt(s). "
                 "It is still in the recipient's inbox.")
         posted = self.post(item["on"], text, payload)
-        entry["gaveUpRecord"] = (posted or {}).get("html_url")
+        self.confirm(entry, (posted or {}).get("html_url"), "posted the give-up record")
+        self.save(state, False)
+
+    def confirm(self, entry: Dict[str, Any], url: Optional[str], how: str) -> None:
+        entry.pop("givingUp", None)
+        entry["gaveUp"] = snapshot.iso(self.now)
+        entry["gaveUpRecord"] = url
+        self.say(f"gave up ({entry.get('gaveUpReason')}); {how}; the handoff stays in the recipient's inbox")
 
     def prune(self, entries: Dict[str, Dict[str, Any]], on_board: set) -> None:
         """Forget finished handoffs that have left the board's window."""

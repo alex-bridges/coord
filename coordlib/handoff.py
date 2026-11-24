@@ -27,20 +27,22 @@ import datetime as dt
 import re
 from typing import Any, Dict, List, Optional
 
-from . import identity, marker, review
+from . import identity, marker, review, snapshot
 
 # A harness session name as ListAgents prints it ("worker-a", "team-lead"). Never a raw
 # session id: the registry gives the sender a name and the harness resolves it.
-_SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_UUID = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$")
+_SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_UUID = re.compile(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}")
+# An agent id as the brief shows one (render._brief_identity): no spaces, no newlines.
+_AGENT = re.compile(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)?")
 
 
 def session_name_error(name: str) -> Optional[str]:
     """Why `name` cannot be registered, or None."""
-    if not isinstance(name, str) or not _SESSION_NAME.match(name):
+    if not isinstance(name, str) or not _SESSION_NAME.fullmatch(name):
         return ("a session name is the name ListAgents prints after \"This session is\" "
                 "(letters, digits, '.', '_', '-'; at most 64)")
-    if _UUID.match(name):
+    if _UUID.fullmatch(name):
         return "that is a session id, not a session name: register the name ListAgents prints"
     return None
 
@@ -48,6 +50,21 @@ def session_name_error(name: str) -> Optional[str]:
 def is_exact_address(address: str) -> bool:
     """One agent id: not `all`, not a prefix ending in *, not `#N` (whoever works on N)."""
     return bool(address) and address != "all" and not address.endswith("*") and not address.startswith("#")
+
+
+def trusted(message: Dict[str, Any], repo: Optional[str]) -> bool:
+    """Whether a handoff, ack or give-up record counts: posted by the trusted user login
+    (snapshot.trusted_attestation) or by the configured app login, the mailbox's rule.
+    The marker's `agent` field is self-declared, so the author decides."""
+    author = message.get("author") or {}
+    if not repo:
+        return False
+    return snapshot.trusted_attestation(author, repo) or author.get("login") == snapshot.sidechain_login()
+
+
+def agent_words(agent: Any) -> Optional[str]:
+    """An agent id fit to print in a line someone will send on, or None."""
+    return agent if isinstance(agent, str) and len(agent) <= 160 and _AGENT.fullmatch(agent) else None
 
 
 def is_handoff(message: Dict[str, Any]) -> bool:
@@ -80,7 +97,8 @@ def addressed_to(message: Dict[str, Any], me: str) -> bool:
 
 def handoffs(snap: Dict[str, Any], now: dt.datetime) -> List[Dict[str, Any]]:
     """Every handoff on the board with its ack state, oldest first."""
-    messages = snap.get("messages") or []
+    repo = snap.get("repo")
+    messages = [m for m in snap.get("messages") or [] if trusted(m, repo)]
     acked = acks(messages)
     gave_up = {}
     for message in messages:
@@ -141,6 +159,7 @@ def wake_text(kind: str, comment_id: int, sender: str, where: str, sent_at: str)
     """The one line a sender gives the harness. It names the coord item and carries no
     work. `sent_at` is when the line is printed (the send, or a later `handoff status`),
     so a re-wake is not dropped as a copy of the sender's previous message."""
+    sender = agent_words(sender) or "(sender not shown)"
     if kind == "handoff":
         return (f"coord handoff {comment_id} for you from {sender} ({where}, sent {sent_at}): "
                 f"run `coord handoff take {comment_id}`")

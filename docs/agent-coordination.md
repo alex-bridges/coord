@@ -469,7 +469,8 @@ The inbox delivers a message durably, but an idle session reads it only when som
 starts its next turn. A handoff adds that start. It has four parts.
 
 1. **The record.** `coord send --handoff --to <agent> "…"` posts the message first, as
-   every `send` does. Its comment id is the handoff id. If the wake below fails, nothing is
+   every `send` does. Each `--to` must be one agent id: `all`, a prefix ending in `*` and
+   `#N` are refused, so a handoff never wakes a crowd. Its comment id is the handoff id. If the wake below fails, nothing is
    lost: the handoff is in the recipient's inbox.
 2. **The wake.** After posting, `send` prints the wake step. A Claude Code session can be
    woken by a session-to-session message from its harness (SendMessage), but only on the
@@ -491,16 +492,25 @@ starts its next turn. A handoff adds that start. It has four parts.
    that has ended fails at once, so you know.
 3. **Taking it.** The recipient runs `coord handoff take <id>`. It checks, in this order,
    this machine's record of acks, the cached board and GitHub. If anyone has already
-   taken the handoff, it says so and you do no new work. Otherwise it posts the ack and
-   prints the work. So a repeated wake costs one read and no duplicate work. That holds
-   after a restart or a compaction too, because GitHub decides. A restarted session can
-   have a new coord id; it takes a handoff addressed to its old id with `--force`.
+   taken the handoff, it says so and you do no new work. Otherwise it posts the ack, reads
+   the acks once more, and prints the work only if its ack is the earliest; when two
+   takers raced, the later one stands down. So a repeated wake costs one read and no
+   duplicate work. That holds after a restart or a compaction too, because GitHub decides.
+   `take` refuses a handoff addressed to another coord id (`--force` overrides that
+   deliberately; a restarted session can have a new id).
 4. **The ack.** The ack is a `msg` record to the sender with an `ack` field (the handoff
    id). The sender sees it in its inbox. `coord handoff status <id>` and
    `coord handoff list --unacked --older-than 30m` (`--from all` for every sender) read
    it from the board, which already holds every message of the last 14 days, so they
    cost no call beyond the board's. Older coord versions read the ack as an ordinary
    message.
+
+**Whose records count.** A marker's `agent` field is self-declared, and on a public
+repository anyone can post one. Handoff, ack and give-up records therefore count only
+when GitHub shows them posted by the trusted user login (`owner_login`) or the configured
+app login (`reviewer_bot_login`), the same rule as the mailbox. That holds on the board,
+in `inbox`, and in `take`'s own read from GitHub. A wake line prints the sender only when
+it is a well-formed agent id.
 
 Until a handoff is taken, `inbox` lists it under OPEN HANDOFFS at every read, even after
 the read cursor has passed it, and the session-start brief names its id (not its text).
@@ -525,30 +535,47 @@ Scheduler). Each pass:
 3. writes the attempt to its state file before running the relay, so a crash never
    repeats one.
 
-**The relay command** is a headless agent run. By default it is Claude Code with only
-ListAgents and SendMessage available and allowed (`--tools` and `--allowedTools`), no
-MCP servers, and no permission prompts. Its prompt is a fixed template with three
-variable parts: the handoff id, the issue or PR number and the session name. Each must
-match a strict pattern (digits; letters, digits, `.` `_` `-` for the name), or nothing is
-relayed and the handoff is given up. No handoff text, note or comment text is ever in the
-prompt. The relay finds the session by name with ListAgents; coord never resolves a name
+**The relay command** is a headless agent run, isolated like `conductor diagnose`. By
+default it is Claude Code with only ListAgents and SendMessage available and allowed
+(`--tools`, `--allowedTools`), `--safe-mode` (no user hooks, plugins, skills or
+CLAUDE.md), `--permission-mode dontAsk`, no MCP servers, no permission prompts, nothing
+saved, and a small pinned model (`COORD_RELAY_MODEL` overrides it). It runs in a fresh
+empty directory, with the GitHub tokens, every `COORD_*` variable and every variable that
+ties it to a Claude Code session (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
+`CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_MESSAGING_*`) removed from its environment.
+Its prompt is a fixed template with four variable parts: the handoff id, the issue or
+PR number, the attempt number and the session name. Each must match a strict pattern;
+the session name follows the registration rule, which also refuses a session id. A bad
+name in this machine's registry skips that one target, and gives nothing up. No handoff
+text, note or comment text is ever in the prompt. The attempt number keeps a retry from
+repeating the previous message word for word. The relay finds the session by name with ListAgents; coord never resolves a name
 to a session id. The run ends with one word: `RELAYED` or `NOT_LISTED`. Config
 `relay_command` (an argv list with a `"{prompt}"` item, no shell) replaces the default.
 
 **Bounded retries.** At most `COORD_RELAY_MAX_ATTEMPTS` attempts (3), the first retry
 after `COORD_RELAY_BACKOFF_MINUTES` (10), doubling each time. After the last attempt's
-wait, the watcher records the give-up in its state and posts one `msg` to the sender with
-`relayGaveUp` (the handoff id); `handoff status` and `handoff list` show it. The handoff
-itself stays in the recipient's inbox.
+wait, the watcher posts one `msg` to the sender with `relayGaveUp` (the handoff id);
+`handoff status` and `handoff list` show it. The handoff itself stays in the recipient's
+inbox. The give-up is posted exactly once: the intent is written to the state file
+before the post, the cached board is invalidated after it, and while the intent is
+unconfirmed a later pass first reads the handoff's issue for an earlier record (or an
+ack) instead of posting again. A post that keeps failing is tried at most five times,
+then recorded on this machine only. An error on one handoff is reported and the pass
+goes on to the next.
 
 **State.** `relay.json` in `COORD_RELAY_STATE_DIR`, else `$XDG_STATE_HOME` (on Windows
-`%LOCALAPPDATA%`, else `~/.local/state`) `/<state_dir_name>-relay/repo-<owner%2Fname>`,
-never inside a checkout. It holds, per handoff: attempts, the last and next attempt, the
+`%LOCALAPPDATA%`, else `~/.local/state`) `/<state_dir_name>-relay/repo-<owner%2Fname>`.
+A directory inside a git work tree is refused. Run every scheduler for one repository
+with the same settings: the lock only covers watchers that name the same directory. It holds, per handoff: attempts, the last and next attempt, the
 last result, and when it was acknowledged or given up. Writes are atomic (a temporary
 file, then a rename), and a lock file keeps two watchers from running at once. GitHub
 stays the record: after a restart, or with the file lost or unreadable (it is set aside
-as `relay.json.bad`), acks and give-up records on the board still keep handled handoffs
-from being woken again.
+as `relay.json.bad`; malformed entries are dropped and a copy kept there), acks and
+give-up records on the board still keep handled handoffs from being woken again. A take
+recorded on this machine (`acked.json`) also stops the relay at once. `--dry-run` takes no
+lock and writes nothing. With no session registered on the machine, a pass stops before
+reading the board. SIGTERM or SIGINT to the watcher kills a running relay's process group
+first.
 
 ## Session start
 

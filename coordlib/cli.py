@@ -495,8 +495,9 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
         # --on N alone reaches whoever works on N; nobody works on the mailbox (#1070).
         raise UsageError(f"#{args.on} is the mailbox issue: nobody works on it, so --on alone reaches no one. "
                          "Name the recipient with --to <agent> (the sender of the message you answer).")
-    if args.handoff and not args.to:
-        raise UsageError("a handoff names its recipient: add --to <agent> (the agent that takes the work over)")
+    if args.handoff and (not args.to or not all(handoff.is_exact_address(to) for to in args.to)):
+        raise UsageError("a handoff names its recipient: --to <agent id> for each agent that takes the work over "
+                         "(not all, a prefix ending in *, or #N)")
     recipients = args.to or (["all"] if args.on is None else [f"#{args.on}"])
     target = args.on if args.on is not None else find_or_create_mailbox(gh)
     payload = {"kind": "msg", "v": 1, "agent": me, "to": recipients}
@@ -649,13 +650,25 @@ def cmd_handoff_list(args: argparse.Namespace, gh: GitHub) -> int:
     return EXIT_OK
 
 
+def trusted_coord_comments(gh: GitHub, raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """REST comments as board records, keeping only those a handoff reader may believe."""
+    return [c for c in map(snapshot.coord_comment, raw) if c is not None and handoff.trusted(c, gh.repo)]
+
+
+def handoff_acks(gh: GitHub, number: Optional[int], handoff_id: int, since: str) -> List[Dict[str, Any]]:
+    """The trusted acks of one handoff, oldest first, read from its issue on GitHub."""
+    later = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?since={since}&per_page=100")
+    return handoff.acks(trusted_coord_comments(gh, later)).get(handoff_id) or []
+
+
 def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     """Take a handoff: refuse a duplicate, else post the ack, then show the work.
 
     Duplicate checks, cheapest first: this machine's record of acks (no call), the cached
     board (no call), then GitHub (the handoff comment and the comments after it on its
-    issue). Only then is the ack posted. A repeated wake therefore costs at most two
-    reads and never a second piece of work, also after a restart or a compaction.
+    issue). Only then is the ack posted, and the acks are read once more: when two takers
+    raced, the earlier ack took the handoff and the later taker stands down. Only records
+    from trusted logins count (handoff.trusted).
     """
     me = identity.agent_id()
     local = cache.load_acked(gh.repo).get(str(args.id))
@@ -672,13 +685,14 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     payload = marker.decode((comment or {}).get("body"))
     if not payload or payload.get("kind") != "msg" or payload.get("handoff") is not True:
         raise UsageError(f"comment {args.id} is not a coord handoff")
+    if not handoff.trusted({"author": snapshot.comment_author(comment)}, gh.repo):
+        raise UsageError(f"comment {args.id} was not posted by a trusted login; it is not a handoff to act on")
     number = _number_from_url(comment.get("issue_url", ""))
     if not any(identity.matches(to, me) for to in marker.recipients(payload)) and not args.force:
-        raise UsageError(f"handoff {args.id} is addressed to {', '.join(marker.recipients(payload))}, not {me}; "
-                         "pass --force to take it over (a restarted session can have a new coord id)")
+        raise UsageError(f"handoff {args.id} is addressed to {', '.join(marker.recipients(payload))}, not to you "
+                         f"({me}); it is not yours to take")
     created = comment.get("created_at") or snapshot.iso(snapshot.now_utc())
-    later = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?since={created}&per_page=100")
-    taken = handoff.acks([c for c in map(snapshot.coord_comment, later) if c is not None]).get(args.id)
+    taken = handoff_acks(gh, number, args.id, created)
     if taken:
         cache.remember_acked(gh.repo, args.id, taken[0])
         return handoff_duplicate(args, taken[0]["by"], taken[0]["at"], taken[0]["url"], "GitHub")
@@ -693,6 +707,13 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     cache.invalidate_snapshot(gh.repo)
     record = {"id": posted.get("id"), "by": me, "at": posted.get("created_at") or snapshot.iso(snapshot.now_utc()),
               "url": posted.get("html_url")}
+    # Read again: another taker may have posted between our check and our ack. The
+    # earliest trusted ack took the handoff; a later one stands down.
+    after = handoff_acks(gh, number, args.id, created)
+    first = after[0] if after else record
+    if first.get("id") != record["id"]:
+        cache.remember_acked(gh.repo, args.id, first)
+        return handoff_duplicate(args, first.get("by"), first.get("at"), first.get("url"), "GitHub, after our ack")
     cache.remember_acked(gh.repo, args.id, record)
     body = marker.strip(comment.get("body") or "")
     if body.startswith("**Handoff from** `") and "\n" in body:
@@ -709,12 +730,32 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
 
 def cmd_handoff_watch(args: argparse.Namespace, gh: GitHub) -> int:
     """One relay pass (relay.py): wake registered local sessions for handoffs nobody took.
-    Meant for a scheduler; it reads the board (cached up to --max-age) and nothing else."""
+    Meant for a scheduler. With no session registered here it stops before reading the
+    board; otherwise it reads the board (cached up to --max-age) and, for a give-up that
+    may already have been posted, that handoff's issue."""
+    if not cache.load_sessions(gh.repo):
+        print("no session is registered on this machine; nothing to relay")
+        return EXIT_OK
+    try:
+        directory = relay.state_dir(gh.repo)
+    except ValueError as error:
+        raise UsageError(str(error)) from None
     snap = get_snapshot(gh, args.max_age)
     if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
         print("coord: the board is stale (budget low or no app token); not relaying this pass", file=sys.stderr)
         return EXIT_OK
-    watcher = relay.Watcher(gh, lambda number, text, payload: post_comment(gh, number, text, payload))
+
+    def post(number: int, text: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return post_comment(gh, number, text, payload)
+        finally:
+            cache.invalidate_snapshot(gh.repo)  # the next pass must not reuse a board without it
+
+    def read(number: int, since: str) -> List[Dict[str, Any]]:
+        return trusted_coord_comments(
+            gh, gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?since={since}&per_page=100"))
+
+    watcher = relay.Watcher(gh, post, read=read, state_directory=directory)
     lines = watcher.run(snap, dry_run=args.dry_run)
     if args.json:
         print(json.dumps({"schema": 1, "status": "ok", "stateDir": watcher.dir, "lines": lines}, indent=2))
@@ -830,7 +871,8 @@ def inbox_items(
             "path": comment.get("path"),
             "url": comment.get("html_url"),
             "text": marker.strip(comment.get("body") or ""),
-            "handoff": bool(payload is not None and payload.get("kind") == "msg" and payload.get("handoff") is True),
+            "handoff": bool(payload is not None and payload.get("kind") == "msg" and payload.get("handoff") is True
+                            and handoff.trusted({"author": snapshot.comment_author(comment)}, snap.get("repo"))),
         })
     items.sort(key=lambda item: item["at"])
     return items
@@ -839,7 +881,8 @@ def inbox_items(
 def open_handoffs(snap: Dict[str, Any], me: str, issue_comments: List[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
     """Handoffs to `me` nobody has taken: from the board, less any ack in comments read
     since it was built. Shown at every inbox read until taken, whatever the cursor."""
-    fresh = handoff.acks([c for c in map(snapshot.coord_comment, issue_comments) if c is not None])
+    fresh = handoff.acks([c for c in map(snapshot.coord_comment, issue_comments)
+                          if c is not None and handoff.trusted(c, snap.get("repo"))])
     return [h for h in handoff.open_for(snap, me, snapshot.now_utc()) if h["id"] not in fresh]
 
 
