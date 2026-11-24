@@ -16,7 +16,7 @@ import urllib.parse
 from typing import Any, Dict, List, NoReturn, Optional
 
 from . import EXIT_BACKEND, EXIT_BUDGET, EXIT_CONFLICT, EXIT_NOT_FOUND, EXIT_OK, EXIT_USAGE
-from . import apptoken, budget, cache, config, doctor, identity, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
+from . import apptoken, budget, cache, config, doctor, handoff, identity, relay, lease, marker, outage, render, review, snapshot, train, train_metrics, train_step
 from .gh import AppAuthError, GitHub, GitHubError, NotFound, redact, repo_from_remote_url
 
 # Which identity each command uses in app mode. Every command not in USER_IDENTITY runs on
@@ -39,7 +39,7 @@ NEEDS_ALEX = frozenset({"train step", "conductor tick", "conductor pause", "cond
 # on the app (Alex's decision, 2026-09-25): an app-authored comment notifies Alex on
 # threads he takes part in, and he handles that with notification settings. To post them
 # as Alex again, add `| CONVERSATION` to USER_IDENTITY below; nothing else changes.
-CONVERSATION = frozenset({"claim", "release", "send", "outage start", "outage end"})
+CONVERSATION = frozenset({"claim", "release", "send", "handoff take", "handoff watch", "outage start", "outage end"})
 # coord has no command that creates a PR or replies in a review thread; if one is added it
 # belongs in USER_IDENTITY, because review.is_bot counts an app reply as no answer to a
 # Codex finding.
@@ -327,7 +327,8 @@ def cmd_board(args: argparse.Namespace, gh: GitHub) -> int:
             out["apiBudget"]["user"] = {resource: budget.summary(gh.repo, resource) for resource in ("core", "graphql")}
         print(json.dumps(out, indent=2))
     elif args.brief:
-        sys.stdout.write(render.brief(snap, me, unread, budget=words))
+        sys.stdout.write(render.brief(snap, me, unread, budget=words, handoffs=open_handoffs(snap, me),
+                                      register_hint=me.startswith("claude@") and me not in cache.load_sessions(gh.repo)))
     else:
         sys.stdout.write(render.board(snap, me, unread, budget=words))
     return EXIT_OK
@@ -494,19 +495,245 @@ def cmd_send(args: argparse.Namespace, gh: GitHub) -> int:
         # --on N alone reaches whoever works on N; nobody works on the mailbox (#1070).
         raise UsageError(f"#{args.on} is the mailbox issue: nobody works on it, so --on alone reaches no one. "
                          "Name the recipient with --to <agent> (the sender of the message you answer).")
+    if args.handoff and not args.to:
+        raise UsageError("a handoff names its recipient: add --to <agent> (the agent that takes the work over)")
     recipients = args.to or (["all"] if args.on is None else [f"#{args.on}"])
     target = args.on if args.on is not None else find_or_create_mailbox(gh)
     payload = {"kind": "msg", "v": 1, "agent": me, "to": recipients}
+    if args.handoff:
+        payload["handoff"] = True
     if args.on is not None:
         payload["on"] = args.on
     else:
         cache.remember_mailboxes(gh.repo, [target])
-    heading = f"**From** `{me}` **to** " + ", ".join(f"`{r}`" for r in recipients)
+    heading = (f"**{'Handoff from' if args.handoff else 'From'}** `{me}` **to** "
+               + ", ".join(f"`{r}`" for r in recipients))
+    # The record first: a wake that fails afterwards loses nothing.
     posted = post_comment(gh, target, f"{heading}\n\n{args.text}", payload)
     cache.invalidate_snapshot(gh.repo)
+    comment_id = posted.get("id")
     print(f"sent to {', '.join(recipients)} on #{target}: {posted.get('html_url')}")
+    if args.handoff and isinstance(comment_id, int):
+        print(f"handoff id {comment_id}: `coord handoff status {comment_id}` shows whether it was taken")
     for line in down_warnings(gh.repo, recipients):
         print(line)
+    if isinstance(comment_id, int):
+        now = snapshot.now_utc()
+        created = posted.get("created_at")
+        sent_at = (created if isinstance(created, str) and len(created) >= 19 else snapshot.iso(now))[11:19] + "Z"
+        where = f"#{args.on}" if args.on is not None else f"mailbox #{target}"
+        text = handoff.wake_text("handoff" if args.handoff else "message", comment_id, me, where, sent_at)
+        for line in handoff.wake_lines(recipients, cache.load_sessions(gh.repo), text, now, render.ago):
+            print(line)
+    return EXIT_OK
+
+
+# MARK: - Session names and handoffs
+
+
+def cmd_session_register(args: argparse.Namespace, gh: GitHub) -> int:
+    """Record this session's harness name against its coord identity, on this machine only:
+    only a session on the same machine can message it, so no GitHub record is written."""
+    error = handoff.session_name_error(args.name)
+    if error:
+        raise UsageError(error)
+    me = identity.agent_id()
+    if not cache.store_session(gh.repo, me, args.name, snapshot.iso(snapshot.now_utc())):
+        print(f"coord: the session registry ({cache.sessions_path(gh.repo)}) is busy or not writable; "
+              "nothing was registered", file=sys.stderr)
+        return EXIT_BACKEND
+    print(f"registered {me} as session `{args.name}` on this machine ({cache.sessions_path(gh.repo)}). "
+          "A sender on this machine can now wake you; run it again if your session name changes.")
+    return EXIT_OK
+
+
+def cmd_session_forget(args: argparse.Namespace, gh: GitHub) -> int:
+    me = args.agent or identity.agent_id()
+    if me not in cache.load_sessions(gh.repo):
+        print(f"{me} has no registered session on this machine")
+        return EXIT_OK
+    if not cache.store_session(gh.repo, me, None, snapshot.iso(snapshot.now_utc())):
+        print("coord: the session registry is busy or not writable; nothing was removed", file=sys.stderr)
+        return EXIT_BACKEND
+    print(f"forgot the session name of {me}")
+    return EXIT_OK
+
+
+def cmd_session_show(args: argparse.Namespace, gh: GitHub) -> int:
+    sessions = cache.load_sessions(gh.repo)
+    address = args.agent
+    agents = sorted(a for a in sessions if address is None or identity.matches(address, a))
+    now = snapshot.now_utc()
+    if args.json:
+        print(json.dumps({"schema": 1, "sessions": [{"agent": a, **sessions[a]} for a in agents]}, indent=2))
+        return EXIT_OK
+    if not agents:
+        print(f"no session on this machine is registered{' for ' + address if address else ''}")
+        return EXIT_OK
+    for agent in agents:
+        print(f"{agent}  session `{sessions[agent]['name']}`  registered {render.ago(sessions[agent].get('at'), now)} ago")
+    print("A name can be stale (the session ended, or another took the name): message it only if it is in "
+          "your ListAgents.")
+    return EXIT_OK
+
+
+def handoff_words(item: Dict[str, Any], now: dt.datetime) -> str:
+    state = (f"taken by {item['acks'][0]['by']} {render.ago(item['acks'][0]['at'], now)} ago"
+             if item["acked"] else "NOT taken")
+    if not item["acked"] and item.get("relayGaveUp"):
+        state += f"; the relay gave up {render.ago(item['relayGaveUp']['at'], now)} ago"
+    return (f"handoff {item['id']} from {item['from']} to {', '.join(item['to'])}, sent "
+            f"{render.ago(item['at'], now)} ago: {state}")
+
+
+def cmd_handoff_status(args: argparse.Namespace, gh: GitHub) -> int:
+    snap = get_snapshot(gh, args.max_age)
+    now = snapshot.now_utc()
+    item = handoff.find(snap, args.id, now)
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "ok" if item else "not_found", "handoff": item,
+                          "generatedAt": snap.get("generatedAt")}, indent=2))
+        return EXIT_OK if item else EXIT_NOT_FOUND
+    if item is None:
+        print(f"coord: no handoff {args.id} on the board of {render.ago(snap.get('generatedAt'), now)} ago "
+              f"(the board holds the last {snapshot.CLAIM_WINDOW_DAYS} days; --max-age 0 reads a fresh one)",
+              file=sys.stderr)
+        return EXIT_NOT_FOUND
+    print(handoff_words(item, now) + f" (board of {render.ago(snap.get('generatedAt'), now)} ago)")
+    print(f"  {item['url']}")
+    for ack in item["acks"][1:]:
+        print(f"  also acknowledged by {ack['by']} {render.ago(ack['at'], now)} ago (the first ack took it)")
+    if not item["acked"]:
+        # A re-wake: stamped with the time it is printed, so the harness does not drop it
+        # as a copy of the last wake for this handoff.
+        where = f"#{item['on']}" if item.get("on") else "the mailbox"
+        text = handoff.wake_text("handoff", item["id"], item["from"], where, snapshot.iso(now)[11:19] + "Z")
+        for line in handoff.wake_lines(item["to"], cache.load_sessions(gh.repo), text, now, render.ago):
+            print(line)
+    return EXIT_OK
+
+
+def parse_age(text: str) -> dt.timedelta:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([mhd])\s*", text or "")
+    if not match:
+        raise ValueError(f"{text!r}: give an age such as 30m, 2h or 1d")
+    return dt.timedelta(seconds=float(match.group(1)) * {"m": 60, "h": 3600, "d": 86400}[match.group(2)])
+
+
+def cmd_handoff_list(args: argparse.Namespace, gh: GitHub) -> int:
+    older = None
+    if args.older_than:
+        try:
+            older = parse_age(args.older_than)
+        except ValueError as error:
+            raise UsageError(str(error)) from None
+    snap = get_snapshot(gh, args.max_age)
+    now = snapshot.now_utc()
+    me = identity.agent_id()
+    items = handoff.handoffs(snap, now)
+    if args.to_me:
+        items = [h for h in items if any(identity.matches(to, me) for to in h["to"])]
+    sender = None if (args.sender == "all" or args.to_me) else (args.sender or me)
+    items = handoff.select(items, sender, args.unacked, older)
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "ok", "generatedAt": snap.get("generatedAt"),
+                          "handoffs": items}, indent=2))
+        return EXIT_OK
+    whose = "to you" if args.to_me else ("from every agent" if sender is None else f"from {sender}")
+    print(f"{len(items)} handoff{'s' if len(items) != 1 else ''} {whose}"
+          + (" not taken" if args.unacked else "") + (f", older than {args.older_than}" if older else "")
+          + f" (board of {render.ago(snap.get('generatedAt'), now)} ago)")
+    for item in items:
+        print("  " + handoff_words(item, now))
+        print(f"    {item['url']}")
+    return EXIT_OK
+
+
+def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
+    """Take a handoff: refuse a duplicate, else post the ack, then show the work.
+
+    Duplicate checks, cheapest first: this machine's record of acks (no call), the cached
+    board (no call), then GitHub (the handoff comment and the comments after it on its
+    issue). Only then is the ack posted. A repeated wake therefore costs at most two
+    reads and never a second piece of work, also after a restart or a compaction.
+    """
+    me = identity.agent_id()
+    local = cache.load_acked(gh.repo).get(str(args.id))
+    if local:
+        return handoff_duplicate(args, local.get("by"), local.get("at"), local.get("url"), "this machine's record")
+    cached = cache.load_snapshot(gh.repo, float("inf"))
+    if cached:
+        item = handoff.find(cached, args.id, snapshot.now_utc())
+        if item and item["acked"]:
+            first = item["acks"][0]
+            cache.remember_acked(gh.repo, args.id, first)
+            return handoff_duplicate(args, first["by"], first["at"], first["url"], "the cached board")
+    comment = gh.rest(f"repos/{{repo}}/issues/comments/{args.id}")
+    payload = marker.decode((comment or {}).get("body"))
+    if not payload or payload.get("kind") != "msg" or payload.get("handoff") is not True:
+        raise UsageError(f"comment {args.id} is not a coord handoff")
+    number = _number_from_url(comment.get("issue_url", ""))
+    if not any(identity.matches(to, me) for to in marker.recipients(payload)) and not args.force:
+        raise UsageError(f"handoff {args.id} is addressed to {', '.join(marker.recipients(payload))}, not {me}; "
+                         "pass --force to take it over (a restarted session can have a new coord id)")
+    created = comment.get("created_at") or snapshot.iso(snapshot.now_utc())
+    later = gh.rest_paginated(f"repos/{{repo}}/issues/{number}/comments?since={created}&per_page=100")
+    taken = handoff.acks([c for c in map(snapshot.coord_comment, later) if c is not None]).get(args.id)
+    if taken:
+        cache.remember_acked(gh.repo, args.id, taken[0])
+        return handoff_duplicate(args, taken[0]["by"], taken[0]["at"], taken[0]["url"], "GitHub")
+    sender = payload.get("agent")
+    ack = {"kind": "msg", "v": 1, "agent": me, "to": [sender], "ack": args.id}
+    if "on" in payload:
+        ack["on"] = number
+    text = f"**Took handoff** {comment.get('html_url')} **from** `{sender}` **as** `{me}`"
+    if args.note:
+        text += "\n\n" + args.note
+    posted = post_comment(gh, number, text, ack)
+    cache.invalidate_snapshot(gh.repo)
+    record = {"id": posted.get("id"), "by": me, "at": posted.get("created_at") or snapshot.iso(snapshot.now_utc()),
+              "url": posted.get("html_url")}
+    cache.remember_acked(gh.repo, args.id, record)
+    body = marker.strip(comment.get("body") or "")
+    if body.startswith("**Handoff from** `") and "\n" in body:
+        body = body.split("\n", 1)[1].strip()
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "taken", "handoff": args.id, "from": sender, "on": number,
+                          "ack": record, "text": body, "url": comment.get("html_url")}, indent=2))
+        return EXIT_OK
+    print(f"took handoff {args.id} from {sender} (ack: {posted.get('html_url')}). The work:")
+    print("  " + body.replace("\n", "\n  "))
+    print(f"  {comment.get('html_url')}")
+    return EXIT_OK
+
+
+def cmd_handoff_watch(args: argparse.Namespace, gh: GitHub) -> int:
+    """One relay pass (relay.py): wake registered local sessions for handoffs nobody took.
+    Meant for a scheduler; it reads the board (cached up to --max-age) and nothing else."""
+    snap = get_snapshot(gh, args.max_age)
+    if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
+        print("coord: the board is stale (budget low or no app token); not relaying this pass", file=sys.stderr)
+        return EXIT_OK
+    watcher = relay.Watcher(gh, lambda number, text, payload: post_comment(gh, number, text, payload))
+    lines = watcher.run(snap, dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "ok", "stateDir": watcher.dir, "lines": lines}, indent=2))
+    else:
+        for line in lines:
+            print(line)
+    return EXIT_OK
+
+
+def handoff_duplicate(args: argparse.Namespace, by: Any, at: Any, url: Any, source: str) -> int:
+    now = snapshot.now_utc()
+    if args.json:
+        print(json.dumps({"schema": 1, "status": "duplicate", "handoff": args.id, "takenBy": by, "takenAt": at,
+                          "ack": url, "source": source}, indent=2))
+        return EXIT_OK
+    print(f"handoff {args.id} was already taken by {by} {render.ago(at, now)} ago ({source}): "
+          "this wake is a duplicate; do no new work for it")
+    if url:
+        print(f"  {url}")
     return EXIT_OK
 
 
@@ -603,9 +830,17 @@ def inbox_items(
             "path": comment.get("path"),
             "url": comment.get("html_url"),
             "text": marker.strip(comment.get("body") or ""),
+            "handoff": bool(payload is not None and payload.get("kind") == "msg" and payload.get("handoff") is True),
         })
     items.sort(key=lambda item: item["at"])
     return items
+
+
+def open_handoffs(snap: Dict[str, Any], me: str, issue_comments: List[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
+    """Handoffs to `me` nobody has taken: from the board, less any ack in comments read
+    since it was built. Shown at every inbox read until taken, whatever the cursor."""
+    fresh = handoff.acks([c for c in map(snapshot.coord_comment, issue_comments) if c is not None])
+    return [h for h in handoff.open_for(snap, me, snapshot.now_utc()) if h["id"] not in fresh]
 
 
 def cmd_inbox(args: argparse.Namespace, gh: GitHub) -> int:
@@ -627,11 +862,25 @@ def inbox_from_snapshot(args: argparse.Namespace, gh: GitHub, me: str,
         print(json.dumps({"schema": 1, "status": "stale", "me": me, "items": None,
                           "unreadDirectMessages": unread, "markedRead": False,
                           "generatedAt": snap.get("generatedAt"), "stale": snap.get("stale"),
+                          "openHandoffs": open_handoffs(snap, me),
                           "reason": getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None)}, indent=2))
         return EXIT_OK
     print(f"inbox for {me}: {unread} new in that snapshot; run `coord inbox` {after} to read them "
           "(nothing was marked read)")
+    print_open_handoffs(open_handoffs(snap, me), set())
     return EXIT_OK
+
+
+def print_open_handoffs(pending: List[Dict[str, Any]], shown: set) -> None:
+    rest = [h for h in pending if h["id"] not in shown]
+    if not rest:
+        return
+    now = snapshot.now_utc()
+    print(f"\nOPEN HANDOFFS for you: {len(rest)} nobody has taken (listed at every read until taken)")
+    for item in rest:
+        print(f"  handoff {item['id']} from {item['from']}, sent {render.ago(item['at'], now)} ago: "
+              f"`coord handoff take {item['id']}`")
+        print(f"    {item['url']}")
 
 
 def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
@@ -662,20 +911,24 @@ def inbox_read(args: argparse.Namespace, gh: GitHub, me: str) -> int:
         print(f"coord: {gh.budget_low}; counting from the cached snapshot", file=sys.stderr)
         return inbox_from_snapshot(args, gh, me, snap)
     items = inbox_items(issue_comments, review_comments, snap, me, since, identity.git_branch(), seen_ids)
+    pending = open_handoffs(snap, me, issue_comments)
     if args.json:
         print(json.dumps({"schema": 1, "status": "ok", "me": me,
-                          "since": snapshot.iso(since), "items": items}, indent=2))
+                          "since": snapshot.iso(since), "items": items, "openHandoffs": pending}, indent=2))
     else:
         print(f"inbox for {me} since {snapshot.iso(since)}: {len(items)} item" + ("s" if len(items) != 1 else ""))
         for item in items:
             where = f"#{item['on']}" + (f" {item['path']}" if item.get("path") else "")
             print(f"\n[{item['at']}] {item['from']} · {item['kind']} {where} · {item['reason']}")
             text = item["text"]
-            if text.startswith("**From** `"):  # the heading `send` writes for humans on GitHub
+            if text.startswith(("**From** `", "**Handoff from** `")):  # the heading `send` writes for humans on GitHub
                 text = text.split("\n", 1)[1].strip() if "\n" in text else ""
             text = text if args.full else render._clip(text, 400)
             print("  " + text.replace("\n", "\n  "))
             print(f"  {item['url']}")
+            if item.get("handoff"):
+                print(f"  a handoff: take it with `coord handoff take {item['id']}` (it says so if it was already taken)")
+        print_open_handoffs(pending, {item["id"] for item in items if item.get("handoff")})
     cache.remember_mailboxes(gh.repo, sorted(mailbox_numbers(
         [{"on": _number_from_url(c.get("issue_url", "")), "payload": marker.decode(c.get("body")),
           "author": snapshot.comment_author(c)} for c in issue_comments], gh.repo)))
@@ -1309,7 +1562,51 @@ def parser() -> argparse.ArgumentParser:
                       help="an agent id, a prefix ending in * (codex@*), or all; repeatable")
     send.add_argument("--on", type=positive_number, metavar="NUMBER",
                       help="post on this issue or PR (default: the mailbox issue)")
+    send.add_argument("--handoff", action="store_true",
+                      help="hand work over: the recipient takes it with `coord handoff take <id>`, which acknowledges it; "
+                           "coord prints how to wake the recipient's session")
     send.set_defaults(func=cmd_send)
+
+    session = sub.add_parser("session", help="this machine's registry of harness session names, so a handoff can wake a session")
+    session_sub = session.add_subparsers(dest="session_command", required=True)
+    register = session_sub.add_parser("register", help="record this session's name (from ListAgents: \"This session is <name>\")")
+    register.add_argument("name")
+    register.set_defaults(func=cmd_session_register)
+    show = session_sub.add_parser("show", help="registered session names on this machine")
+    show.add_argument("agent", nargs="?", help="an agent id or a prefix ending in *")
+    show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_session_show)
+    forget = session_sub.add_parser("forget", help="remove a registered session name (default: this session's)")
+    forget.add_argument("agent", nargs="?")
+    forget.set_defaults(func=cmd_session_forget)
+
+    handoff_parser = sub.add_parser("handoff", help="take a handoff, or see whether one was taken")
+    handoff_sub = handoff_parser.add_subparsers(dest="handoff_command", required=True)
+    take = handoff_sub.add_parser("take", help="acknowledge a handoff and show its work; says so if it was already taken")
+    take.add_argument("id", type=positive_number, help="the handoff id (its comment id)")
+    take.add_argument("--note")
+    take.add_argument("--force", action="store_true", help="take a handoff addressed to another coord id")
+    take.add_argument("--json", action="store_true")
+    take.set_defaults(func=cmd_handoff_take)
+    hstatus = handoff_sub.add_parser("status", help="whether a handoff was taken, from the board")
+    hstatus.add_argument("id", type=positive_number)
+    hstatus.add_argument("--json", action="store_true")
+    hstatus.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
+    hstatus.set_defaults(func=cmd_handoff_status)
+    hlist = handoff_sub.add_parser("list", help="handoffs on the board (default: the ones you sent)")
+    hlist.add_argument("--from", dest="sender", metavar="AGENT", help="a sender's id, or all (default: you)")
+    hlist.add_argument("--to-me", action="store_true", help="handoffs addressed to you instead")
+    hlist.add_argument("--unacked", action="store_true", help="only handoffs nobody has taken")
+    hlist.add_argument("--older-than", metavar="AGE", help="only handoffs at least this old: 30m, 2h, 1d")
+    hlist.add_argument("--json", action="store_true")
+    hlist.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE)
+    hlist.set_defaults(func=cmd_handoff_list)
+    watch = handoff_sub.add_parser("watch", help="one relay pass: wake registered sessions on this machine for "
+                                   "handoffs nobody took (run it from a scheduler)")
+    watch.add_argument("--dry-run", action="store_true", help="say what would be relayed; run nothing, write nothing")
+    watch.add_argument("--json", action="store_true")
+    watch.add_argument("--max-age", type=float, default=300.0, help="reuse a cached board up to this many seconds old")
+    watch.set_defaults(func=cmd_handoff_watch)
 
     inbox = sub.add_parser("inbox", help="messages to you and comments on the work you claim")
     inbox.add_argument("--json", action="store_true")

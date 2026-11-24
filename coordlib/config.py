@@ -33,6 +33,7 @@ DEFAULTS = {
     "lane_classifier": None,         # {"script": ..., "rules": ...} or None
     "runner_variables": [],          # repo variables the conductor may set
     "runner_control_variable": None,
+    "relay_command": [],             # handoff relay argv with a "{prompt}" item; [] = the default (relay.py)
     "conductor": {
         "agent_file": None,          # path to the conductor prompt
         "instructions_file": None,   # e.g. "CLAUDE.md"

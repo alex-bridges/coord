@@ -245,6 +245,58 @@ def _cache_lock(repo: str, name: str, timeout_seconds: float) -> Iterator[bool]:
             os.close(fd)
 
 
+def sessions_path(repo: str) -> str:
+    return os.path.join(cache_dir(repo), "sessions.json")
+
+
+def load_sessions(repo: str) -> Dict[str, Dict[str, Any]]:
+    """coord identity -> {"name", "at"}: the harness session name each local session
+    registered for itself. Only names: a sender messages the name and its harness
+    resolves it, so nothing here is ever used as a session id."""
+    data = _read(sessions_path(repo))
+    agents = data.get("agents") if isinstance(data, dict) and data.get("version") == 1 else None
+    if not isinstance(agents, dict):
+        return {}
+    return {agent: {"name": entry["name"], "at": _timestamp(entry.get("at"))}
+            for agent, entry in agents.items()
+            if isinstance(agent, str) and isinstance(entry, dict) and isinstance(entry.get("name"), str)}
+
+
+def store_session(repo: str, agent: str, name: Optional[str], at: str) -> bool:
+    """Register (or with name None, forget) `agent`'s session name. False when the lock
+    could not be had, so the caller can say the registry was not changed."""
+    with _cache_lock(repo, "sessions.lock", 5.0) as acquired:
+        if not acquired:
+            return False
+        agents = load_sessions(repo)
+        if name is None:
+            agents.pop(agent, None)
+        else:
+            agents[agent] = {"name": name, "at": at}
+        _write(sessions_path(repo), {"version": 1, "agents": agents})
+        return load_sessions(repo).get(agent, {}).get("name") == name
+
+
+def acked_path(repo: str) -> str:
+    return os.path.join(cache_dir(repo), "acked.json")
+
+
+def load_acked(repo: str) -> Dict[str, Dict[str, Any]]:
+    """Handoff id (as a string) -> the ack this machine posted or saw. Only positives are
+    kept, and an ack is never withdrawn, so a hit is always true; a miss means "ask GitHub"."""
+    data = _read(acked_path(repo))
+    handoffs = data.get("handoffs") if isinstance(data, dict) and data.get("version") == 1 else None
+    return {k: v for k, v in handoffs.items() if isinstance(v, dict)} if isinstance(handoffs, dict) else {}
+
+
+def remember_acked(repo: str, handoff_id: int, record: Dict[str, Any]) -> None:
+    with _cache_lock(repo, "acked.lock", 5.0) as acquired:
+        if acquired:
+            handoffs = load_acked(repo)
+            handoffs.setdefault(str(handoff_id), record)
+            _write(acked_path(repo), {"version": 1, "handoffs": handoffs})
+
+
 def _cursor_path(repo: str, agent: str) -> str:
     """Readable prefix plus a digest of the FULL id: `a+b` and `a_b` both read `a_b`, and
     two agents sharing a cursor would mark each other's messages read (Codex on #989)."""
