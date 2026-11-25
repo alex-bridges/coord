@@ -261,7 +261,8 @@ def board(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, budge
 
 
 def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit: int = 6,
-          budget: Optional[str] = None) -> str:
+          budget: Optional[str] = None, handoffs: Optional[List[Dict[str, Any]]] = None,
+          register_hint: bool = False) -> str:
     """At most ~10 lines, for a session-start hook."""
     now = review.parse_time(snapshot["generatedAt"]) or dt.datetime.now(dt.timezone.utc)
     runs = snapshot["runs"]
@@ -278,6 +279,8 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
         parts.append(f"conductor {conductor_state(snapshot, now)}")
     if unread:
         parts.append(f"{unread} new message" + ("s" if unread != 1 else "") + " for you")
+    if handoffs:
+        parts.append(f"{len(handoffs)} open handoff" + ("s" if len(handoffs) != 1 else "") + " for you")
     if budget:
         parts.append(budget)
     lines = [f"coord ({me}): " + ", ".join(parts)]
@@ -295,5 +298,12 @@ def brief(snapshot: Dict[str, Any], me: str, unread: Optional[int] = None, limit
     for claim in open_claims[: max(0, limit - len(snapshot["prs"]))]:
         lines.append(f"  claim #{claim['issue']} {_brief_identity(claim['branch'])} "
                      f"[{_brief_identity(claim['agent'], agent=True)}]" + (" stale" if claim["stale"] else ""))
+    for item in (handoffs or [])[:3]:
+        # Ids and the sender only: a handoff's text never enters the startup context.
+        lines.append(f"  handoff {int(item['id'])} from [{_brief_identity(item.get('from'), agent=True)}] waiting for you: "
+                     f"coord handoff take {int(item['id'])}")
+    if register_hint:
+        lines.append("  wake: run `coord session register <name>` with the name ListAgents gives this session, "
+                     "so a handoff can wake it")
     lines.append("  details: coord board · messages: coord inbox")
     return "\n".join(lines) + "\n"

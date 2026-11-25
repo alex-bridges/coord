@@ -68,6 +68,20 @@ def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
                          "codexCloud": "not probed",
                          "nativeWindows": "supported (DPAPI key store, Task Scheduler installer, Job Object isolation)"},
     }
+    local_app = ((getattr(mode, "config", None) or {}).get("app_login") or "") if mode else ""
+    result["warnings"] = []
+    trusted_apps: Any = None
+    if local_app:  # only app mode reads the repository's trust settings
+        try:
+            trusted_apps = sorted(snapshot.trusted_app_logins())
+        except Exception as error:  # noqa: BLE001 - a preflight reports, it does not fail
+            result["warnings"].append(f"could not read the repository's trusted app logins: {redact(str(error))}")
+    result["appLogin"] = {"local": local_app or None, "trusted": trusted_apps}
+    if local_app and trusted_apps is not None and local_app not in trusted_apps:
+        result["warnings"].append(
+            f"this machine posts as {local_app} in app mode, but the repository trusts "
+            + (", ".join(trusted_apps) if trusted_apps else "no app login")
+            + f": set \"coord_app_login\": \"{local_app}\" in .coord/config.json, or its handoffs and acks will not count")
     if online:
         gh.rest("repos/{repo}")
         principal = gh.principal()
@@ -94,5 +108,6 @@ def render(report: Dict[str, Any]) -> str:
         "writes: not probed",
         "cache: " + (f"generated {cached['generatedAt']}, age {cached['ageSeconds']}s" if cached["present"] else "none"),
         *([f"problem: {auth['problem']}"] if auth["problem"] else []),
+        *(f"warning: {warning}" for warning in report.get("warnings") or []),
         "Codex cloud: not probed; native Windows: supported",
     ]) + "\n"

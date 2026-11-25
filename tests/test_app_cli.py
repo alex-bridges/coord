@@ -177,8 +177,10 @@ class RoutingTests(AppCliTestCase):
                  ["train", "substitute-review", "7", "--head", "a" * 40, "--note", "n"], ["train", "step"], ["outage", "start", "claude"], ["outage", "end", "claude"],
                  ["conductor", "tick"], ["conductor", "status"], ["conductor", "diagnose"], ["conductor", "pause", "--for", "1h"],
                  ["conductor", "resume"], ["conductor", "escalate", "x"],
-                 ["token", "status"], ["token", "exec", "--", "true"], ["token", "import-key", "x.pem"]]
-        self.assertEqual({tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
+                 ["token", "status"], ["token", "exec", "--", "true"], ["token", "import-key", "x.pem"],
+                 ["session", "register", "s"], ["session", "show"], ["session", "forget"],
+                 ["handoff", "take", "9"], ["handoff", "status", "9"], ["handoff", "list"], ["handoff", "watch", "--dry-run"]]
+        self.assertEqual({tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token", "session", "handoff") else (argv[0],)
                           for argv in argvs}, parser_commands(), "every subcommand is decided here")
         for argv in argvs:
             args = cli.parser().parse_args(argv)
@@ -941,11 +943,14 @@ class NoLeakTests(AppCliTestCase):
             ["conductor", "pause", "--for", "1h"], ["conductor", "resume"], ["conductor", "escalate", "look"],
             ["token", "status"], ["token", "exec", "--", "true"], ["token", "exec", "--kind", "ops", "--", "true"],
             ["token", "import-key", os.path.join(self.root, "missing.pem")],
+            ["session", "register", "worker-a"], ["session", "show"], ["session", "forget"],
+            ["handoff", "take", "101"], ["handoff", "status", "101"], ["handoff", "list", "--from", "all", "--unacked"],
+            ["handoff", "watch", "--dry-run"],
         ]
 
     def test_no_subcommand_prints_a_secret(self):
-        commands = {tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token") else (argv[0],)
-                    for argv in self.argvs()}
+        commands = {tuple(argv[:2]) if argv[0] in ("train", "outage", "conductor", "token", "session", "handoff")
+                    else (argv[0],) for argv in self.argvs()}
         for scenario in ("minting", "cached", "mint refused", "keychain fails"):
             self.diagnosis_fails = scenario in ("mint refused", "keychain fails")
             self.server.mint_status = None

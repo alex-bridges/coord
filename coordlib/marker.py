@@ -80,6 +80,8 @@ _FIELDS: Dict[str, Callable[[Any], bool]] = {
     "verdict": _nonempty_text, "model": _text, "revokes": _text,
     "countsForTrain": lambda value: type(value) is bool,
     "reviewRuns": _texts, "handoffKeys": _texts,
+    # A `send --handoff` message, and the ack message that takes it (the handoff's comment id).
+    "handoff": lambda value: type(value) is bool, "ack": _positive_int, "relayGaveUp": _positive_int,
 }
 _REQUIRED = {
     "claim": ("issue",), "release": ("issue",), "msg": ("to",),
