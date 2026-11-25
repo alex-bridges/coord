@@ -1045,12 +1045,30 @@ def sidechain_login() -> str:
     return config.get("reviewer_bot_login") or NO_SIDECHAIN_LOGIN
 
 
+def configured_app_logins() -> List[str]:
+    """The app logins the repository names (config `coord_app_login`, `reviewer_bot_login`),
+    as written."""
+    return [login for login in (config.get("coord_app_login"), config.get("reviewer_bot_login")) if login]
+
+
+def is_bot_login(login: Any) -> bool:
+    """A GitHub App's login: "<slug>[bot]". No user account can have that name."""
+    return isinstance(login, str) and len(login) > len("[bot]") and login.lower().endswith("[bot]")
+
+
 def trusted_app_logins() -> FrozenSet[str]:
-    """App logins whose coord records count (handoffs, acks, give-ups, mailbox posts): the
-    app coord itself posts as in app mode (config `coord_app_login`) and the reviewer app
-    (`reviewer_bot_login`). Repository settings, so every reader agrees, with or without
-    an app config of its own."""
-    return frozenset(login for login in (config.get("coord_app_login"), config.get("reviewer_bot_login")) if login)
+    """App logins whose coord records count (handoffs, acks, give-ups, mailbox posts), lower
+    case: the app coord itself posts as in app mode (config `coord_app_login`) and the
+    reviewer app (`reviewer_bot_login`). Repository settings, so every reader agrees, with or
+    without an app config of its own. A value without the [bot] suffix trusts nobody: it
+    would otherwise name a user account anyone could register (`coord doctor` warns)."""
+    return frozenset(login.lower() for login in configured_app_logins() if is_bot_login(login))
+
+
+def trusted_app_author(author: Optional[Dict[str, Any]]) -> bool:
+    """Whether `author` is one of the trusted app logins (compared without case)."""
+    login = str((author or {}).get("login") or "")
+    return is_bot_login(login) and login.lower() in trusted_app_logins()
 
 
 def __getattr__(name: str) -> Any:

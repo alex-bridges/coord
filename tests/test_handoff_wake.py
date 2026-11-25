@@ -223,7 +223,7 @@ class TakeTests(HandoffTestCase):
         self.assertEqual(code, EXIT_OK)
         self.assertIn("already yours", out)
         self.assertIn("do not start it twice", out)
-        self.assertEqual([m for m, _ in self.api.calls], ["GET"])  # the handoff's text; no ack, no ack read
+        self.assertEqual([m for m, _ in self.api.calls], ["GET", "GET"])  # the handoff, then its acks; no new ack
 
     def test_a_repeated_wake_for_another_taker_is_a_duplicate_and_costs_no_call(self):
         handoff_id, _ = self.hand_off()

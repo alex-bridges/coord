@@ -51,7 +51,7 @@ def trusted(message: Dict[str, Any], repo: Optional[str]) -> bool:
     author = message.get("author") or {}
     if not repo:
         return False
-    return snapshot.trusted_attestation(author, repo) or author.get("login") in snapshot.trusted_app_logins()
+    return snapshot.trusted_attestation(author, repo) or snapshot.trusted_app_author(author)
 
 
 def agent_words(agent: Any) -> Optional[str]:

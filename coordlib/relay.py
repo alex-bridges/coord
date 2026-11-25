@@ -190,6 +190,8 @@ def stop_kills(runner: Any):
 
     stops = [signal.SIGTERM, signal.SIGINT] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
     for signum in stops:
+        if signal.getsignal(signum) == signal.SIG_IGN:
+            continue  # inherited "ignore" (nohup, a background job): leave it, and the relay, alone
         previous[signum] = signal.signal(signum, handler)
     try:
         yield
