@@ -698,6 +698,22 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     created = comment.get("created_at") or snapshot.iso(snapshot.now_utc())
     sender = payload.get("agent")
     if local:
+        # Our own record, but a racer may have acked first and we never saw it (our re-read
+        # failed, or we were stopped before it). Ask GitHub once more; if it cannot answer,
+        # the record stands.
+        try:
+            acks = handoff_acks(gh, number, args.id, created)
+        except GitHubError as error:
+            print(f"coord: could not check the acks on GitHub ({redact(str(error))[:160]}); "
+                  "going by this machine's record", file=sys.stderr)
+            acks = []
+        mine = local.get("id") if isinstance(local.get("id"), int) else None
+        earlier = [a for a in acks if a.get("by") != me and isinstance(a.get("id"), int)
+                   and (mine is None or a["id"] < mine)]
+        if earlier:
+            cache.replace_acked(gh.repo, args.id, earlier[0])
+            return handoff_duplicate(args, earlier[0].get("by"), earlier[0].get("at"), earlier[0].get("url"),
+                                     "GitHub: an earlier ack than this machine's record")
         return handoff_work(args, comment, sender, number, local, "already yours (this machine's record)")
     taken = handoff_acks(gh, number, args.id, created)
     if taken:
@@ -715,15 +731,16 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     cache.invalidate_snapshot(gh.repo)
     record = {"id": posted.get("id"), "by": me, "at": posted.get("created_at") or snapshot.iso(snapshot.now_utc()),
               "url": posted.get("html_url")}
-    cache.remember_acked(gh.repo, args.id, record)  # before the re-read: a failure after this keeps it ours
+    cache.replace_acked(gh.repo, args.id, record)  # before the re-read: a failure after this keeps it ours
     # Read again: another taker may have posted between our check and our ack. Only an
     # ack with a smaller id than ours, by someone else, took the handoff first.
     try:
         after = handoff_acks(gh, number, args.id, created)
     except GitHubError as error:
-        print(f"coord: could not read the acks again ({redact(str(error))[:160]}); no earlier ack was seen, "
-              "so the handoff is yours", file=sys.stderr)
-        after = []
+        print(f"coord: could not read the acks again ({redact(str(error))[:160]}): the handoff is yours but "
+              f"UNCONFIRMED. Run `coord handoff take {args.id}` again before starting; it checks GitHub for an "
+              "earlier ack", file=sys.stderr)
+        return handoff_work(args, comment, sender, number, record, "unconfirmed")
     mine = record.get("id") if isinstance(record.get("id"), int) else None
     earlier = [a for a in after if isinstance(a.get("id"), int) and mine is not None and a["id"] < mine
                and a.get("by") != me]
@@ -741,15 +758,20 @@ def handoff_work(args: argparse.Namespace, comment: Dict[str, Any], sender: Any,
     if body.startswith("**Handoff from** `") and "\n" in body:
         body = body.split("\n", 1)[1].strip()
     if args.json:
-        print(json.dumps({"schema": 1, "status": "taken" if how == "taken" else "mine", "handoff": args.id,
+        status = {"taken": "taken", "unconfirmed": "unconfirmed"}.get(how, "mine")
+        print(json.dumps({"schema": 1, "status": status, "handoff": args.id,
                           "from": sender, "on": number, "ack": record, "text": body, "url": comment.get("html_url")},
                          indent=2))
         return EXIT_OK
     if how == "taken":
         print(f"took handoff {args.id} from {sender} (ack: {record.get('url')}). The work:")
+    elif how == "unconfirmed":
+        print(f"took handoff {args.id} from {sender} (ack: {record.get('url')}), UNCONFIRMED: the check for an "
+              f"earlier ack failed. Run `coord handoff take {args.id}` again before you start. The work:")
     else:
         print(f"handoff {args.id} from {sender} is {how}: you took it at {record.get('at')} ({record.get('url')}). "
-              "If you have started it, carry on; do not start it twice. The work:")
+              "If you have finished it, there is nothing to do; if you have started it, carry on; do not start it "
+              "twice. The work:")
     print("  " + body.replace("\n", "\n  "))
     print(f"  {comment.get('html_url')}")
     return EXIT_OK
@@ -825,7 +847,7 @@ def mailbox_numbers(messages: List[Dict[str, Any]], repo: str) -> set:
     return {m.get("on") for m in messages if isinstance(m.get("on"), int)
             and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})
             and (snapshot.trusted_attestation(m.get("author"), repo)
-                 or (m.get("author") or {}).get("login") in snapshot.trusted_app_logins())}
+                 or snapshot.trusted_app_author(m.get("author")))}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:

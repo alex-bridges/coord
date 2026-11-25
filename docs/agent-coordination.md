@@ -495,10 +495,12 @@ starts its next turn. A handoff adds that start. It has four parts.
    this machine's record of acks, the cached board and GitHub. If anyone has already
    taken the handoff, it says so and you do no new work. Otherwise it posts the ack, records it
    on this machine, and reads the acks once more: it stands down only when another
-   agent's ack has a smaller id than its own. If that read fails, no earlier ack was
-   seen, and the handoff is its own. A `take` whose earliest ack is its own (a repeated
-   wake, or a retry after an ack whose response was lost) prints the work again, marked
-   as already taken by you, and posts nothing. So a repeated wake costs one read and no
+   agent's ack has a smaller id than its own. If that read fails, the handoff is its own but
+   UNCONFIRMED: run `take` again before starting, and it checks GitHub. A `take` that
+   finds its own ack (on this machine or as the earliest on GitHub: a repeated wake, or a
+   retry after an ack whose response was lost) first asks GitHub whether another agent
+   acked earlier; if so it stands down, otherwise it prints the work again, marked as
+   already yours (if you have finished it, there is nothing to do), and posts nothing. So a repeated wake costs one read and no
    duplicate work. That holds after a restart or a compaction too, because GitHub decides.
    `take` refuses a handoff addressed to another coord id (`--force` overrides that
    deliberately; a restarted session can have a new id).
@@ -514,7 +516,10 @@ repository anyone can post one. Handoff, ack and give-up records therefore count
 when GitHub shows them posted by the trusted user login (`owner_login`) or a configured
 app login (`coord_app_login`, the app coord posts as in app mode, and
 `reviewer_bot_login`), the same rule as the mailbox. These are repository settings, so
-every reader agrees whether or not it has an app config of its own. That holds on the board,
+every reader agrees whether or not it has an app config of its own. App logins are
+compared without case and count only with the `[bot]` suffix, which no user account can
+have; a value without it trusts nobody, and `coord doctor` says so. In app mode `doctor`
+also notes an app config without `app_login`. That holds on the board,
 in `inbox`, and in `take`'s own read from GitHub. A wake line prints the sender only when
 it is a well-formed agent id.
 
@@ -586,7 +591,8 @@ recorded on this machine (`acked.json`) also stops the relay at once. `--dry-run
 lock, writes no relay state, and says what a real pass would set aside or drop; reading the
 board may refresh coord's shared board cache, as any board read does. With no session registered on the machine, a pass stops before
 reading the board. SIGTERM, SIGINT or (POSIX) SIGHUP to the watcher kills a running relay's
-process group first. Registry names are checked on every read, so a session id or a
+process group first; a signal the watcher inherited as ignored (`nohup`, a background job)
+stays ignored. Registry names are checked on every read, so a session id or a
 malformed name in `sessions.json` reaches no wake line and no relay.
 
 ## Session start

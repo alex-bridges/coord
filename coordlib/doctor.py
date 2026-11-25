@@ -69,15 +69,25 @@ def inspect(gh: GitHub, online: bool = False) -> Dict[str, Any]:
                          "nativeWindows": "supported (DPAPI key store, Task Scheduler installer, Job Object isolation)"},
     }
     local_app = ((getattr(mode, "config", None) or {}).get("app_login") or "") if mode else ""
+    app_mode = bool(local_app) or bool(getattr(mode, "on", False)) or getattr(gh, "app", None) is not None
     result["warnings"] = []
     trusted_apps: Any = None
-    if local_app:  # only app mode reads the repository's trust settings
+    if app_mode:  # only app mode reads the repository's trust settings
         try:
             trusted_apps = sorted(snapshot.trusted_app_logins())
+            for login in snapshot.configured_app_logins():
+                if not snapshot.is_bot_login(login):
+                    result["warnings"].append(
+                        f"the repository names the app login {login!r} without the [bot] suffix; it trusts nobody. "
+                        f"Write the app's login as GitHub shows it, e.g. \"{login}[bot]\"")
         except Exception as error:  # noqa: BLE001 - a preflight reports, it does not fail
             result["warnings"].append(f"could not read the repository's trusted app logins: {redact(str(error))}")
+        if not local_app:
+            result["warnings"].append(
+                "app mode is on, but the app config has no app_login: add it (the app's login, e.g. "
+                "\"my-coord-app[bot]\") so doctor can check that the repository trusts what this machine posts")
     result["appLogin"] = {"local": local_app or None, "trusted": trusted_apps}
-    if local_app and trusted_apps is not None and local_app not in trusted_apps:
+    if local_app and trusted_apps is not None and local_app.lower() not in trusted_apps:
         result["warnings"].append(
             f"this machine posts as {local_app} in app mode, but the repository trusts "
             + (", ".join(trusted_apps) if trusted_apps else "no app login")
