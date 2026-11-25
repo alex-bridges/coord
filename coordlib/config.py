@@ -33,6 +33,7 @@ DEFAULTS = {
     "lane_classifier": None,         # {"script": ..., "rules": ...} or None
     "runner_variables": [],          # repo variables the conductor may set
     "runner_control_variable": None,
+    "coord_app_login": None,         # the GitHub App coord posts as in app mode (e.g. "my-coord-app[bot]")
     "relay_command": [],             # handoff relay argv with a "{prompt}" item; [] = the default (relay.py)
     "conductor": {
         "agent_file": None,          # path to the conductor prompt

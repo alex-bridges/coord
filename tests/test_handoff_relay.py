@@ -223,7 +223,8 @@ class InjectionTests(RelayTestCase):
                 handoff_id, _ = self.hand_off()
                 lines = self.watch()
                 self.assertEqual(self.fake.calls, [])
-                self.assertIn("session name does not match", "\n".join(lines))
+                self.assertEqual(cache.load_sessions("o/r"), {})  # every reader drops the bad name
+                self.assertEqual([c for c in self.api.comments if "relayGaveUp" in c["body"]], [])
 
     def test_identifiers_that_fail_their_pattern(self):
         good = relay.prompt(12, 34, "worker-a")

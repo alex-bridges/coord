@@ -249,6 +249,21 @@ def sessions_path(repo: str) -> str:
     return os.path.join(cache_dir(repo), "sessions.json")
 
 
+_SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+_SESSION_ID = re.compile(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}")
+
+
+def session_name_error(name: Any) -> Optional[str]:
+    """Why `name` is not a harness session name, or None. One rule for registration, for
+    every reader of the registry, and for the relay."""
+    if not isinstance(name, str) or not _SESSION_NAME.fullmatch(name):
+        return ("a session name is the name ListAgents prints after \"This session is\" "
+                "(letters, digits, '.', '_', '-'; at most 64)")
+    if _SESSION_ID.fullmatch(name):
+        return "that is a session id, not a session name: register the name ListAgents prints"
+    return None
+
+
 def load_sessions(repo: str) -> Dict[str, Dict[str, Any]]:
     """coord identity -> {"name", "at"}: the harness session name each local session
     registered for itself. Only names: a sender messages the name and its harness
@@ -259,7 +274,7 @@ def load_sessions(repo: str) -> Dict[str, Dict[str, Any]]:
         return {}
     return {agent: {"name": entry["name"], "at": _timestamp(entry.get("at"))}
             for agent, entry in agents.items()
-            if isinstance(agent, str) and isinstance(entry, dict) and isinstance(entry.get("name"), str)}
+            if isinstance(agent, str) and isinstance(entry, dict) and session_name_error(entry.get("name")) is None}
 
 
 def store_session(repo: str, agent: str, name: Optional[str], at: str) -> bool:
@@ -294,6 +309,15 @@ def remember_acked(repo: str, handoff_id: int, record: Dict[str, Any]) -> None:
         if acquired:
             handoffs = load_acked(repo)
             handoffs.setdefault(str(handoff_id), record)
+            _write(acked_path(repo), {"version": 1, "handoffs": handoffs})
+
+
+def replace_acked(repo: str, handoff_id: int, record: Dict[str, Any]) -> None:
+    """Overwrite this machine's record of who took a handoff (a taker that stood down)."""
+    with _cache_lock(repo, "acked.lock", 5.0) as acquired:
+        if acquired:
+            handoffs = load_acked(repo)
+            handoffs[str(handoff_id)] = record
             _write(acked_path(repo), {"version": 1, "handoffs": handoffs})
 
 

@@ -23,6 +23,7 @@ missing key stops with a message naming it.
 | `needs_owner_label` | `needs-owner` | label that holds a carve-out PR until the owner approves its head |
 | `owner_approved_label` | `owner-approved` | label applied when `coord train approve` records owner approval |
 | `reviewer_bot_login` | none: reviewer disabled | the reviewer app's login, e.g. `my-bot[bot]` |
+| `coord_app_login` | none | the GitHub App coord itself posts as in app mode (its `app_login`, e.g. `my-coord-app[bot]`); its handoff, ack, give-up and mailbox records count. `coord doctor` warns when this machine's app posts as another login |
 | `reviewer_trigger` | none | the PR comment that requests a review, e.g. `@my-bot review` |
 | `ci_workflow` | none: train disabled | the CI workflow file the train dispatches and reads |
 | `train_workflow` | none: train disabled | the workflow that runs `coord train step` |
@@ -492,9 +493,12 @@ starts its next turn. A handoff adds that start. It has four parts.
    that has ended fails at once, so you know.
 3. **Taking it.** The recipient runs `coord handoff take <id>`. It checks, in this order,
    this machine's record of acks, the cached board and GitHub. If anyone has already
-   taken the handoff, it says so and you do no new work. Otherwise it posts the ack, reads
-   the acks once more, and prints the work only if its ack is the earliest; when two
-   takers raced, the later one stands down. So a repeated wake costs one read and no
+   taken the handoff, it says so and you do no new work. Otherwise it posts the ack, records it
+   on this machine, and reads the acks once more: it stands down only when another
+   agent's ack has a smaller id than its own. If that read fails, no earlier ack was
+   seen, and the handoff is its own. A `take` whose earliest ack is its own (a repeated
+   wake, or a retry after an ack whose response was lost) prints the work again, marked
+   as already taken by you, and posts nothing. So a repeated wake costs one read and no
    duplicate work. That holds after a restart or a compaction too, because GitHub decides.
    `take` refuses a handoff addressed to another coord id (`--force` overrides that
    deliberately; a restarted session can have a new id).
@@ -507,8 +511,10 @@ starts its next turn. A handoff adds that start. It has four parts.
 
 **Whose records count.** A marker's `agent` field is self-declared, and on a public
 repository anyone can post one. Handoff, ack and give-up records therefore count only
-when GitHub shows them posted by the trusted user login (`owner_login`) or the configured
-app login (`reviewer_bot_login`), the same rule as the mailbox. That holds on the board,
+when GitHub shows them posted by the trusted user login (`owner_login`) or a configured
+app login (`coord_app_login`, the app coord posts as in app mode, and
+`reviewer_bot_login`), the same rule as the mailbox. These are repository settings, so
+every reader agrees whether or not it has an app config of its own. That holds on the board,
 in `inbox`, and in `take`'s own read from GitHub. A wake line prints the sender only when
 it is a well-formed agent id.
 
@@ -548,7 +554,10 @@ PR number, the attempt number and the session name. Each must match a strict pat
 the session name follows the registration rule, which also refuses a session id. A bad
 name in this machine's registry skips that one target, and gives nothing up. No handoff
 text, note or comment text is ever in the prompt. The attempt number keeps a retry from
-repeating the previous message word for word. The relay finds the session by name with ListAgents; coord never resolves a name
+repeating the previous message word for word. The relay command and model are checked
+before an attempt is counted: a configuration error is reported, counts nothing and never
+leads to a give-up. The relay's working folder is created inside the state folder, which
+is outside every work tree, so no repository's branch or commits reach it as context. The relay finds the session by name with ListAgents; coord never resolves a name
 to a session id. The run ends with one word: `RELAYED` or `NOT_LISTED`. Config
 `relay_command` (an argv list with a `"{prompt}"` item, no shell) replaces the default.
 
@@ -565,7 +574,8 @@ goes on to the next.
 
 **State.** `relay.json` in `COORD_RELAY_STATE_DIR`, else `$XDG_STATE_HOME` (on Windows
 `%LOCALAPPDATA%`, else `~/.local/state`) `/<state_dir_name>-relay/repo-<owner%2Fname>`.
-A directory inside a git work tree is refused. Run every scheduler for one repository
+A folder inside a git work tree is refused; when your home folder is itself a work
+tree, set `COORD_RELAY_STATE_DIR` to a folder outside it. Run every scheduler for one repository
 with the same settings: the lock only covers watchers that name the same directory. It holds, per handoff: attempts, the last and next attempt, the
 last result, and when it was acknowledged or given up. Writes are atomic (a temporary
 file, then a rename), and a lock file keeps two watchers from running at once. GitHub
@@ -573,9 +583,11 @@ stays the record: after a restart, or with the file lost or unreadable (it is se
 as `relay.json.bad`; malformed entries are dropped and a copy kept there), acks and
 give-up records on the board still keep handled handoffs from being woken again. A take
 recorded on this machine (`acked.json`) also stops the relay at once. `--dry-run` takes no
-lock and writes nothing. With no session registered on the machine, a pass stops before
-reading the board. SIGTERM or SIGINT to the watcher kills a running relay's process group
-first.
+lock, writes no relay state, and says what a real pass would set aside or drop; reading the
+board may refresh coord's shared board cache, as any board read does. With no session registered on the machine, a pass stops before
+reading the board. SIGTERM, SIGINT or (POSIX) SIGHUP to the watcher kills a running relay's
+process group first. Registry names are checked on every read, so a session id or a
+malformed name in `sessions.json` reaches no wake line and no relay.
 
 ## Session start
 

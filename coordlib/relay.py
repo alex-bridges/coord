@@ -172,7 +172,7 @@ class ChildRunner:
 
 @contextlib.contextmanager
 def stop_kills(runner: Any):
-    """While a pass runs: SIGTERM and SIGINT kill the running relay's group first, then
+    """While a pass runs: SIGTERM, SIGINT and (POSIX) SIGHUP kill the running relay's group first, then
     stop the watcher as they would have. Only in the main thread (signal's rule)."""
     if not hasattr(runner, "kill") or threading.current_thread() is not threading.main_thread():
         yield
@@ -188,7 +188,8 @@ def stop_kills(runner: Any):
             raise KeyboardInterrupt
         raise SystemExit(128 + signum)
 
-    for signum in (signal.SIGTERM, signal.SIGINT):
+    stops = [signal.SIGTERM, signal.SIGINT] + ([signal.SIGHUP] if hasattr(signal, "SIGHUP") else [])
+    for signum in stops:
         previous[signum] = signal.signal(signum, handler)
     try:
         yield
@@ -264,8 +265,13 @@ def state_dir(repo: str, env: Optional[Dict[str, str]] = None) -> str:
         directory = os.path.join(root, namespace, "repo-" + urllib.parse.quote(repo.lower(), safe=""))
     tree = inside_work_tree(directory)
     if tree is not None:
-        raise ValueError(f"the relay state directory {directory} is inside the git work tree {tree}; "
-                         "set COORD_RELAY_STATE_DIR (or XDG_STATE_HOME) to a directory outside any checkout")
+        home = os.path.abspath(os.path.expanduser("~"))
+        where = ("your home folder is itself a git work tree, so every folder under it is inside one; "
+                 "set COORD_RELAY_STATE_DIR to a folder outside your home folder"
+                 if os.path.normcase(tree) == os.path.normcase(home) else
+                 "set COORD_RELAY_STATE_DIR (or XDG_STATE_HOME) to a folder outside it")
+        raise ValueError(f"the relay state folder {directory} is inside the git work tree {tree}, whose commits and "
+                         f"branch would reach the relay run as context; {where}")
     return directory
 
 
@@ -394,12 +400,22 @@ class Watcher:
 
     def _pass(self, snap: Dict[str, Any], dry_run: bool) -> None:
         state = load_state(self.dir, set_aside=not dry_run)
+        bad = state_path(self.dir) + ".bad"
         if state.get("recovered"):
-            self.say(f"the state file was unreadable; set aside as {state_path(self.dir)}.bad. "
+            self.say(f"the state file is unreadable; a real pass sets it aside as {bad}" if dry_run else
+                     f"the state file was unreadable; set aside as {bad}. "
                      "The board's acks and give-up records still decide what is handled")
         if state.get("dropped"):
-            self.say(f"dropped {state['dropped']} malformed state entr{'y' if state['dropped'] == 1 else 'ies'} "
-                     f"(a copy is in {state_path(self.dir)}.bad)")
+            noun = f"malformed state entr{'y' if state['dropped'] == 1 else 'ies'}"
+            self.say(f"{state['dropped']} {noun}; a real pass drops them and keeps a copy in {bad}" if dry_run else
+                     f"dropped {state['dropped']} {noun} (a copy is in {bad})")
+        try:
+            command(prompt(1, 1, "check", 1), self.settings["model"])
+        except (ValueError, IdentifierError) as error:
+            # A configuration error is no attempt: nothing is counted, nothing is given up.
+            self.say(f"relay configuration error ({error}); nothing relayed or counted this pass. "
+                     "Check COORD_RELAY_MODEL and relay_command")
+            return
         entries: Dict[str, Dict[str, Any]] = state["handoffs"]
         items = handoff.handoffs(snap, self.now)
         sessions = cache.load_sessions(self.gh.repo)
@@ -460,7 +476,7 @@ class Watcher:
         for agent in names:
             name = sessions[agent].get("name")
             try:
-                texts.append((name, prompt(item["id"], item.get("on"), name, attempt)))
+                texts.append((name, command(prompt(item["id"], item.get("on"), name, attempt), self.settings["model"])))
             except IdentifierError as error:
                 # This machine's registry entry is bad; skip it here, give nothing up for anyone.
                 self.say(f"handoff {key}: skipped {agent} ({error}); fix it with `coord session register`")
@@ -477,8 +493,9 @@ class Watcher:
             if dry_run:
                 results.append(f"{name}: dry run")
                 continue
-            with tempfile.TemporaryDirectory(prefix="coord-relay-") as scratch:
-                result = self.runner(command(text, self.settings["model"]), scratch,
+            os.makedirs(self.dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="run-", dir=self.dir) as scratch:  # under the checked state folder
+                result = self.runner(text, scratch,
                                      relay_environment(self.env), self.settings["timeout"])
             results.append(f"{name}: {outcome(result)}")
         entry["lastResult"] = ", ".join(results)

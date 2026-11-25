@@ -215,11 +215,21 @@ class TakeTests(HandoffTestCase):
         self.assertEqual((ack["kind"], ack["ack"], ack["to"], ack["agent"]), ("msg", handoff_id, [SENDER], RECIPIENT))
         self.assertEqual(len(self.api.posts()), 2)  # the handoff and one ack
 
-    def test_a_repeated_wake_is_a_duplicate_and_costs_no_call(self):
+    def test_a_repeated_wake_shows_the_taker_its_own_work_without_a_second_ack(self):
         handoff_id, _ = self.hand_off()
         self.run_cli(["handoff", "take", str(handoff_id)], RECIPIENT)
         self.api.calls.clear()
         code, out, _ = self.run_cli(["handoff", "take", str(handoff_id)], RECIPIENT, board=False)
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("already yours", out)
+        self.assertIn("do not start it twice", out)
+        self.assertEqual([m for m, _ in self.api.calls], ["GET"])  # the handoff's text; no ack, no ack read
+
+    def test_a_repeated_wake_for_another_taker_is_a_duplicate_and_costs_no_call(self):
+        handoff_id, _ = self.hand_off()
+        self.run_cli(["handoff", "take", str(handoff_id)], RECIPIENT)
+        self.api.calls.clear()
+        code, out, _ = self.run_cli(["handoff", "take", str(handoff_id), "--force"], RESTARTED, board=False)
         self.assertEqual(code, EXIT_OK)
         self.assertIn("already taken", out)
         self.assertIn("do no new work", out)
@@ -247,7 +257,7 @@ class TakeTests(HandoffTestCase):
         os.unlink(cache.acked_path("o/r"))
         cache.store_snapshot("o/r", self.api.board())
         self.api.calls.clear()
-        code, out, _ = self.run_cli(["handoff", "take", str(handoff_id)], RECIPIENT, board=False)
+        code, out, _ = self.run_cli(["handoff", "take", str(handoff_id), "--force"], RESTARTED, board=False)
         self.assertIn("already taken", out)
         self.assertEqual(self.api.calls, [])
 

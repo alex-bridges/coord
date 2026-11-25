@@ -666,21 +666,25 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
 
     Duplicate checks, cheapest first: this machine's record of acks (no call), the cached
     board (no call), then GitHub (the handoff comment and the comments after it on its
-    issue). Only then is the ack posted, and the acks are read once more: when two takers
-    raced, the earlier ack took the handoff and the later taker stands down. Only records
-    from trusted logins count (handoff.trusted).
+    issue). An earliest ack that is our own (a retry after an ack POST whose response was
+    lost, or a repeated wake) is not a duplicate: the work is shown again, marked as
+    already ours. After posting, the ack is recorded on this machine first, then the acks
+    are read once more: a taker stands down only when a trusted ack with a smaller id than
+    its own, by another agent, exists. If that read fails, no earlier ack has been seen, so
+    this taker keeps the handoff. Only records from trusted logins count (handoff.trusted).
     """
     me = identity.agent_id()
     local = cache.load_acked(gh.repo).get(str(args.id))
-    if local:
+    if local and local.get("by") != me:
         return handoff_duplicate(args, local.get("by"), local.get("at"), local.get("url"), "this machine's record")
-    cached = cache.load_snapshot(gh.repo, float("inf"))
-    if cached:
-        item = handoff.find(cached, args.id, snapshot.now_utc())
-        if item and item["acked"]:
-            first = item["acks"][0]
-            cache.remember_acked(gh.repo, args.id, first)
-            return handoff_duplicate(args, first["by"], first["at"], first["url"], "the cached board")
+    if not local:
+        cached = cache.load_snapshot(gh.repo, float("inf"))
+        if cached:
+            item = handoff.find(cached, args.id, snapshot.now_utc())
+            if item and item["acked"] and item["acks"][0]["by"] != me:
+                first = item["acks"][0]
+                cache.remember_acked(gh.repo, args.id, first)
+                return handoff_duplicate(args, first["by"], first["at"], first["url"], "the cached board")
     comment = gh.rest(f"repos/{{repo}}/issues/comments/{args.id}")
     payload = marker.decode((comment or {}).get("body"))
     if not payload or payload.get("kind") != "msg" or payload.get("handoff") is not True:
@@ -692,11 +696,15 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
         raise UsageError(f"handoff {args.id} is addressed to {', '.join(marker.recipients(payload))}, not to you "
                          f"({me}); it is not yours to take")
     created = comment.get("created_at") or snapshot.iso(snapshot.now_utc())
+    sender = payload.get("agent")
+    if local:
+        return handoff_work(args, comment, sender, number, local, "already yours (this machine's record)")
     taken = handoff_acks(gh, number, args.id, created)
     if taken:
         cache.remember_acked(gh.repo, args.id, taken[0])
+        if taken[0].get("by") == me:
+            return handoff_work(args, comment, sender, number, taken[0], "already yours (your ack is the first)")
         return handoff_duplicate(args, taken[0]["by"], taken[0]["at"], taken[0]["url"], "GitHub")
-    sender = payload.get("agent")
     ack = {"kind": "msg", "v": 1, "agent": me, "to": [sender], "ack": args.id}
     if "on" in payload:
         ack["on"] = number
@@ -707,22 +715,41 @@ def cmd_handoff_take(args: argparse.Namespace, gh: GitHub) -> int:
     cache.invalidate_snapshot(gh.repo)
     record = {"id": posted.get("id"), "by": me, "at": posted.get("created_at") or snapshot.iso(snapshot.now_utc()),
               "url": posted.get("html_url")}
-    # Read again: another taker may have posted between our check and our ack. The
-    # earliest trusted ack took the handoff; a later one stands down.
-    after = handoff_acks(gh, number, args.id, created)
-    first = after[0] if after else record
-    if first.get("id") != record["id"]:
-        cache.remember_acked(gh.repo, args.id, first)
+    cache.remember_acked(gh.repo, args.id, record)  # before the re-read: a failure after this keeps it ours
+    # Read again: another taker may have posted between our check and our ack. Only an
+    # ack with a smaller id than ours, by someone else, took the handoff first.
+    try:
+        after = handoff_acks(gh, number, args.id, created)
+    except GitHubError as error:
+        print(f"coord: could not read the acks again ({redact(str(error))[:160]}); no earlier ack was seen, "
+              "so the handoff is yours", file=sys.stderr)
+        after = []
+    mine = record.get("id") if isinstance(record.get("id"), int) else None
+    earlier = [a for a in after if isinstance(a.get("id"), int) and mine is not None and a["id"] < mine
+               and a.get("by") != me]
+    if earlier:
+        first = earlier[0]
+        cache.replace_acked(gh.repo, args.id, first)
         return handoff_duplicate(args, first.get("by"), first.get("at"), first.get("url"), "GitHub, after our ack")
-    cache.remember_acked(gh.repo, args.id, record)
+    return handoff_work(args, comment, sender, number, record, "taken")
+
+
+def handoff_work(args: argparse.Namespace, comment: Dict[str, Any], sender: Any, number: Optional[int],
+                 record: Dict[str, Any], how: str) -> int:
+    """Print the work of a handoff that is ours: newly taken, or taken by us earlier."""
     body = marker.strip(comment.get("body") or "")
     if body.startswith("**Handoff from** `") and "\n" in body:
         body = body.split("\n", 1)[1].strip()
     if args.json:
-        print(json.dumps({"schema": 1, "status": "taken", "handoff": args.id, "from": sender, "on": number,
-                          "ack": record, "text": body, "url": comment.get("html_url")}, indent=2))
+        print(json.dumps({"schema": 1, "status": "taken" if how == "taken" else "mine", "handoff": args.id,
+                          "from": sender, "on": number, "ack": record, "text": body, "url": comment.get("html_url")},
+                         indent=2))
         return EXIT_OK
-    print(f"took handoff {args.id} from {sender} (ack: {posted.get('html_url')}). The work:")
+    if how == "taken":
+        print(f"took handoff {args.id} from {sender} (ack: {record.get('url')}). The work:")
+    else:
+        print(f"handoff {args.id} from {sender} is {how}: you took it at {record.get('at')} ({record.get('url')}). "
+              "If you have started it, carry on; do not start it twice. The work:")
     print("  " + body.replace("\n", "\n  "))
     print(f"  {comment.get('html_url')}")
     return EXIT_OK
@@ -734,7 +761,8 @@ def cmd_handoff_watch(args: argparse.Namespace, gh: GitHub) -> int:
     board; otherwise it reads the board (cached up to --max-age) and, for a give-up that
     may already have been posted, that handoff's issue."""
     if not cache.load_sessions(gh.repo):
-        print("no session is registered on this machine; nothing to relay")
+        line = "no session is registered on this machine; nothing to relay"
+        print(json.dumps({"schema": 1, "status": "ok", "stateDir": None, "lines": [line]}, indent=2) if args.json else line)
         return EXIT_OK
     try:
         directory = relay.state_dir(gh.repo)
@@ -742,7 +770,9 @@ def cmd_handoff_watch(args: argparse.Namespace, gh: GitHub) -> int:
         raise UsageError(str(error)) from None
     snap = get_snapshot(gh, args.max_age)
     if getattr(gh, "budget_low", None) or getattr(gh, "app_unavailable", None):
-        print("coord: the board is stale (budget low or no app token); not relaying this pass", file=sys.stderr)
+        line = "the board is stale (budget low or no app token); not relaying this pass"
+        print(json.dumps({"schema": 1, "status": "stale", "stateDir": directory, "lines": [line]}, indent=2)
+              if args.json else f"coord: {line}", file=sys.stdout if args.json else sys.stderr)
         return EXIT_OK
 
     def post(number: int, text: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -757,6 +787,8 @@ def cmd_handoff_watch(args: argparse.Namespace, gh: GitHub) -> int:
 
     watcher = relay.Watcher(gh, post, read=read, state_directory=directory)
     lines = watcher.run(snap, dry_run=args.dry_run)
+    if args.dry_run:
+        lines.append("dry run: no relay state was written; the board read may have refreshed coord's board cache")
     if args.json:
         print(json.dumps({"schema": 1, "status": "ok", "stateDir": watcher.dir, "lines": lines}, indent=2))
     else:
@@ -793,7 +825,7 @@ def mailbox_numbers(messages: List[Dict[str, Any]], repo: str) -> set:
     return {m.get("on") for m in messages if isinstance(m.get("on"), int)
             and (m.get("payload") or {}).get("kind") == "msg" and "on" not in (m.get("payload") or {})
             and (snapshot.trusted_attestation(m.get("author"), repo)
-                 or (m.get("author") or {}).get("login") == snapshot.SIDECHAIN_LOGIN)}
+                 or (m.get("author") or {}).get("login") in snapshot.trusted_app_logins())}
 
 
 def down_warnings(repo: str, recipients: List[str]) -> List[str]:
@@ -1646,7 +1678,9 @@ def parser() -> argparse.ArgumentParser:
     hlist.set_defaults(func=cmd_handoff_list)
     watch = handoff_sub.add_parser("watch", help="one relay pass: wake registered sessions on this machine for "
                                    "handoffs nobody took (run it from a scheduler)")
-    watch.add_argument("--dry-run", action="store_true", help="say what would be relayed; run nothing, write nothing")
+    watch.add_argument("--dry-run", action="store_true",
+                       help="say what would be relayed; run nothing and write no relay state (reading the board "
+                            "may refresh coord's shared board cache, as any board read does)")
     watch.add_argument("--json", action="store_true")
     watch.add_argument("--max-age", type=float, default=300.0, help="reuse a cached board up to this many seconds old")
     watch.set_defaults(func=cmd_handoff_watch)

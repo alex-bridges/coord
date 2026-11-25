@@ -27,24 +27,15 @@ import datetime as dt
 import re
 from typing import Any, Dict, List, Optional
 
-from . import identity, marker, review, snapshot
+from . import cache, identity, marker, review, snapshot
 
-# A harness session name as ListAgents prints it ("worker-a", "team-lead"). Never a raw
-# session id: the registry gives the sender a name and the harness resolves it.
-_SESSION_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
-_UUID = re.compile(r"[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}")
 # An agent id as the brief shows one (render._brief_identity): no spaces, no newlines.
 _AGENT = re.compile(r"[A-Za-z0-9._-]+@[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)?")
 
 
-def session_name_error(name: str) -> Optional[str]:
-    """Why `name` cannot be registered, or None."""
-    if not isinstance(name, str) or not _SESSION_NAME.fullmatch(name):
-        return ("a session name is the name ListAgents prints after \"This session is\" "
-                "(letters, digits, '.', '_', '-'; at most 64)")
-    if _UUID.fullmatch(name):
-        return "that is a session id, not a session name: register the name ListAgents prints"
-    return None
+def session_name_error(name: Any) -> Optional[str]:
+    """Why `name` cannot be registered, or None (cache.session_name_error: one rule)."""
+    return cache.session_name_error(name)
 
 
 def is_exact_address(address: str) -> bool:
@@ -54,12 +45,13 @@ def is_exact_address(address: str) -> bool:
 
 def trusted(message: Dict[str, Any], repo: Optional[str]) -> bool:
     """Whether a handoff, ack or give-up record counts: posted by the trusted user login
-    (snapshot.trusted_attestation) or by the configured app login, the mailbox's rule.
+    (snapshot.trusted_attestation) or by a configured app login (snapshot.trusted_app_logins:
+    `coord_app_login`, `reviewer_bot_login`), the mailbox's rule.
     The marker's `agent` field is self-declared, so the author decides."""
     author = message.get("author") or {}
     if not repo:
         return False
-    return snapshot.trusted_attestation(author, repo) or author.get("login") == snapshot.sidechain_login()
+    return snapshot.trusted_attestation(author, repo) or author.get("login") in snapshot.trusted_app_logins()
 
 
 def agent_words(agent: Any) -> Optional[str]:

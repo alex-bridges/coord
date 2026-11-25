@@ -285,7 +285,7 @@ class P3_8_SessionNames(ReviewCase):
         lines = self.watch(T0)
         self.assertEqual(len(self.fake.calls), 1)
         self.assertEqual(self.give_ups(handoff_id), [])
-        self.assertIn("skipped", "\n".join(lines))
+        self.assertNotIn(RESTARTED, cache.load_sessions("o/r"))
 
 
 DRIVER = r'''

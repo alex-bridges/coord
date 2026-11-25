@@ -242,6 +242,9 @@ on your user login.
      "app_login": "my-coord-app[bot]"
    }
    ```
+   Also set `"coord_app_login": "my-coord-app[bot]"` in the repository's `.coord/config.json`,
+   so every reader trusts the handoff, ack and mailbox records this app posts (`coord doctor`
+   warns when the two differ).
 4. **Import the `.pem` private key** into your OS credential store (macOS login Keychain or
    Windows DPAPI under `%LOCALAPPDATA%\coord\keys\`):
    ```sh

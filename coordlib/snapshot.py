@@ -1045,6 +1045,14 @@ def sidechain_login() -> str:
     return config.get("reviewer_bot_login") or NO_SIDECHAIN_LOGIN
 
 
+def trusted_app_logins() -> FrozenSet[str]:
+    """App logins whose coord records count (handoffs, acks, give-ups, mailbox posts): the
+    app coord itself posts as in app mode (config `coord_app_login`) and the reviewer app
+    (`reviewer_bot_login`). Repository settings, so every reader agrees, with or without
+    an app config of its own."""
+    return frozenset(login for login in (config.get("coord_app_login"), config.get("reviewer_bot_login")) if login)
+
+
 def __getattr__(name: str) -> Any:
     # SIDECHAIN_LOGIN stays an attribute for other modules, read from config on each access.
     if name == "SIDECHAIN_LOGIN":
